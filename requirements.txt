@@ -1,0 +1,28 @@
+# Direct dependencies, pinned. Versions verified installed on Python 3.14.
+# Keep local and CI identical (CLAUDE.md, Environment).
+
+# Bot framework
+aiogram==3.31.0
+
+# Web server: Telegram webhook, payment callbacks, cron jobs (Phase 4)
+fastapi==0.141.1
+uvicorn==0.54.0
+
+# Database
+SQLAlchemy[asyncio]==2.1.1    # asyncio extra pulls in greenlet
+alembic==1.20.0
+aiosqlite==0.22.1          # local SQLite driver
+# PostgreSQL driver. Installed from Phase 1 because CI runs the migration check against a
+# throwaway Postgres (quality-gates section 5); the app itself switches over in Phase 4.
+psycopg[binary]==3.3.6
+
+# Configuration
+pydantic-settings==2.15.0
+# Used directly by alembic/env.py so migrations read the same .env as the app.
+python-dotenv==1.2.3
+
+# Monitoring
+# sentry-sdk==2.*          # TODO(phase-4)
+
+# Scheduling for the billing jobs (in-process; the plan allows this before Phase 4).
+APScheduler==3.11.3

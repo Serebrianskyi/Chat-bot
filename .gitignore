@@ -218,3 +218,21 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ======================================================================
+# ChatBot specifics — these are the rules GitHub's template does not cover
+# ======================================================================
+
+# Secrets. standing gate S4. The template covers .env but not the variants.
+.env
+.env.*
+!.env.example
+
+# The local SQLite database holds real member rows. The template only lists
+# db.sqlite3, which does not match chatbot.db.
+*.db
+*.sqlite3
+
+# The template leaves this commented out; PyCharm state is local, and
+# .idea/runConfigurations carries machine-specific paths.
+.idea/

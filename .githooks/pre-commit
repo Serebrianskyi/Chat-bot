@@ -1,0 +1,81 @@
+#!/bin/sh
+# Blocks committing credentials. Installed via:  git config core.hooksPath .githooks
+#
+# Belt to .gitignore's braces. .gitignore stops files you never add; this stops the case
+# .gitignore cannot: `git add -f .env`, a secret pasted into a source file, or a rename that
+# lands a real token in a tracked path.
+#
+# CI runs gitleaks too (standing gate S4), but that is after a push. This is before a commit.
+
+set -eu
+
+fail() {
+    echo "" >&2
+    echo "COMMIT BLOCKED: $1" >&2
+    echo "" >&2
+    exit 1
+}
+
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+[ -z "$staged" ] && exit 0
+
+# 1. Any .env file except the committed template.
+for path in $staged; do
+    case "$path" in
+        .env.example|*/.env.example) : ;;
+        .env|*/.env|.env.*|*/.env.*)
+            fail "$path holds real credentials and must never be committed.
+  Unstage it:  git rm --cached '$path'" ;;
+    esac
+done
+
+# 2. A Telegram bot token anywhere in the staged content.
+#    Shape: 8-10 digits, a colon, then 35 chars of base64url.
+if git diff --cached -U0 | grep -nEq '^\+.*[0-9]{8,10}:[A-Za-z0-9_-]{35}'; then
+    offenders=$(git diff --cached --name-only -G'[0-9]{8,10}:[A-Za-z0-9_-]{35}' | tr '\n' ' ')
+    fail "a Telegram bot token appears in: $offenders
+  Move it to .env and read it through config.py (CLAUDE.md rule 3).
+  If the token is real, revoke it with @BotFather /revoke -- it is in your reflog now."
+fi
+
+# 3. A WayForPay secret key, named.
+if git diff --cached -U0 | grep -nEiq '^\+.*wayforpay[_a-z]*(secret|key)[[:space:]]*=[[:space:]]*["'"'"']?[A-Za-z0-9]{12,}'; then
+    fail "what looks like a WayForPay secret is staged. Keep payment keys in the environment only."
+fi
+
+# 4. Any known real credential, by fingerprint.
+#
+# Rules 1-3 match on names. This one matches on the value, so a secret pasted under any
+# variable name -- or into a comment, a doc, or a test fixture -- is still caught. Only the
+# SHA-256 is stored, so this list is safe to commit; the secrets themselves are not here.
+#
+# Add a line when a new credential enters .env:
+#   printf '%s' 'the-secret' | shasum -a 256
+KNOWN_FINGERPRINTS="
+7d32018577eb00d07474b3fd4a2b53841e99e006a357631480b2c3f3f4a79314
+69f3b61f77f1bef9fd4a6515287b3f14f4942174a75dd3829b32a6823afd6914
+2070eed467bff37e5290a528b02fed818e35beb017536675cc478004ddf9676f
+"
+
+if command -v shasum >/dev/null 2>&1; then
+    sha256() { shasum -a 256 | cut -d" " -f1; }
+elif command -v sha256sum >/dev/null 2>&1; then
+    sha256() { sha256sum | cut -d" " -f1; }
+else
+    echo "WARNING: no shasum/sha256sum, skipping the known-credential check" >&2
+    sha256() { printf 'nohash'; }
+fi
+
+# Candidate tokens: anything long enough to be a key. Telegram tokens contain ':' and '-', so
+# those are included in the character class.
+for candidate in $(git diff --cached -U0 | grep '^+' | grep -oE '[A-Za-z0-9_:.-]{20,}' | sort -u); do
+    fingerprint=$(printf '%s' "$candidate" | sha256)
+    if echo "$KNOWN_FINGERPRINTS" | grep -qx "$fingerprint"; then
+        fail "a known real credential is staged (matched by fingerprint).
+  It must never be committed. Remove it, keep it in .env, and if it has already been
+  pushed anywhere, rotate it: @BotFather /revoke for the bot token, or the WayForPay
+  dashboard for payment keys."
+    fi
+done
+
+exit 0

@@ -1,0 +1,95 @@
+# Standing gate S1-S4, S7, S11. Step order follows telegram-bot-quality-gates.md section 5.
+# Merging to main requires this green (enable branch protection on GitHub).
+#
+# Every step is live as of Phase 1. Coverage still has no --cov-fail-under: S11's 80% target
+# for services/ is advisory in the gates document, so it is reported, not enforced.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  quality-gate:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.14"]
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: club_bot_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # gitleaks needs full history to scan commits
+
+      # 1. Install dependencies (cached)
+      # Matrix so CI proves the code on both the version used locally and the floor a host
+      # is likely to offer. A green suite on 3.14 alone would not tell us the deploy works.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+
+      # 2. Lint
+      - name: ruff check
+        run: ruff check .
+
+      # 3. Format
+      - name: ruff format --check
+        run: ruff format --check .
+
+      # 4. Secrets scan (S4)
+      - name: gitleaks detect
+        run: |
+          curl -sSL \
+            "https://github.com/gitleaks/gitleaks/releases/download/v8.29.0/gitleaks_8.29.0_linux_x64.tar.gz" \
+            | tar -xz gitleaks
+          ./gitleaks detect --no-banner --redact --exit-code 1
+
+      # 5. Migrations upgrade from empty, then round-trip and match the models (S7)
+      - name: alembic upgrade head
+        env:
+          DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/club_bot_test
+        run: alembic upgrade head
+
+      - name: alembic downgrade base and back
+        env:
+          DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/club_bot_test
+        # A one-way migration makes the Phase 4 rollback drill (G4.11) impossible.
+        run: |
+          alembic downgrade base
+          alembic upgrade head
+
+      - name: alembic check
+        env:
+          DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/club_bot_test
+        # Fails when db/models.py has changed without a matching migration — S7's real intent.
+        run: alembic check
+
+      # 6. Tests with coverage of services/ (S3, S11 advisory)
+      - name: pytest
+        env:
+          BOT_TOKEN: "000:ci-placeholder-not-a-real-token"
+          ADMIN_IDS: "1"
+          CHANNEL_ID: "-1000000000000"
+          DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/club_bot_test
+        run: pytest --cov=services --cov-report=term-missing

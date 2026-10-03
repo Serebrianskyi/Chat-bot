@@ -1,0 +1,38 @@
+[project]
+name = "club-bot"
+version = "0.1.0"
+description = "Paid Telegram community bot: channel access, WayForPay subscriptions, knowledge base, networking"
+# 3.12 is the floor the code actually needs (StrEnum, datetime.UTC, PEP 604 unions all land
+# earlier). Local development runs 3.14; a host that only offers 3.12 is fine.
+requires-python = ">=3.12"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+exclude = ["alembic/versions", ".venv"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # import sorting
+    "UP",  # pyupgrade
+    "B",   # bugbear
+    "ASYNC",
+    "DTZ", # timezone-aware datetimes -- enforces CLAUDE.md rule 1 (UTC everywhere)
+    "S",   # bandit: no hardcoded secrets, no insecure calls
+]
+ignore = [
+    "S101",  # assert is how pytest works
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S105", "S106"]  # test fixtures use obviously fake tokens
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-q --strict-markers"
+
+[tool.coverage.run]
+source = ["services"]
