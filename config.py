@@ -55,7 +55,7 @@ class Settings(BaseSettings):
     )
 
     # --- Database: SQLite locally, PostgreSQL from Phase 4 ---
-    database_url: str = "sqlite+aiosqlite:///./club_bot.db"
+    database_url: str = "sqlite+aiosqlite:///./chatbot.db"
 
     # --- Phase 4: webhook mode and protected job endpoints ---
     mode: Literal["polling", "webhook"] = "polling"

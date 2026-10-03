@@ -1,4 +1,4 @@
-# CLAUDE.md — Club Bot
+# CLAUDE.md — ChatBot
 
 Paid Telegram community bot: private-channel access, WayForPay recurring subscriptions,
 knowledge base, networking profiles, admin panel.
@@ -110,8 +110,8 @@ README / `.env.example` updated if needed.
 
 ## Layout
 
-Flat at the repository root, per the plan's layout (its `club-bot/` is the repo name, not a
-nesting level).
+Flat at the repository root. The plan's layout shows a `club-bot/` folder; that is a repo name,
+not a nesting level. This repo is **ChatBot** (`Serebrianskyi/Chat-bot`).
 
 ```
 main.py        entry point: polling (dev, Phases 0–3) or FastAPI app (prod, Phase 4+)
@@ -168,7 +168,7 @@ through `db.models.utcnow()`.
   the bot locally from PyCharm rather than deploy to Railway/Render. Consequences to respect:
   - **Polling, not webhooks.** There is no public HTTPS URL. `MODE=webhook` and `web/routes.py`
     stay Phase 4 work; do not wire them up as a workaround.
-  - **SQLite is the working database** (`club_bot.db`, gitignored). Nothing creates tables at
+  - **SQLite is the working database** (`chatbot.db`, gitignored). Nothing creates tables at
     startup, so `alembic upgrade head` must be run after any schema change — the
     **1 Migrate** run configuration exists for this. PostgreSQL is exercised only by CI.
   - **No Docker.** Files for a containerised run were written and then removed on request

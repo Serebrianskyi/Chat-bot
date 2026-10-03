@@ -33,7 +33,7 @@ Extra beyond the gate, because the code would otherwise have been wrong:
 | S1  | pass | `ruff check .` → All checks passed |
 | S2  | pass | `ruff format --check .` → 39 files already formatted |
 | S3  | pass | `pytest` → 64 passed, no skips (test_admin 15, test_config 15, test_audit 7, test_errors 7, test_main 7, test_models 7, test_start 6) |
-| S4  | **not done** | Blocked on G0.3/G0.4: there is no git repository, so gitleaks has no history to scan. A blank `.env` and a local `club_bot.db` now exist on disk; both are in `.gitignore`, but that is not the check. Satisfied by the first CI run after `git init` and a push |
+| S4  | **not done** | Blocked on G0.3/G0.4: there is no git repository, so gitleaks has no history to scan. A blank `.env` and a local `chatbot.db` now exist on disk; both are in `.gitignore`, but that is not the check. Satisfied by the first CI run after `git init` and a push |
 | S5  | pass | `tests/test_config.py` — each required variable removed in turn, and separately blanked, `ConfigError` names it and says why. Hardened after running the bot for real: see "Found by running it" below |
 | S6  | pass | `tests/test_audit.py` — a row carries actor, action and target; `record_action` does not commit, so a rolled-back action leaves no row |
 | S7  | pass | See G1.6. CI also runs `alembic check` |

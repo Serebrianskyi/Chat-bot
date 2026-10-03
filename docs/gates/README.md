@@ -24,14 +24,16 @@ Update this table when a gate closes, and link the record.
 The repository side of Gate 0 is in place (layout, CI, `README.md`, `.env.example`, a green
 trivial test). These items need a human and cannot be done from the repo:
 
-- **G0.1 / G0.5 / G0.6** — create `@yourclub_bot` and `@yourclub_test_bot` in @BotFather;
-  add the **test** bot to the private channel as administrator with "Invite users via link"
-  and "Ban users"; record `CHANNEL_ID` in `.env` and verify it with a `get_chat` call.
+- **G0.1 / G0.5 / G0.6** — **done, with a deviation.** One bot exists, `@yourstoryclub_bot`,
+  not the plan's production/test pair: the owner chose to run the live bot. It is an
+  administrator of `Create Your Story | Club` (supergroup, id `-1003980549671`) with
+  "Invite users via link" and "Ban users" both granted, verified via `getChatMember`.
+  `CHANNEL_ID` is set in `.env`.
 - **G0.3** — `git init`, then `git config core.hooksPath .githooks` **before the first
   commit**, then push to a private GitHub repo and confirm the CI workflow runs green.
 - **G0.4** — confirm `.env` is untracked and `.env.example` is committed. Verified in a
   throwaway repo: with this `.gitignore`, `git add -A` stages neither `.env` nor
-  `club_bot.db` nor `.idea/`.
+  `chatbot.db` nor `.idea/`.
 
 Phase order was changed on 2026-09-30: the knowledge base (plan Phase 2) is deferred, and
 **Phase 2A** — onboarding plus the start of the subscription mechanism — was built instead,

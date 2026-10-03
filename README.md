@@ -1,4 +1,4 @@
-# Club Bot
+# ChatBot
 
 A paid Telegram community bot: private-channel access, WayForPay recurring subscriptions,
 a knowledge base, networking profiles and an admin panel.
@@ -37,10 +37,10 @@ pip install -r requirements-dev.txt     # requirements.txt alone for production
 cp .env.example .env                    # then fill it in
 ```
 
-Get a bot token from [@BotFather](https://t.me/BotFather). **Create two bots** —
-`@yourclub_bot` for production and `@yourclub_test_bot` for development — and put the *test*
-token in `.env`. Only one process may use a token at a time, so polling locally with the
-production token will make the live bot behave erratically.
+The bot is [@yourstoryclub_bot](https://t.me/yourstoryclub_bot) and its token is already in
+`.env`. The plan calls for a second, test bot; the owner chose to run the live one instead, so
+**every local run touches production** — real members message this bot. Only one process may hold
+a token at a time, so stop anything else that is polling before you start it.
 
 Python 3.14 is required. `.idea/` is gitignored, so your PyCharm settings stay local; the
 whole toolchain is driven by `pyproject.toml` and works the same from the command line.
@@ -82,7 +82,7 @@ Four run configurations ship in `.idea/runConfigurations/`, so they appear in th
 
 | Configuration | What it does | When |
 | --- | --- | --- |
-| **1 Migrate (alembic upgrade head)** | Applies migrations to `club_bot.db` | Once now, then after any `db/models.py` change |
+| **1 Migrate (alembic upgrade head)** | Applies migrations to `chatbot.db` | Once now, then after any `db/models.py` change |
 | **2 Bot (polling)** | Runs `main.py` | To start the bot |
 | **3 Tests (pytest)** | Runs the suite | Before calling anything done |
 | **4 Lint (ruff check)** | Lints | Same |
@@ -144,12 +144,12 @@ Both exit with status 1.
 ### Inspecting the local database
 
 ```bash
-sqlite3 club_bot.db '.tables'
-sqlite3 club_bot.db 'SELECT telegram_id, username, role FROM users;'
-sqlite3 club_bot.db 'SELECT * FROM audit_log ORDER BY created_at DESC LIMIT 10;'
+sqlite3 chatbot.db '.tables'
+sqlite3 chatbot.db 'SELECT telegram_id, username, role FROM users;'
+sqlite3 chatbot.db 'SELECT * FROM audit_log ORDER BY created_at DESC LIMIT 10;'
 ```
 
-`club_bot.db` is gitignored. Delete it and re-run **1 Migrate** to start clean.
+`chatbot.db` is gitignored. Delete it and re-run **1 Migrate** to start clean.
 
 ### Starting and stopping
 
@@ -219,7 +219,7 @@ commit exists.
 | Path | Why |
 | --- | --- |
 | `.env` | The bot token and admin ids |
-| `club_bot.db` | Real user rows |
+| `chatbot.db` | Real user rows |
 | `.idea/` | Local IDE state, including run configurations |
 
 `.env.example` **is** committed: names only, no values.
@@ -269,7 +269,7 @@ All of these live in `.env` locally and in platform environment variables in pro
 | `BOT_TOKEN` | Phase 0 | @BotFather token. Currently the **live** bot — see Credentials above. |
 | `ADMIN_IDS` | Phase 0 | Comma-separated Telegram user ids with admin access |
 | `CHANNEL_ID` | Phase 3 | The private channel the bot administrates. Validated if set; Phase 1 does not read it |
-| `DATABASE_URL` | Phase 1 | SQLite (`club_bot.db`); PostgreSQL if this ever moves to a host |
+| `DATABASE_URL` | Phase 1 | SQLite (`chatbot.db`); PostgreSQL if this ever moves to a host |
 | `SUBSCRIPTION_PRICE` | Phase 2A | Regular monthly price for a new joiner |
 | `SUBSCRIPTION_CURRENCY` | Phase 2A | Defaults to `UAH` |
 | `SUBSCRIPTION_PERIOD_DAYS` | Phase 2A | Defaults to 30 |
@@ -365,8 +365,8 @@ round-trips). Rolling code back needs git, which is not initialised yet.
 Not the Phase 4 restore drill (G4.9) — that needs managed backups on a host — but worth knowing:
 
 ```bash
-cp club_bot.db club_bot.db.backup      # back up
-cp club_bot.db.backup club_bot.db      # restore
+cp chatbot.db chatbot.db.backup      # back up
+cp chatbot.db.backup chatbot.db      # restore
 ```
 
 Both procedures are required in writing before launch (G8.5), and each must have been

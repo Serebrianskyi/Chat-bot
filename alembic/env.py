@@ -27,7 +27,7 @@ config = context.config
 
 # The database URL comes from the environment, never from alembic.ini -- the same
 # variable the app uses, so migrations can never target a different database.
-database_url = os.environ.get("DATABASE_URL", "sqlite+aiosqlite:///./club_bot.db")
+database_url = os.environ.get("DATABASE_URL", "sqlite+aiosqlite:///./chatbot.db")
 config.set_main_option("sqlalchemy.url", database_url)
 
 # Interpret the config file for Python logging.

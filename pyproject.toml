@@ -1,5 +1,5 @@
 [project]
-name = "club-bot"
+name = "chatbot"
 version = "0.1.0"
 description = "Paid Telegram community bot: channel access, WayForPay subscriptions, knowledge base, networking"
 # 3.12 is the floor the code actually needs (StrEnum, datetime.UTC, PEP 604 unions all land
