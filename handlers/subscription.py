@@ -19,6 +19,7 @@ import texts
 from db.models import SubscriptionStatus, utcnow
 from services import discounts as discount_service
 from services import subscriptions as subs
+from services.pricing import extend
 
 log = logging.getLogger(__name__)
 
@@ -72,15 +73,32 @@ async def render_subscription(
         username=username,
         now=utcnow(),
     )
-    await message.answer(
-        texts.SUBSCRIPTION_STATUS.format(
-            status=texts.STATUS_NAMES.get(subscription.status.value, subscription.status.value),
+    now = utcnow()
+    status_name = texts.STATUS_NAMES.get(subscription.status.value, subscription.status.value)
+
+    if subscription.expires_at <= now:
+        # They owe money, so there is no "valid until" date to quote. Show when it lapsed, and
+        # what paying now would buy — which is the question somebody looking at this screen has.
+        body = texts.SUBSCRIPTION_STATUS_UNPAID.format(
+            status=status_name,
             amount=texts.money(amount, currency),
             period=subscription.period_days,
             until=texts.day(subscription.expires_at.date()),
-        ),
-        reply_markup=_status_keyboard(subscription.status),
-    )
+            next_until=texts.day(
+                extend(
+                    subscription.expires_at, now=now, period_days=subscription.period_days
+                ).date()
+            ),
+        )
+    else:
+        body = texts.SUBSCRIPTION_STATUS.format(
+            status=status_name,
+            amount=texts.money(amount, currency),
+            period=subscription.period_days,
+            until=texts.day(subscription.expires_at.date()),
+        )
+
+    await message.answer(body, reply_markup=_status_keyboard(subscription.status))
 
 
 async def show_subscription(message: Message, session: AsyncSession) -> None:

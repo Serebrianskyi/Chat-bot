@@ -798,6 +798,7 @@ def test_every_member_facing_message_is_ukrainian_and_formats_cleanly():
     sample = {
         "club": texts.CLUB_NAME,
         "until": "31.12.2026",
+        "next_until": "30.01.2027",
         "amount": "10 €",
         "period": 30,
         "retry_in": "24 години",

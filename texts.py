@@ -215,8 +215,22 @@ MENU_NETWORKING = "🤝 Нетворкінг / Каталог"  # SPEC
 MENU_MY_SUBSCRIPTION = "💳 Моя підписка"
 MENU_MY_PROFILE = "👤 Мій профіль"
 
+#: The member's own subscription card. Two variants, because one line cannot honestly cover
+#: both cases: a paid-up member has a date their access runs to, while someone who owes money
+#: has no such date — saying «Діє до <today>» to them reads as "valid until today", which is
+#: the opposite of the truth.
 SUBSCRIPTION_STATUS = (
     "<b>Ваша підписка</b>\n\nСтатус: {status}\nВартість: {amount} на {period} днів\nДіє до: {until}"
+)
+
+SUBSCRIPTION_STATUS_UNPAID = (
+    "<b>Ваша підписка</b>\n"
+    "\n"
+    "Статус: {status}\n"
+    "До оплати: {amount} за {period} днів\n"
+    "Термін вийшов: {until}\n"
+    "\n"
+    "Після оплати доступ буде діяти до {next_until}."
 )
 
 STATUS_NAMES = {
