@@ -16,6 +16,11 @@ aiosqlite==0.22.1          # local SQLite driver
 # throwaway Postgres (quality-gates section 5); the app itself switches over in Phase 4.
 psycopg[binary]==3.3.6
 
+# HTTP client. A RUNTIME dependency: services/wayforpay.py calls the payment API with it.
+# It was filed under requirements-dev.txt because tests also use it, which crashed the first
+# deploy with ModuleNotFoundError.
+httpx==0.28.1
+
 # Configuration
 pydantic-settings==2.15.0
 # Used directly by alembic/env.py so migrations read the same .env as the app.

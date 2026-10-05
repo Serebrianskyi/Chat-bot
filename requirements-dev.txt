@@ -4,4 +4,5 @@ ruff==0.16.9
 pytest==9.1.1
 pytest-asyncio==1.4.0
 pytest-cov==7.1.0
-httpx==0.28.1              # FastAPI route tests via httpx.AsyncClient
+# httpx is NOT listed here: it is a runtime dependency in requirements.txt, which this file
+# already includes via -r. Listing it twice is how it ended up looking dev-only.
