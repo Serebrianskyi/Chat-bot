@@ -86,7 +86,8 @@ def upgrade() -> None:
             "fixed_price": Decimal(price),
             "currency": "EUR",
             "free_first_period": True,
-            "note": "засновник клубу",
+            # No note: it would read identically on all 17 rows and add nothing to the
+            # admin list. A note is for a genuinely one-off case.
             "created_at": now,
         }
         for username, price in FOUNDING_MEMBERS

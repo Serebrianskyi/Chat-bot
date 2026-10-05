@@ -42,7 +42,7 @@ async def ensure_subscription(
     regular_price: Decimal,
     regular_currency: str,
     period_days: int,
-    legacy_offer_deadline: datetime | None,
+    free_period_until: datetime | None,
     now: datetime,
 ) -> tuple[Subscription, bool]:
     """Return this user's subscription, creating it on first ``/start``.
@@ -65,7 +65,7 @@ async def ensure_subscription(
         discount_grants_free_period=discount is not None and discount.free_first_period,
         in_community=in_community,
         now=now,
-        legacy_offer_deadline=legacy_offer_deadline,
+        free_period_until=free_period_until,
     )
 
     subscription = Subscription(
@@ -82,7 +82,12 @@ async def ensure_subscription(
         price_tier=decision.tier,
         period_days=period_days,
         started_at=now,
-        expires_at=first_expiry(decision, now=now, period_days=period_days),
+        expires_at=first_expiry(
+            decision,
+            now=now,
+            period_days=period_days,
+            free_period_until=free_period_until,
+        ),
         free_period_granted=decision.first_period_free,
         source="wayforpay",
     )

@@ -55,20 +55,22 @@ def decide_price(
     has_discount: bool,
     in_community: bool,
     now: datetime,
-    legacy_offer_deadline: datetime | None,
+    free_period_until: datetime | None,
     discount_grants_free_period: bool = False,
 ) -> PriceDecision:
     """Resolve base price, tier and free period for one user at ``/start``.
 
-    ``legacy_offer_deadline`` closes the migration window. Until the community is gated, anyone
-    could join the free chat and then start the bot to claim a free month; after the deadline,
-    community membership stops buying one. A discount is explicit and deliberate, so it survives
-    the deadline — only the free period is withdrawn.
+    ``free_period_until`` is both the end of the free period and the close of the offer: before it,
+    a qualifying member is free until that date; after it, nobody gets a free period and billing is
+    monthly from the start. One date rather than two settings, because they are the same decision.
+
+    Until the channel is gated, anyone could join it and then start the bot to claim a free month,
+    which is the other reason the offer needs an end.
 
     The base price is the regular tariff in every case. A discounted member is marked as such by
     the tier, not by a reduced ``price``: the reduction is applied per invoice, so it can end.
     """
-    offer_open = legacy_offer_deadline is None or now < legacy_offer_deadline
+    offer_open = free_period_until is None or now < free_period_until
 
     # Two independent ways to earn the free first period:
     #   * already in the community when they started the bot (the migration incentive), or
@@ -92,16 +94,31 @@ def decide_price(
     )
 
 
-def first_expiry(decision: PriceDecision, *, now: datetime, period_days: int) -> datetime:
+def first_expiry(
+    decision: PriceDecision,
+    *,
+    now: datetime,
+    period_days: int,
+    free_period_until: datetime | None = None,
+) -> datetime:
     """When the first payment falls due.
 
-    A free first period pushes the due date out by one period. Everyone else owes immediately, so
-    ``expires_at`` is ``now`` — the due-date job picks them up on its next run rather than needing
-    a separate "unpaid from the start" branch.
+    With ``free_period_until`` set, every free first period ends on that **same date** rather than
+    N days after each person happened to join. Someone starting on the 5th and someone starting on
+    the 28th both pay from the same day, which is what "free until the end of the month" means —
+    staggered 30-day windows would have the club billing people on 30 different dates forever.
+
+    Without it, a free period simply runs one period from today.
+
+    Everyone who owes immediately gets ``now``, so the due-date job picks them up on its next run
+    rather than needing a separate "unpaid from the start" branch.
     """
-    if decision.first_period_free:
-        return now + timedelta(days=period_days)
-    return now
+    if not decision.first_period_free:
+        return now
+    if free_period_until is not None:
+        # The caller only grants a free period while the offer is open, so this is in the future.
+        return free_period_until
+    return now + timedelta(days=period_days)
 
 
 def extend(current_expiry: datetime, *, now: datetime, period_days: int) -> datetime:

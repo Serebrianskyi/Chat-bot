@@ -31,7 +31,7 @@ from db.models import (
 from db.session import create_engine
 from services import discounts as discount_service
 from services.billing import BillingConfig, poll_open_payments, process_due_subscriptions
-from services.pricing import decide_price, extend
+from services.pricing import decide_price, extend, first_expiry
 from services.wayforpay import (
     RESPONSE_SIGNATURE_FIELDS,
     SignatureMismatch,
@@ -111,7 +111,7 @@ def decide(**over):
         "has_discount": False,
         "in_community": False,
         "now": NOW,
-        "legacy_offer_deadline": None,
+        "free_period_until": None,
     }
     kwargs.update(over)
     return decide_price(**kwargs)
@@ -142,13 +142,30 @@ def test_who_pays_what_and_who_gets_a_free_month():
     assert decide(has_discount=True, discount_grants_free_period=True).first_period_free is True
 
 
-def test_the_deadline_closes_the_free_period_offer():
-    """Until the channel is gated, anyone could join it and claim a free month."""
+def test_the_free_period_ends_on_a_fixed_date_not_n_days_after_joining():
+    """ "Free until the end of the month" has to mean one shared date. Staggered 30-day windows
+    would leave the club billing people on 30 different days of the month, forever.
+
+    The same date also closes the offer: after it, nobody gets a free period, which is what stops
+    someone joining the open channel later and claiming a free month."""
+    first_of_november = datetime(2026, 11, 1, tzinfo=UTC)
+
+    # Joining on the 1st and on the 28th both end on the same day.
+    for day in (1, 28):
+        joined = datetime(2026, 10, day, 12, 0, tzinfo=UTC)
+        decision = decide(in_community=True, now=joined, free_period_until=first_of_november)
+        assert decision.first_period_free is True
+        assert (
+            first_expiry(decision, now=joined, period_days=30, free_period_until=first_of_november)
+            == first_of_november
+        )
+
+    # On or after the date, no free period at all: billing is monthly from the start.
+    after = datetime(2026, 11, 1, 0, 0, tzinfo=UTC)
+    late = decide(in_community=True, now=after, free_period_until=first_of_november)
+    assert late.first_period_free is False
     assert (
-        decide(
-            in_community=True, legacy_offer_deadline=NOW - timedelta(seconds=1)
-        ).first_period_free
-        is False
+        first_expiry(late, now=after, period_days=30, free_period_until=first_of_november) == after
     )
 
 
@@ -208,15 +225,17 @@ async def test_start_registers_once_and_invoices_a_paying_joiner(
             await session.execute(select(func.count()).select_from(Subscription))
         ).scalar_one() == 1
     assert len(fake_wayforpay.invoice_calls) == 1
-    buttons = [
-        b.url
-        for c in recording_session.of_type("SendMessage")
-        if c.reply_markup
-        for row in c.reply_markup.inline_keyboard
-        for b in row
-        if b.url
-    ]
-    assert any("secure.wayforpay.com" in u for u in buttons)
+
+    # The first /start sends two messages, not three: the club pitch, then the tariff carrying
+    # the pay button. The button used to arrive in a message of its own headed "time to renew",
+    # which made no sense for somebody who had just joined. The second /start adds one more
+    # message, the "already registered" reply.
+    sent = recording_session.of_type("SendMessage")
+    assert len(sent) == 3
+    buttons = [b for row in sent[1].reply_markup.inline_keyboard for b in row]
+    assert buttons[0].text == texts.PAY_BUTTON.format(club=texts.CLUB_NAME)
+    assert "secure.wayforpay.com" in buttons[0].url
+    assert texts.MENU_MY_SUBSCRIPTION in [b.text for b in buttons]
 
 
 async def test_a_founding_member_is_matched_pinned_and_given_a_free_month(

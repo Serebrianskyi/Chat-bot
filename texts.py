@@ -205,7 +205,7 @@ AUTORENEW_RESUMED = "Автопродовження відновлено. Нас
 # already knows it exists. /admin is registered per-admin, so ordinary members are not shown a
 # command they cannot use.
 
-CMD_START = "Почати / моя підписка"
+CMD_START = "Почати"
 CMD_SUBSCRIPTION = "Моя підписка"
 CMD_CANCEL = "Скасувати поточну дію"
 CMD_ADMIN = "Адмін-панель"

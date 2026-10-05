@@ -69,15 +69,25 @@ async def is_in_community(bot: Bot, chat_id: str | None, user_id: int) -> bool:
         return False
 
 
-def member_keyboard(is_admin: bool) -> InlineKeyboardMarkup:
+def member_keyboard(is_admin: bool, *, pay_url: str | None = None) -> InlineKeyboardMarkup:
     """What a member can reach from the welcome.
 
-    Without this the only way in is typing a command nobody mentioned. Buttons for features that
-    do not exist yet are deliberately absent — a button that answers "later" is worse than none.
+    When there is something to pay, the pay button goes **first and on this same message**. It used
+    to arrive in a second message of its own, which meant the greeting said "the link is below" and
+    the link was in a different bubble entirely, under a heading about renewing a subscription the
+    person had never had.
+
+    Buttons for features that do not exist yet are deliberately absent — a button that answers
+    "later" is worse than no button.
     """
-    rows = [
+    rows: list[list[InlineKeyboardButton]] = []
+    if pay_url:
+        rows.append(
+            [InlineKeyboardButton(text=texts.PAY_BUTTON.format(club=texts.CLUB_NAME), url=pay_url)]
+        )
+    rows.append(
         [InlineKeyboardButton(text=texts.MENU_MY_SUBSCRIPTION, callback_data="menu:subscription")]
-    ]
+    )
     if is_admin:
         rows.append([InlineKeyboardButton(text=texts.ADMIN_MENU_TITLE, callback_data="menu:admin")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -148,7 +158,7 @@ async def handle_start(
         regular_price=settings.subscription_price,
         regular_currency=settings.subscription_currency,
         period_days=settings.subscription_period_days,
-        legacy_offer_deadline=settings.legacy_offer_deadline,
+        free_period_until=settings.free_period_until,
         now=now,
     )
     await session.commit()
@@ -221,14 +231,13 @@ async def handle_start(
         log.warning("No invoice for %s at /start; the daily job will retry", telegram_id)
         return
 
+    # One message: the tariff and the button that acts on it. Splitting them produced a second
+    # bubble headed "time to renew" for someone who had just arrived.
     quoted = texts.money(payment.amount, payment.currency)
-    # The menu goes on the tariff message; the pay link follows with its own single button, so
-    # the two keyboards do not compete for attention.
     await message.answer(
         texts.WELCOME_PAY.format(club=texts.CLUB_NAME, amount=quoted, period=period_days),
-        reply_markup=member_keyboard(is_admin),
+        reply_markup=member_keyboard(is_admin, pay_url=payment.invoice_url),
     )
-    await billing.send_payment_link(bot, subscription=subscription, payment=payment)
     log.info("Invoiced %s at /start: %s %s", telegram_id, payment.amount, payment.currency)
 
 

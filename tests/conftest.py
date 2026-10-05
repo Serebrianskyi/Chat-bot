@@ -146,8 +146,14 @@ CHANNEL_ID = "-1001234567890"
 
 @pytest.fixture
 def settings() -> Settings:
-    """Settings built explicitly, never read from the developer's environment."""
+    """Settings built explicitly, never read from the developer's environment.
+
+    ``_env_file=None`` is what makes that true. Without it pydantic-settings fills any field not
+    passed here from the real ``.env`` on disk, so adding a variable locally silently changes test
+    outcomes — which is exactly what happened when FREE_PERIOD_UNTIL was set.
+    """
     return Settings(
+        _env_file=None,
         bot_token=FAKE_TOKEN,
         admin_ids=str(ADMIN_ID),
         channel_id=CHANNEL_ID,
@@ -157,7 +163,8 @@ def settings() -> Settings:
         subscription_period_days=PERIOD_DAYS,
         wayforpay_merchant_account="test_merchant",
         wayforpay_merchant_domain="example.com",
-        wayforpay_secret_key="test_secret",
+        wayforpay_secret_key="test_secret",  # noqa: S106
+        free_period_until=None,
     )
 
 

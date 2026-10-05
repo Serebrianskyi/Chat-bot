@@ -82,10 +82,14 @@ class Settings(BaseSettings):
     #: SecretStr for the same reason as bot_token. This one signs money.
     wayforpay_secret_key: SecretStr | None = None
 
-    # After this moment, being in the community no longer buys a free first period. Leave unset
-    # while migrating; set it once the community is gated, or anyone who joins the free chat can
-    # claim a free month. ISO-8601, UTC assumed if no offset is given.
-    legacy_offer_deadline: datetime | None = None
+    # When the free first period ends, for everybody who qualifies for one.
+    #
+    # Set it to the moment billing should begin — e.g. 2026-11-01T00:00:00+02:00 means "free until
+    # the end of October, monthly from November". It is one date doing two jobs: the free period
+    # ends there, and anyone starting the bot after it gets no free period at all.
+    #
+    # Give it an offset. Without one it is read as UTC, which in Kyiv winter is two hours early.
+    free_period_until: datetime | None = None
 
     # Display time zone. Storage is always UTC — see CLAUDE.md rule 1.
     display_timezone: str = "Europe/Kyiv"
@@ -173,10 +177,10 @@ class Settings(BaseSettings):
             return "postgresql+psycopg://" + value[len("postgresql://") :]
         return value
 
-    @field_validator("legacy_offer_deadline")
+    @field_validator("free_period_until")
     @classmethod
     def _deadline_must_be_aware(cls, value: datetime | None) -> datetime | None:
-        """A naive deadline has no defined instant, so assume UTC (CLAUDE.md rule 1)."""
+        """A naive datetime has no defined instant, so assume UTC (CLAUDE.md rule 1)."""
         if value is not None and value.tzinfo is None:
             return value.replace(tzinfo=UTC)
         return value
