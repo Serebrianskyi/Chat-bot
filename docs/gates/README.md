@@ -4,18 +4,18 @@ One file per closed phase: `phase-0.md`, `phase-1.md`, … Copy `TEMPLATE.md` to
 Together these are the project's release history — they are the evidence that a phase
 actually passed, not just that it felt finished.
 
-| Gate | Phase                             | Record | Status      |
-| ---- | --------------------------------- | ------ | ----------- |
-| 0    | Setup and hello world             | —      | repo side done; bots + CI need a human |
-| 1    | Skeleton, database, admin gate    | [phase-1.md](phase-1.md) | automated items green; blocked on S9 |
-| 2A   | Onboarding + subscription start   | [phase-2a-onboarding-payments.md](phase-2a-onboarding-payments.md) | automated items green; blocked on A.21, S4, S9 |
-| 2    | Knowledge base                    | —      | **deferred** — reordered after 2A |
-| 3    | Manual subscriptions and access   | —      | not started |
-| 4    | Production infrastructure         | —      | not started |
-| 5    | WayForPay payments                | —      | not started |
-| 6    | Networking profiles               | —      | not started |
-| 7    | Broadcasts and statistics         | —      | not started |
-| 8    | Launch                            | —      | not started |
+| Gate | Phase | Record | Status |
+| ---- | ----- | ------ | ------ |
+| 0 | Setup | — | **done.** One live bot (not the plan's prod/test pair), channel configured, repo pushed, CI running |
+| 1 | Skeleton, database, admin gate | [phase-1.md](phase-1.md) | automated items green; S9 (phone test) never formally recorded |
+| 2A | Onboarding + subscription start | [phase-2a-onboarding-payments.md](phase-2a-onboarding-payments.md) | automated items green; **A.21 open** — no real payment has been made |
+| 2 | Knowledge base | — | **deferred**, reordered after 2A |
+| 3 | Manual subscriptions and access | — | partly absorbed into 2A. Removal and manual grants outstanding |
+| 4 | Production infrastructure | — | **partly done**: deployed on Railway with managed Postgres and migrate-on-deploy. No webhook, Sentry, uptime monitoring or backups |
+| 5 | WayForPay payments | — | **partly done**: invoicing and confirmation live. Renewals (`CHARGE`) not built |
+| 6 | Networking profiles | — | not started |
+| 7 | Broadcasts and statistics | — | not started |
+| 8 | Launch | — | not started |
 
 Update this table when a gate closes, and link the record.
 

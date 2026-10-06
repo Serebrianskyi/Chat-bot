@@ -312,6 +312,15 @@ async def poll_open_payments(
                 payment.status = PaymentStatus.ERROR
                 payment.last_checked_at = now
                 continue
+            except Exception:
+                # Anything else is a bug, not a gateway answer — an unparseable field, say. One
+                # such row used to abort the whole job before ``session.commit()``, so no other
+                # open payment was ever checked and any status learned earlier in the run was
+                # rolled back. Skip the row instead: ERROR is non-terminal, so it is retried.
+                log.exception("Status check crashed for %s", payment.order_reference)
+                payment.status = PaymentStatus.ERROR
+                payment.last_checked_at = now
+                continue
 
             extended = await subs.apply_payment_result(
                 session,
@@ -328,33 +337,44 @@ async def poll_open_payments(
 
             if extended:
                 counts["completed"] += 1
-                subscription = await session.get(Subscription, payment.subscription_id)
-                if subscription is not None:
-                    # A first payment and a renewal read differently to the member: one is a
-                    # welcome, the other a receipt. free_period_granted tells them apart.
-                    template = (
-                        texts.PAYMENT_RENEWED
-                        if subscription.free_period_granted
-                        else texts.PAYMENT_FIRST_CONFIRMED
-                    )
-                    try:
-                        await bot.send_message(
-                            subscription.user_id,
-                            template.format(
-                                club=texts.CLUB_NAME,
-                                until=texts.day(subscription.expires_at.date()),
-                            ),
+                # Telling the member is separate from having granted them the period. A failure
+                # here is logged and dropped, and must never write back to ``payment.status``:
+                # downgrading a COMPLETE row would put it back in the poll query, and
+                # ``apply_payment_result``'s idempotency guard only holds while it reads COMPLETE,
+                # so the next Approved would extend the subscription a second time (A.11).
+                try:
+                    subscription = await session.get(Subscription, payment.subscription_id)
+                    if subscription is not None:
+                        # A first payment and a renewal read differently to the member: one is a
+                        # welcome, the other a receipt. free_period_granted tells them apart.
+                        template = (
+                            texts.PAYMENT_RENEWED
+                            if subscription.free_period_granted
+                            else texts.PAYMENT_FIRST_CONFIRMED
                         )
-                    except TelegramForbiddenError:
-                        log.warning("Paid but unreachable: %s", subscription.user_id)
+                        try:
+                            await bot.send_message(
+                                subscription.user_id,
+                                template.format(
+                                    club=texts.CLUB_NAME,
+                                    until=texts.day(subscription.expires_at.date()),
+                                ),
+                            )
+                        except TelegramForbiddenError:
+                            log.warning("Paid but unreachable: %s", subscription.user_id)
 
-                    await deliver_invite(
-                        session,
-                        bot,
-                        subscription=subscription,
-                        channel_id=config.channel_id,
-                        admin_ids=admin_ids,
-                        now=now,
+                        await deliver_invite(
+                            session,
+                            bot,
+                            subscription=subscription,
+                            channel_id=config.channel_id,
+                            admin_ids=admin_ids,
+                            now=now,
+                        )
+                except Exception:
+                    log.exception(
+                        "Paid and extended, but announcing it failed for %s",
+                        payment.order_reference,
                     )
             elif payment.status is PaymentStatus.DENIED:
                 counts["failed"] += 1

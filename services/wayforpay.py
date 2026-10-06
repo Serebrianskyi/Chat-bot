@@ -28,7 +28,7 @@ import hashlib
 import hmac
 import logging
 from dataclasses import dataclass, field
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any
 
 import httpx
@@ -78,6 +78,33 @@ def format_amount(amount: Decimal) -> str:
     Used for both the signature and the payload so they cannot disagree.
     """
     return str(amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def parse_amount(value: Any, *, order_reference: str, gateway_status: str | None) -> Decimal | None:
+    """Read a gateway ``amount`` into a Decimal, or None when there is no number in it.
+
+    WayForPay sends an empty ``amount`` for an order that never carried money — an invoice that
+    expired unpaid is the case seen in production — and the response is signed with that blank in
+    place, so the body is genuine and must not be rejected. Returning None rather than raising
+    keeps the poller alive: ``apply_payment_result`` already refuses to grant access without an
+    amount, so nothing loosens on the money path.
+
+    The offending value is logged because the crash this replaces happened before the raw body was
+    persisted, leaving nothing to inspect afterwards. Only the amount and the status are logged —
+    never the body, which carries the signature (standing gate S5).
+    """
+    if value is None:
+        return None
+    try:
+        return Decimal(str(value))
+    except InvalidOperation:
+        log.warning(
+            "Unparseable amount %r for order %s (transactionStatus=%r); treating it as absent",
+            value,
+            order_reference,
+            gateway_status,
+        )
+        return None
 
 
 def sign(secret_key: str, fields: list[str]) -> str:
@@ -264,12 +291,16 @@ class WayForPayClient:
         data = await self._post(payload)
         self.verify_response(data)
 
-        raw_amount = data.get("amount")
+        gateway_status = data.get("transactionStatus")
         return TransactionStatus(
             order_reference=order_reference,
-            status=map_status(data.get("transactionStatus")),
-            gateway_status=data.get("transactionStatus"),
-            amount=Decimal(str(raw_amount)) if raw_amount is not None else None,
+            status=map_status(gateway_status),
+            gateway_status=gateway_status,
+            amount=parse_amount(
+                data.get("amount"),
+                order_reference=order_reference,
+                gateway_status=gateway_status,
+            ),
             currency=data.get("currency"),
             reason_code=str(data["reasonCode"]) if data.get("reasonCode") is not None else None,
             rec_token=data.get("recToken"),

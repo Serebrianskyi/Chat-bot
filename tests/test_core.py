@@ -38,6 +38,7 @@ from services.wayforpay import (
     WayForPayClient,
     WayForPayError,
     map_status,
+    parse_amount,
 )
 from tests.conftest import (
     ADMIN_ID,
@@ -523,6 +524,121 @@ async def test_a_wrong_amount_is_refused(session_factory, bot, config):
 
     assert (await one_payment(session_factory)).status is PaymentStatus.ERROR
     assert (await load_sub(session_factory)).expires_at == NOW
+
+
+async def test_an_expired_invoice_with_a_blank_amount_does_not_crash_the_poller(session_factory):
+    """Production, 2026-10-06: WayForPay answered CHECK_STATUS with ``"amount": ""``.
+
+    The body is signed with the blank in place, so it is genuine and must be read, not rejected.
+    ``Decimal("")`` raised out of the client, out of the job's loop and past ``session.commit()``,
+    so every two minutes the whole poll run died and no open payment was checked at all. A blank
+    amount must come back as None, which ``apply_payment_result`` already refuses to grant on.
+    """
+    import hashlib
+    import hmac
+
+    import httpx
+
+    body = {
+        "merchantAccount": "acct",
+        "orderReference": "o1",
+        "amount": "",
+        "currency": "",
+        "transactionStatus": "Expired",
+        "reasonCode": 1108,
+    }
+    body["merchantSignature"] = hmac.new(
+        b"secret",
+        ";".join(str(body.get(f, "") or "") for f in RESPONSE_SIGNATURE_FIELDS).encode(),
+        hashlib.md5,
+    ).hexdigest()
+
+    client = WayForPayClient(
+        merchant_account="acct",
+        merchant_domain="example.com",
+        secret_key="secret",  # noqa: S106
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json=body)),
+    )
+
+    result = await client.check_status(order_reference="o1")
+
+    assert result.amount is None  # not an exception, and not Decimal("0")
+    assert result.status is PaymentStatus.CANCELED  # Expired is terminal: stop polling it
+    # An unparseable amount is equally absent, rather than fatal.
+    assert parse_amount("10 EUR", order_reference="o1", gateway_status="Approved") is None
+    assert parse_amount("10.00", order_reference="o1", gateway_status="Approved") == Decimal("10")
+
+
+async def test_one_broken_row_does_not_cost_everyone_else_their_payment(
+    session_factory, bot, config
+):
+    """The real damage of the crash above: one unreadable row aborted the run for every other.
+
+    A payment that raises must be stepped over — and a payment already granted must stay
+    ``complete`` even if telling the member fails, because a downgraded row is polled again and
+    ``apply_payment_result``'s idempotency guard only holds while it reads COMPLETE (A.11).
+    """
+    other_id = USER_ID + 1
+    await seed_due(session_factory)
+    async with session_factory() as session:
+        session.add(User(telegram_id=other_id, username="second"))
+        session.add(
+            Subscription(
+                user_id=other_id,
+                status=SubscriptionStatus.PAST_DUE,
+                price=REGULAR_PRICE,
+                currency=CURRENCY,
+                price_tier=PriceTier.REGULAR,
+                period_days=PERIOD_DAYS,
+                started_at=NOW - timedelta(days=PERIOD_DAYS),
+                expires_at=NOW,
+            )
+        )
+        await session.commit()
+
+    gw = FakeGateway()
+    await process_due_subscriptions(
+        session_factory, gw, bot, admin_ids=frozenset({ADMIN_ID}), config=config, now=NOW
+    )
+    async with session_factory() as session:
+        refs = {
+            p.user_id: p.order_reference
+            for p in (await session.execute(select(Payment))).scalars().all()
+        }
+    assert len(refs) == 2
+
+    async def check_status(*, order_reference):
+        if order_reference == refs[USER_ID]:
+            raise ValueError("unparseable field")  # stands in for the Decimal("") crash
+        return approved(order_reference)
+
+    gw.check_status = check_status
+
+    # Announcing the good payment fails too, which must not undo it.
+    async def unreachable(*a, **k):
+        raise RuntimeError("Telegram is down")
+
+    bot.send_message = unreachable
+
+    counts = await poll_open_payments(session_factory, gw, bot, config=config, now=NOW)
+
+    async with session_factory() as session:
+        paid = await session.scalar(
+            select(Payment).where(Payment.order_reference == refs[other_id])
+        )
+        broken = await session.scalar(
+            select(Payment).where(Payment.order_reference == refs[USER_ID])
+        )
+        good_sub = await session.scalar(
+            select(Subscription).where(Subscription.user_id == other_id)
+        )
+
+    assert counts["completed"] == 1  # the run finished instead of dying on the first row
+    assert paid.status is PaymentStatus.COMPLETE  # committed, not rolled back
+    assert good_sub.expires_at == NOW + timedelta(days=PERIOD_DAYS)
+    assert good_sub.status is SubscriptionStatus.ACTIVE
+    assert broken.status is PaymentStatus.ERROR  # non-terminal, so it is retried
+    assert broken.last_checked_at == NOW
 
 
 async def test_a_discount_changes_the_invoiced_sum(session_factory, bot, config):

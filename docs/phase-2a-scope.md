@@ -82,3 +82,28 @@ link, and have their payment confirmed — with an admin told when one is missin
   against real Telegram until the bot is added to the community as administrator.
 - **Phase 1's gate is still open** (S9 phone smoke test, S4 secrets scan). This slice is built on
   top of it at the owner's direction.
+
+---
+
+## 5. Where this stands — 2026-10-06
+
+Every item in scope is built, and several things were added on top as the owner refined the
+requirements:
+
+| Added after the original scope | Why |
+| --- | --- |
+| Invoicing at `/start` rather than only in the daily job | The welcome promised a payment link; the job delivered it eight hours later |
+| Pay button on the welcome message itself | It used to arrive in a second message headed "time to renew", for somebody who had just joined |
+| `FREE_PERIOD_UNTIL` — one shared end date | "Free until the end of the month" cannot mean 30 days per person, or the club bills on 30 different dates forever |
+| `free_first_period` on a discount | The founding list needed a free month *and* a price, and a bot cannot detect most channel members |
+| Single-use channel invite on payment | Owner asked for it once `CHANNEL_ID` existed |
+| Cancel autorenew, with resume | Required by the specification |
+| 👥 Учасники | Owner had no visibility into who had registered |
+| Command menu + welcome keyboard | `/admin` was unreachable: nothing linked to it and Telegram listed no commands |
+| Two subscription cards | The paid-up card said «Діє до <today>» to someone who owed money |
+
+**Still open on the gate:** A.21 — a sandbox or real payment confirmed end to end. Everything
+else is proven by the 30 tests in `tests/test_core.py` or by having been run against the live bot.
+
+**Known gap:** `PAYMENT_FIRST_CONFIRMED` tells a paying member «оплата автоматична», and
+automatic renewal is not built. The bot is promising something untrue until `CHARGE` is wired up.

@@ -29,15 +29,62 @@ into the payment phase.
 
 ## Current status
 
-**Phase 1 — Skeleton, database, admin gate.** Implemented: `users` + `audit_log` models and
-the first migration, `/start` registration, the `/admin` gate and menu, the global error
-handler. Phases 2–7 modules are still placeholders carrying the phase that fills them.
-Do not implement ahead of the current phase — if a helper has no caller yet, leave it as a
-`TODO(phase-N)` instead of writing it.
+Last updated 2026-10-06. **Working and pushed** (`Serebrianskyi/Chat-bot`, branch `main`),
+deployed on Railway. 32 tests, 6 migrations.
 
-Phase order: 0 Setup → 1 Skeleton/DB/admin gate → 2 Knowledge base → 3 Manual subscriptions
-→ 4 Production infra → 5 WayForPay → 6 Profiles → 7 Broadcasts/stats → 8 Launch.
-Phase 3 is a valid early launch point.
+### Built
+
+| Area | What works |
+| --- | --- |
+| Onboarding | `/start` registers a member, resolves their price, writes a due date, and invoices on the spot. Two messages: the club pitch, then the tariff carrying the **Стати учасником** pay button |
+| Pricing | 10 EUR base. Three tiers: discounted (list or admin grant), already-in-the-channel, new joiner |
+| Free period | Ends on `FREE_PERIOD_UNTIL` — one shared date, not 30 days per person. Set to 2026-11-01 Kyiv. After it, nobody gets one |
+| Founding members | 17 usernames seeded by migration with their 8/10 EUR price and a free first period. Idempotent across deploys |
+| Discounts | Percent or fixed price, optional expiry, soft revocation. The charged amount is computed **per invoice**, so a time-limited discount actually ends |
+| WayForPay | `CREATE_INVOICE`, then `CHECK_STATUS` polled every 2 min. Signature verified both ways, amount checked against the invoice, idempotent on a repeated `Approved` |
+| Channel invite | Single-use, 3-day link on a confirmed payment. Every failure path tells the member something true and alerts an admin |
+| Due dates | Daily job at 09:00 Kyiv invoices whoever has come due, then alerts an admin if still unpaid |
+| Admin panel | 🎟 Знижки · 🎁 Надати знижку · 👥 Учасники. The other four answer "later" |
+| Member area | `/subscription` with status, next amount and date; **Скасувати автопродовження** keeps the paid period |
+| Copy | All Ukrainian, all in `texts.py`. Owner-supplied strings marked `SPEC` |
+| Operator tools | `scripts/discounts.py`, `scripts/run_jobs.py` (`status` is read-only), `scripts/start.sh` |
+
+### Live configuration
+
+Bot `@yourstoryclub_bot`; channel `Create Your Story | Club`, id `-1003980549671`, bot is
+administrator with *Invite users via link* and *Ban users*. Admins: `158032815`, `386701736`.
+
+`@makaolya` (`158032815`) holds a **lifetime subscription**: `expires_at` is 2100-01-01, so no job
+invoices them and no screen shows them a due date. Granted by migration `c3a1f0d27b94`, marked
+`source='lifetime'`. A sentinel date rather than a nullable column, because every job and screen
+is a comparison against `expires_at`.
+
+### Not built — in the order I would do it
+
+1. **Automatic renewals** (`CHARGE` with the stored `recToken`). **This is the most important gap,
+   because the copy already promises it**: `PAYMENT_FIRST_CONFIRMED` tells a paying member
+   «оплата автоматична». Today a renewal requires them to tap a link again, so the bot is saying
+   something that is not yet true. The token is captured; the charging is not written.
+2. **Removal of non-payers.** Five `TODO(removal)` markers mark the exact spot. Deliberately
+   deferred until the payment path has been exercised with real money; an admin is alerted instead.
+3. **Renewal reminder**, one day before the charge. Copy exists (`RENEWAL_REMINDER`), no job.
+4. **Knowledge base** (plan Phase 2) — 10 TODOs; category names already in `texts.py`.
+5. **Networking catalogue** (plan Phase 6) — 6 TODOs; card layout already in `texts.py`.
+6. **Broadcasts and statistics** (plan Phase 7) — 10 TODOs.
+7. **Webhooks, Sentry, uptime monitoring, backups** (plan Phase 4) — 7 TODOs. Polling is in use;
+   a webhook needs a public HTTPS endpoint.
+
+### Never verified with real money
+
+Nobody has completed a payment. Confirmation → invite has only ever run against fakes, and no
+test can close that gap. It is the single most valuable thing left to try.
+
+### Phase numbering
+
+The plan's order was changed on 2026-09-30: the knowledge base (its Phase 2) is deferred, and
+**Phase 2A** — onboarding plus the start of the subscription mechanism — was built instead,
+drawing items from the plan's Phases 3 and 5. `docs/phase-2a-scope.md` holds its item list;
+`docs/gates/README.md` tracks every gate.
 
 ## Non-negotiable rules for every change
 

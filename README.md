@@ -3,12 +3,16 @@
 A paid Telegram community bot: private-channel access, WayForPay recurring subscriptions,
 a knowledge base, networking profiles and an admin panel.
 
-**Status: Phase 2A — onboarding and subscription start.** `/start` registers a user, works out
-what they should pay (custom list / already-in-the-community / new joiner), and writes a due
-date. WayForPay invoices are created and confirmed by polling `CHECK_STATUS`. An overdue member
-is reported to an admin — **not** removed; removal is deliberately deferred.
+**Status: deployed on Railway, taking payments.** `/start` registers a member, prices them,
+invoices them on the spot, and confirms the payment by polling `CHECK_STATUS`. A paid member gets
+a single-use channel invite. An overdue member is reported to an admin — **not** removed; removal
+is deliberately deferred until the payment path has been proven with real money.
 
-Scope and gate: `docs/phase-2a-scope.md`. Mechanics: `docs/telegram-bot-payments-design.md`.
+**Biggest gap:** automatic renewals are not built, and the payment confirmation already tells
+members «оплата автоматична». Until `CHARGE` is wired up, a renewal needs them to tap a link again.
+
+`CLAUDE.md` holds the full done/next list. Scope and gate: `docs/phase-2a-scope.md`.
+Mechanics: `docs/telegram-bot-payments-design.md`.
 
 ## The three documents that govern this project
 
