@@ -1213,6 +1213,76 @@ async def test_the_participants_screen_groups_members_and_stays_one_message(
     assert texts.money(REGULAR_PRICE, CURRENCY) in body
 
 
+async def test_a_broadcast_to_unpaid_members_follows_the_text_with_a_pay_button(
+    dispatcher, bot, session_factory, recording_session, fake_wayforpay
+):
+    """Written for the people who started the bot and never paid. The admin's text alone is an
+    advert with no way to act on it, so each recipient also gets their own payment link.
+
+    Nothing may be sent before the admin has confirmed: a broadcast cannot be recalled.
+    """
+    from handlers.admin import AdminMenu
+
+    await dispatcher.feed_update(bot, make_message(make_user(USER_ID, username="owes"), "/start"))
+    admin = make_user(ADMIN_ID, username="boss")
+
+    # Pick the audience, write the text — and check that the preview alone sends nothing.
+    await dispatcher.feed_update(
+        bot, make_callback(admin, AdminMenu(action="broadcast").pack(), update_id=2)
+    )
+    await dispatcher.feed_update(bot, make_callback(admin, "bcast:unpaid", update_id=3))
+    recording_session.calls.clear()
+    await dispatcher.feed_update(
+        bot, make_message(admin, "Ціну знижено до 8 € — повертайтесь!", update_id=4)
+    )
+
+    preview = recording_session.of_type("SendMessage")
+    assert all(c.chat_id == ADMIN_ID for c in preview)  # the member has heard nothing yet
+    assert any("Ціну знижено до 8 €" in c.text for c in preview)  # shown exactly as it arrives
+    assert any(texts.JOIN_CLUB_BUTTON in c.text for c in preview)  # and what follows it
+
+    # Confirm.
+    recording_session.calls.clear()
+    await dispatcher.feed_update(bot, make_callback(admin, "bcast:send", update_id=5))
+
+    to_member = [c for c in recording_session.of_type("SendMessage") if c.chat_id == USER_ID]
+    assert len(to_member) == 2
+    assert "Ціну знижено до 8 €" in to_member[0].text
+    # The second message is the way back to paying, on a live invoice.
+    button = to_member[1].reply_markup.inline_keyboard[0][0]
+    assert button.text == texts.JOIN_CLUB_BUTTON
+    assert button.url  # a real invoice URL from the gateway
+    assert len(fake_wayforpay.invoice_calls) >= 1
+
+    async with session_factory() as session:
+        entry = await session.scalar(select(AuditLog).where(AuditLog.action == "broadcast.sent"))
+    assert entry.actor_id == ADMIN_ID
+    assert entry.details["audience"] == "unpaid"
+    assert "Ціну знижено" in entry.details["text"]
+
+
+async def test_an_admin_can_post_into_the_channel_only_after_confirming(
+    dispatcher, bot, recording_session, settings
+):
+    """The other direction of the conversation. Nothing reaches the channel from the typing step."""
+    from handlers.admin import AdminMenu
+
+    admin = make_user(ADMIN_ID, username="boss")
+    await dispatcher.feed_update(bot, make_callback(admin, AdminMenu(action="channel_post").pack()))
+    recording_session.calls.clear()
+    await dispatcher.feed_update(bot, make_message(admin, "Зустріч у четвер о 19:00", update_id=2))
+
+    # Preview only: the channel has had nothing.
+    assert all(c.chat_id == ADMIN_ID for c in recording_session.of_type("SendMessage"))
+
+    recording_session.calls.clear()
+    await dispatcher.feed_update(bot, make_callback(admin, "post:send", update_id=3))
+
+    to_channel = [c for c in recording_session.of_type("SendMessage") if c.chat_id == CHANNEL_ID]
+    assert len(to_channel) == 1
+    assert to_channel[0].text == "Зустріч у четвер о 19:00"
+
+
 async def test_cancelling_a_subscription_keeps_the_paid_period(dispatcher, bot, session_factory):
     """SPEC: «Підписка діє до [дата], далі буде скасована»."""
     from db.models import utcnow
@@ -1317,6 +1387,11 @@ def test_every_member_facing_message_is_ukrainian_and_formats_cleanly():
         "text": "Привіт!",
         "step": "перевірка оплат",
         "extra": " — не доставлено",
+        "button": "Стати частиною клубу!",
+        "sent": 50,
+        "blocked": 2,
+        "invoiced": 48,
+        "failed": 0,
     }
     placeholder = re.compile(r"\{(\w+)\}")
     checked = 0

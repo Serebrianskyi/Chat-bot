@@ -267,6 +267,7 @@ ADMIN_MENU_DISCOUNTS = "🎟 Знижки"
 ADMIN_MENU_GRANT_DISCOUNT = "🎁 Надати знижку"
 ADMIN_MENU_SEND_INVITE = "🔗 Надіслати запрошення"
 ADMIN_MENU_MESSAGE_USER = "✍️ Написати учаснику"
+ADMIN_MENU_CHANNEL_POST = "📢 Написати в канал"
 
 # --- the participants list ---
 #
@@ -509,6 +510,73 @@ ADMIN_MESSAGE_EMPTY = "Повідомлення порожнє. Напишіть
 #: How an admin's message arrives for the member. Marked as coming from a person, not the bot:
 #: a bare forwarded string reads like an automated notice and gets ignored.
 MESSAGE_FROM_ADMIN = "Повідомлення від адміністратора {club}:\n\n{text}"
+
+# --- 📣 Розсилка (admin writes to a group of members) ----------------------------------------
+#
+# Built for the people who started the bot and never paid: maybe the price put them off, maybe
+# they simply forgot. The admin picks the group, writes once, and sees exactly what will arrive
+# before anything is sent.
+
+ADMIN_BROADCAST_ASK_AUDIENCE = "<b>Розсилка</b>\n\nКому надіслати? Оберіть групу:"
+
+ADMIN_BROADCAST_ASK_TEXT = (
+    "Кому: <b>{label}</b> — {count} учасник(ів)\n\n"
+    "Напишіть текст розсилки одним повідомленням.\n"
+    "Щоб скасувати — /cancel"
+)
+
+ADMIN_BROADCAST_PREVIEW = "<b>Ось що отримає кожен з {count} учасник(ів):</b>\n— — — — —"
+
+#: Appended to the preview when the group owes money, so the admin knows a second message with
+#: a live payment link follows the text they wrote.
+ADMIN_BROADCAST_PREVIEW_WITH_PAY = (
+    "— — — — —\n\n"
+    "<b>Відразу після цього</b> кожному піде друге повідомлення з кнопкою "
+    "«{button}» і персональним посиланням на оплату."
+)
+
+ADMIN_BROADCAST_PREVIEW_PLAIN = "— — — — —\n\nБільше нічого не надсилатиметься."
+
+ADMIN_BROADCAST_CONFIRM_YES = "✅ Надіслати"
+ADMIN_BROADCAST_EMPTY = "Текст порожній. Напишіть повідомлення або /cancel"
+ADMIN_BROADCAST_NO_AUDIENCE = "У цій групі зараз нікого немає."
+ADMIN_BROADCAST_STARTED = "Надсилаю — {count} учасник(ів). Напишу, коли завершу."
+
+ADMIN_BROADCAST_DONE = (
+    "<b>Розсилку завершено</b>\n\n"
+    "Доставлено: {sent}\n"
+    "Не доставлено (заблокували бота): {blocked}\n"
+    "З посиланням на оплату: {invoiced}\n"
+    "Помилки: {failed}"
+)
+
+#: SPEC-adjacent: the owner's wording for the button that takes a member back to payment.
+JOIN_CLUB_BUTTON = "Стати частиною клубу!"
+
+#: The second message of a broadcast to members who owe money. Deliberately short — the admin's
+#: own text above it is the message; this is only the way back to paying.
+BROADCAST_PAY_PROMPT = (
+    "Щоб приєднатися до {club} — натисніть кнопку нижче.\nВартість: {amount} за {period} днів."
+)
+
+
+# --- 📢 Написати в канал ---------------------------------------------------------------------
+
+ADMIN_CHANNEL_ASK_TEXT = (
+    "<b>Пост у канал</b>\n\n"
+    "Напишіть текст одним повідомленням — бот опублікує його в каналі {club}.\n"
+    "Щоб скасувати — /cancel"
+)
+
+ADMIN_CHANNEL_PREVIEW = "<b>Ось як це буде виглядати в каналі:</b>\n— — — — —"
+ADMIN_CHANNEL_PREVIEW_FOOTER = "— — — — —\n\nОпублікувати?"
+ADMIN_CHANNEL_CONFIRM_YES = "✅ Опублікувати"
+ADMIN_CHANNEL_SENT = "✅ Опубліковано в каналі."
+ADMIN_CHANNEL_FAILED = (
+    "Не вдалося опублікувати. Перевірте, що бот — адміністратор каналу "
+    "з правом публікувати повідомлення."
+)
+ADMIN_CHANNEL_NO_ID = "CHANNEL_ID не заданий — немає куди публікувати."
 
 # --- the report an admin gets after the bot boots --------------------------------------------
 #

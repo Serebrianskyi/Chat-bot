@@ -40,8 +40,11 @@ class Action:
     INVITE_ESCALATED = "invite.escalated"
     #: An admin wrote to a member through the bot.
     MESSAGE_SENT = "message.sent"
+    #: One row per broadcast, with the audience and the text that went out.
+    BROADCAST_SENT = "broadcast.sent"
+    #: One row per post the bot published in the channel.
+    CHANNEL_POST = "channel.post"
     # TODO(phase-2): material.created / material.deleted / category.renamed ...
-    # TODO(phase-7): broadcast.sent
 
 
 async def record_action(

@@ -64,6 +64,10 @@ def build_dispatcher(
         settings=settings,
         wayforpay=wayforpay,
         billing_config=billing_config or build_billing_config(settings),
+        # A broadcast outlives the one-session-per-update contract: it opens a session per
+        # recipient so one failed invoice cannot roll back the others. It therefore needs the
+        # factory itself, not the session the middleware injects.
+        session_factory=session_factory,
     )
 
     # Outer, so every update type gets a session before any filter runs.

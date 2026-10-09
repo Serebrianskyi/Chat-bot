@@ -47,9 +47,11 @@ deployed on Railway. 39 tests, 7 migrations.
 | Startup report | After the boot sweep, admins get **one** message: who had a payment recovered, who was sent a link, and who still needs a person — each with a tap-to-copy id and the reason. Built from `audit_log`, so it reports what was recorded, not what was attempted. A failed step is named. Nothing to report means no message |
 | Invite recovery | **Runs on every boot**, and daily at 10:00 Kyiv: finds paid members who are not in the channel and sends one retry. If that does not get them in, an admin is told directly — handle, id, name, reason — and the member is not touched again. Scope is everyone holding paid access, **plus** anyone with a confirmed payment who has never been sent a link at all, even if their period has lapsed — otherwise a payer whose invite failed drops out of scope when their month runs out. A free trial is **not** a payment: TRIAL subscriptions are never messaged by it |
 | Reconciliation | Re-asks WayForPay about orders this bot wrote off and credits the ones really paid, with their invites. **Runs on every boot** (`recover_access_at_startup`), and by hand as `run_jobs reconcile`, which is a dry run until `--apply`. Only members who currently have **no** access are in scope, so a hand-written credit cannot be doubled, and one member is credited at most once per sweep |
-| Admin panel | 🎟 Знижки · 🎁 Надати знижку · 👥 Учасники · 🔗 Надіслати запрошення · ✍️ Написати учаснику (admin dictates, the bot delivers — the only way to reach a member with no username). The other four answer "later". 👥 Учасники opens on counts with a button per group — 🔄 автопродовження · ⏹ скасували автопродовження · 🎁 пробний період · ⏳ очікують оплати · ♾ безстрокові · ❓ без підписки — so it stays one message as the club grows; tapping a group lists only that group, naming people without a username by their first name |
+| Admin panel | 🎟 Знижки · 🎁 Надати знижку · 👥 Учасники · 🔗 Надіслати запрошення · ✍️ Написати учаснику (admin dictates, the bot delivers — the only way to reach a member with no username) · 📣 Розсилка · 📢 Написати в канал. The other four answer "later". 👥 Учасники opens on counts with a button per group — 🔄 автопродовження · ⏹ скасували автопродовження · 🎁 пробний період · ⏳ очікують оплати · ♾ безстрокові · ❓ без підписки — so it stays one message as the club grows; tapping a group lists only that group, naming people without a username by their first name |
 | Member area | `/subscription` with status, next amount and date; **Скасувати автопродовження** keeps the paid period |
 | Copy | All Ukrainian, all in `texts.py`. Owner-supplied strings marked `SPEC` |
+| Broadcast | 📣 Розсилка: pick a group (the same groups 👥 Учасники uses) → write the text → **see it rendered exactly as it will arrive** → confirm. For ⏳ Очікують оплати each recipient also gets a second message with «Стати частиною клубу!» and their own live invoice, since the text alone gives them no way to act. Held to 20 messages/second, honours `RetryAfter` without skipping or duplicating anybody (rule 10). One `audit_log` row per broadcast, carrying the audience and the text |
+| Channel posts | 📢 Написати в канал: the bot publishes an admin's text in the private channel, with the same preview-then-confirm step, so the club can speak there as well as read |
 | Operator tools | `scripts/discounts.py`, `scripts/run_jobs.py` (`status` is read-only), `scripts/diagnose.py` (read-only: `access` tells a bot failure from a member who never used their link, `reasons` groups what WayForPay actually said), `scripts/start.sh` |
 
 ### Live configuration
@@ -73,7 +75,7 @@ is a comparison against `expires_at`.
 3. **Renewal reminder**, one day before the charge. Copy exists (`RENEWAL_REMINDER`), no job.
 4. **Knowledge base** (plan Phase 2) — 10 TODOs; category names already in `texts.py`.
 5. **Networking catalogue** (plan Phase 6) — 6 TODOs; card layout already in `texts.py`.
-6. **Broadcasts and statistics** (plan Phase 7) — 10 TODOs.
+6. **Statistics** (plan Phase 7). Broadcasts are built — see the table above; statistics are not.
 7. **Webhooks, Sentry, uptime monitoring, backups** (plan Phase 4) — 7 TODOs. Polling is in use;
    a webhook needs a public HTTPS endpoint.
 
