@@ -64,10 +64,20 @@ def parse_months(raw: str) -> int | None:
     return months if 1 <= months <= MAX_MONTHS else None
 
 
-#: Audiences that have not paid, and so are sent the payment link after the admin's text. TRIAL
-#: is not here: a free period is running, nothing is owed yet, and a payment button would be
-#: asking for money the club has not asked for.
-AUDIENCES_OWED_PAYMENT = frozenset({"unpaid"})
+#: Audiences whose members get the payment link after the admin's text, and whose flow therefore
+#: includes the price step.
+#:
+#: ``unpaid`` is the real target: they started the bot and never paid.
+#:
+#: ``lifetime`` is there so the whole thing can be rehearsed. That group is the admins holding a
+#: no-end-date grant — in practice the owner's own account — so choosing it walks exactly the same
+#: steps, issues a real invoice and delivers a real «Стати частиною клубу!» button to one person
+#: who can check it works before fifty-three members see it. A test path that skipped the price
+#: step or the button would prove nothing about the one that matters.
+#:
+#: TRIAL is deliberately absent: a free period is running, nothing is owed yet, and a payment
+#: button would be asking for money the club has not asked for.
+AUDIENCES_WITH_PAY_LINK = frozenset({"unpaid", "lifetime"})
 
 
 class Broadcast(StatesGroup):
@@ -92,6 +102,24 @@ def _audience_keyboard(counts: dict[str, int]) -> InlineKeyboardMarkup:
             if counts.get(key)
         ]
     )
+
+
+def _sample_pay_keyboard() -> InlineKeyboardMarkup:
+    """The pay button as it will look, carrying no URL.
+
+    A callback button rather than a URL one: the real link is built per member at send time, and
+    a preview button pointing at a plausible-looking dead URL would be worse than none. Tapping
+    this says so.
+    """
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=texts.JOIN_CLUB_BUTTON, callback_data="bcast:sample")]
+        ]
+    )
+
+
+async def explain_sample_button(query: CallbackQuery) -> None:
+    await query.answer(texts.ADMIN_BROADCAST_SAMPLE_ALERT, show_alert=True)
 
 
 def _confirm_keyboard(yes_text: str, yes_data: str) -> InlineKeyboardMarkup:
@@ -212,7 +240,7 @@ def _period_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def receive_broadcast_text(message: Message, state: FSMContext) -> None:
+async def receive_broadcast_text(message: Message, state: FSMContext, settings: Settings) -> None:
     """Hold the text, then ask what the payment link should charge.
 
     The audiences that are not sent a payment link skip straight to the preview: there is no
@@ -227,20 +255,22 @@ async def receive_broadcast_text(message: Message, state: FSMContext) -> None:
     await state.update_data(body=body, photo=photo)
     data = await state.get_data()
 
-    if data.get("audience") in AUDIENCES_OWED_PAYMENT:
+    if data.get("audience") in AUDIENCES_WITH_PAY_LINK:
         await state.set_state(Broadcast.waiting_for_price)
         await message.answer(texts.ADMIN_BROADCAST_ASK_PRICE, reply_markup=_price_keyboard())
         return
 
-    await _show_preview(message, state)
+    await _show_preview(message, state, settings)
 
 
-async def choose_price(query: CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+async def choose_price(
+    query: CallbackQuery, state: FSMContext, session: AsyncSession, settings: Settings
+) -> None:
     await query.answer()
     if query.message is None:
         return
     if (query.data or "").endswith("regular"):
-        await _show_preview(query.message, state)
+        await _show_preview(query.message, state, settings)
         return
     await state.set_state(Broadcast.waiting_for_amount)
     await query.message.answer(texts.ADMIN_BROADCAST_ASK_AMOUNT)
@@ -297,7 +327,7 @@ async def _apply_months(
         months=months,
         days=months * settings.subscription_period_days if months else None,
     )
-    await _show_preview(message, state)
+    await _show_preview(message, state, settings)
 
 
 async def choose_period(query: CallbackQuery, state: FSMContext, settings: Settings) -> None:
@@ -332,7 +362,7 @@ def _offer_from(data: dict) -> broadcast_service.PriceOffer | None:
     )
 
 
-async def _show_preview(message: Message, state: FSMContext) -> None:
+async def _show_preview(message: Message, state: FSMContext, settings: Settings) -> None:
     """Everything the admin needs to decide, in the order the member will see it."""
     data = await state.get_data()
     body = data.get("body", "")
@@ -349,7 +379,7 @@ async def _show_preview(message: Message, state: FSMContext) -> None:
     else:
         await message.answer(body)
 
-    if data.get("audience") not in AUDIENCES_OWED_PAYMENT:
+    if data.get("audience") not in AUDIENCES_WITH_PAY_LINK:
         await message.answer(
             texts.ADMIN_BROADCAST_PREVIEW_PLAIN,
             reply_markup=_confirm_keyboard(texts.ADMIN_BROADCAST_CONFIRM_YES, "bcast:send"),
@@ -357,6 +387,26 @@ async def _show_preview(message: Message, state: FSMContext) -> None:
         return
 
     offer = _offer_from(data)
+
+    # The second message, shown exactly as it will arrive: its own message, straight after the
+    # main one, with the button in place. Describing it in words left the admin guessing at the
+    # thing most likely to decide whether anybody pays.
+    if offer is None:
+        quoted = texts.money(settings.subscription_price, settings.subscription_currency)
+    elif offer.percent_off:
+        reduced = settings.subscription_price * (100 - offer.percent_off) / 100
+        quoted = texts.money(reduced, settings.subscription_currency)
+    else:
+        quoted = texts.money(offer.fixed_price, offer.currency)
+    await message.answer(
+        texts.BROADCAST_PAY_PROMPT.format(
+            club=texts.CLUB_NAME,
+            amount=quoted,
+            period=settings.subscription_period_days,
+        ),
+        reply_markup=_sample_pay_keyboard(),
+    )
+
     tail = texts.ADMIN_BROADCAST_PREVIEW_WITH_PAY.format(button=texts.JOIN_CLUB_BUTTON)
     if offer is None:
         tail += "\n" + texts.ADMIN_BROADCAST_PRICE_LINE_REGULAR
@@ -409,7 +459,7 @@ async def confirm_broadcast(
         await query.message.answer(texts.ADMIN_GRANT_CANCELLED)
         return
 
-    with_invoice = audience in AUDIENCES_OWED_PAYMENT
+    with_invoice = audience in AUDIENCES_WITH_PAY_LINK
     await query.message.answer(texts.ADMIN_BROADCAST_STARTED.format(count=len(recipients)))
 
     # The session from the middleware is not used for the send: a broadcast outlives one unit of
@@ -536,4 +586,5 @@ def register(router: Router) -> None:
         F.data == "post:send",
         StateFilter(ChannelPost.waiting_for_confirmation),
     )
+    router.callback_query.register(explain_sample_button, F.data == "bcast:sample")
     router.callback_query.register(cancel_from_button, F.data == "bcast:no")

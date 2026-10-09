@@ -1244,7 +1244,21 @@ async def test_a_broadcast_to_unpaid_members_follows_the_text_with_a_pay_button(
     preview = recording_session.of_type("SendMessage")
     assert all(c.chat_id == ADMIN_ID for c in preview)  # the member has heard nothing yet
     assert any("Ціну знижено до 8 €" in c.text for c in preview)  # shown exactly as it arrives
-    assert any(texts.JOIN_CLUB_BUTTON in c.text for c in preview)  # and what follows it
+    # The second message is previewed for real — its own message, straight after the main one,
+    # with the button in place. Describing it in words left the admin guessing at the thing most
+    # likely to decide whether anybody pays.
+    sample = [c for c in preview if c.reply_markup is not None]
+    assert any(
+        row[0].text == texts.JOIN_CLUB_BUTTON
+        for c in sample
+        for row in c.reply_markup.inline_keyboard
+    )
+    # It carries no URL: the real link is per member, and a plausible dead link would be worse.
+    pay_sample = next(
+        c for c in sample if c.reply_markup.inline_keyboard[0][0].text == texts.JOIN_CLUB_BUTTON
+    )
+    assert pay_sample.reply_markup.inline_keyboard[0][0].url is None
+    assert pay_sample.reply_markup.inline_keyboard[0][0].callback_data == "bcast:sample"
     # Months can also be typed, for a duration that is not on a button. Bounded at both ends:
     # 0 is not "no limit" (that has its own button) and a typo must not price a century.
     from handlers.broadcast import MAX_MONTHS, parse_months
@@ -1287,6 +1301,65 @@ async def test_a_broadcast_to_unpaid_members_follows_the_text_with_a_pay_button(
     # lapsing part-way through one.
     assert discount.valid_until is not None
     assert (discount.valid_until - discount.created_at).days == 3 * PERIOD_DAYS
+
+
+async def test_the_lifetime_group_walks_the_same_broadcast_flow_as_unpaid_members(
+    dispatcher, bot, session_factory, recording_session, fake_wayforpay
+):
+    """♾ Безстрокові is the owner's own account, so it is how the campaign gets rehearsed.
+
+    The rehearsal is only worth anything if it is the *same* path: the price step, a real
+    invoice and a real «Стати частиною клубу!» button. A test target that quietly skipped any
+    of those would prove nothing about the send that reaches fifty-three members.
+    """
+    from db.models import utcnow
+    from handlers.admin import AdminMenu
+    from handlers.broadcast import AUDIENCES_WITH_PAY_LINK
+
+    assert "lifetime" in AUDIENCES_WITH_PAY_LINK
+
+    async with session_factory() as session:
+        session.add(User(telegram_id=ADMIN_ID, username="boss"))
+        session.add(
+            Subscription(
+                user_id=ADMIN_ID,
+                status=SubscriptionStatus.ACTIVE,
+                price=REGULAR_PRICE,
+                currency=CURRENCY,
+                price_tier=PriceTier.REGULAR,
+                period_days=PERIOD_DAYS,
+                started_at=utcnow(),
+                expires_at=datetime(2100, 1, 1, tzinfo=UTC),
+                source="lifetime",  # what the grant migration marks it with
+            )
+        )
+        await session.commit()
+
+    admin = make_user(ADMIN_ID, username="boss")
+    await dispatcher.feed_update(bot, make_callback(admin, AdminMenu(action="broadcast").pack()))
+    await dispatcher.feed_update(bot, make_callback(admin, "bcast:lifetime", update_id=2))
+    await dispatcher.feed_update(bot, make_message(admin, "Тестова розсилка", update_id=3))
+
+    # The price step is offered, exactly as it is for ⏳ Очікують оплати.
+    asked_price = recording_session.of_type("SendMessage")[-1]
+    assert texts.ADMIN_BROADCAST_PRICE_SPECIAL in [
+        button.text for row in asked_price.reply_markup.inline_keyboard for button in row
+    ]
+
+    await dispatcher.feed_update(bot, make_callback(admin, "bprice:special", update_id=4))
+    await dispatcher.feed_update(bot, make_message(admin, "8", update_id=5))
+    await dispatcher.feed_update(bot, make_callback(admin, "bperiod:1", update_id=6))
+    recording_session.calls.clear()
+    await dispatcher.feed_update(bot, make_callback(admin, "bcast:send", update_id=7))
+
+    to_self = [c for c in recording_session.of_type("SendMessage") if c.chat_id == ADMIN_ID]
+    # The text, the pay message, and the "done" report all land in the admin's own chat.
+    assert any("Тестова розсилка" == c.text for c in to_self)
+    with_button = [c for c in to_self if c.reply_markup is not None]
+    assert len(with_button) == 1
+    assert with_button[0].reply_markup.inline_keyboard[0][0].text == texts.JOIN_CLUB_BUTTON
+    assert with_button[0].reply_markup.inline_keyboard[0][0].url
+    assert fake_wayforpay.invoice_calls[-1]["amount"] == Decimal("8.00")
 
 
 async def test_an_admin_can_post_into_the_channel_only_after_confirming(

@@ -545,12 +545,19 @@ ADMIN_BROADCAST_ASK_TEXT = (
 
 ADMIN_BROADCAST_PREVIEW = "<b>Ось що отримає кожен з {count} учасник(ів):</b>\n— — — — —"
 
-#: Appended to the preview when the group owes money, so the admin knows a second message with
-#: a live payment link follows the text they wrote.
+#: Closes the preview. The second message is now shown for real, button and all, so this only
+#: has to say what is sample about it: the link, which is built per member at send time.
 ADMIN_BROADCAST_PREVIEW_WITH_PAY = (
     "— — — — —\n\n"
-    "<b>Відразу після цього</b> кожному піде друге повідомлення з кнопкою "
-    "«{button}» і персональним посиланням на оплату."
+    "Друге повідомлення — вище. Кнопка «{button}» у ньому показана як приклад: "
+    "справжнє посилання створюється для кожного учасника окремо."
+)
+
+#: Shown if the admin taps the sample button. It carries no link on purpose — a button that
+#: looked real and led nowhere would be worse than one that says what it is.
+ADMIN_BROADCAST_SAMPLE_ALERT = (
+    "Це приклад кнопки. Справжнє посилання на оплату створюється "
+    "для кожного учасника під час надсилання."
 )
 
 ADMIN_BROADCAST_PREVIEW_PLAIN = "— — — — —\n\nБільше нічого не надсилатиметься."
