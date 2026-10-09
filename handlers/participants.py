@@ -21,8 +21,40 @@ from services import discounts as discount_service
 
 log = logging.getLogger(__name__)
 
-#: Telegram rejects a message over 4096 characters, so the list is capped and the rest is counted.
-MAX_LISTED = 30
+#: Telegram rejects a message over 4096 characters. The list is therefore split across several
+#: messages rather than truncated: an admin looking for one member among 85 cannot find them in
+#: a list that stops at 30, which is what this screen is for.
+CHUNK_CHARS = 3500
+
+
+def _handle(user: User) -> str:
+    """How a member is named in the list.
+
+    A username when they have one. Otherwise their first name — Telegram does not give a bot
+    anybody's phone number (only a contact the user chooses to share, which this bot never asks
+    for), so a name is the best searchable handle available, and far better than a bare id.
+    """
+    if user.username:
+        return f"@{user.username}"
+    if user.first_name:
+        return f"{user.first_name} (id {user.telegram_id})"
+    return f"id {user.telegram_id}"
+
+
+def _chunks(lines: list[str]) -> list[str]:
+    """Group lines into messages that each stay under Telegram's limit."""
+    messages: list[str] = []
+    current: list[str] = []
+    size = 0
+    for line in lines:
+        if current and size + len(line) > CHUNK_CHARS:
+            messages.append("\n".join(current))
+            current, size = [], 0
+        current.append(line)
+        size += len(line) + 1
+    if current:
+        messages.append("\n".join(current))
+    return messages
 
 
 async def show_participants(query: CallbackQuery, session: AsyncSession) -> None:
@@ -48,7 +80,7 @@ async def show_participants(query: CallbackQuery, session: AsyncSession) -> None
     lines: list[str] = []
 
     for user, subscription in rows:
-        handle = f"@{user.username}" if user.username else f"id {user.telegram_id}"
+        handle = _handle(user)
 
         if subscription is None:
             # Registered but with no subscription: only possible if a row was removed by hand.
@@ -76,22 +108,16 @@ async def show_participants(query: CallbackQuery, session: AsyncSession) -> None
             amount = texts.money(price, currency)
             until = texts.day(subscription.expires_at.date())
 
-        if len(lines) < MAX_LISTED:
-            lines.append(
-                texts.ADMIN_USER_LINE.format(
-                    handle=handle, status=status_name, amount=amount, until=until
-                )
+        lines.append(
+            texts.ADMIN_USER_LINE.format(
+                handle=handle, status=status_name, amount=amount, until=until
             )
+        )
 
-    body = [
-        texts.ADMIN_USERS_HEADER.format(total=len(rows), **counts),
-        *lines,
-    ]
-    if len(rows) > MAX_LISTED:
-        body.append(texts.ADMIN_USERS_TRUNCATED.format(shown=MAX_LISTED, total=len(rows)))
-    body.append(texts.ADMIN_USERS_FOOTER)
-
-    await query.message.answer("\n".join(body))
+    await query.message.answer(texts.ADMIN_USERS_HEADER.format(total=len(rows), **counts))
+    for chunk in _chunks(lines):
+        await query.message.answer(chunk)
+    await query.message.answer(texts.ADMIN_USERS_FOOTER)
     log.info("Listed %d participants for admin %s", len(rows), query.from_user.id)
 
 

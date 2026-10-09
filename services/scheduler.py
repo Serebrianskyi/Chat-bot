@@ -19,7 +19,12 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from config import Settings
-from services.billing import BillingConfig, poll_open_payments, process_due_subscriptions
+from services.billing import (
+    BillingConfig,
+    poll_open_payments,
+    process_due_subscriptions,
+    retry_missing_invites,
+)
 from services.wayforpay import WayForPayClient
 
 log = logging.getLogger(__name__)
@@ -30,6 +35,11 @@ POLL_INTERVAL_MINUTES = 2
 #: Daily sweep. 9am local is deliberate: a payment request should not arrive at 3am, and an
 #: admin alert is more likely to be acted on during the day.
 DUE_JOB_HOUR = 9
+
+#: Daily check that paid members actually got into the channel. An hour after the due-date job,
+#: so a payment confirmed in the morning has had its invite attempted by the poller first and
+#: this does not duplicate it.
+INVITE_RETRY_HOUR = 10
 
 
 def build_client(settings: Settings) -> WayForPayClient | None:
@@ -123,11 +133,29 @@ def start_scheduler(
         max_instances=1,
     )
 
+    scheduler.add_job(
+        retry_missing_invites,
+        "cron",
+        hour=INVITE_RETRY_HOUR,
+        minute=0,
+        id="retry_missing_invites",
+        kwargs={
+            "session_factory": session_factory,
+            "bot": bot,
+            "channel_id": config.channel_id,
+            "admin_ids": admin_ids,
+        },
+        coalesce=True,
+        max_instances=1,
+    )
+
     scheduler.start()
     log.info(
-        "Billing jobs started: payments polled every %s min, due dates checked daily at %s:00 %s",
+        "Billing jobs started: payments polled every %s min, due dates checked daily at "
+        "%s:00, missing invites retried daily at %s:00 %s",
         POLL_INTERVAL_MINUTES,
         DUE_JOB_HOUR,
+        INVITE_RETRY_HOUR,
         settings.display_timezone,
     )
     return scheduler

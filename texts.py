@@ -265,6 +265,7 @@ ADMIN_MENU_KNOWLEDGE_BASE = "📚 База знань"
 ADMIN_MENU_ADD_SUBSCRIBER = "➕ Додати учасника"
 ADMIN_MENU_DISCOUNTS = "🎟 Знижки"
 ADMIN_MENU_GRANT_DISCOUNT = "🎁 Надати знижку"
+ADMIN_MENU_SEND_INVITE = "🔗 Надіслати запрошення"
 
 # --- the participants list ---
 #
@@ -283,7 +284,6 @@ ADMIN_USERS_FOOTER = (
     "\nЦе ті, хто запустив бота. Перелік учасників каналу бот отримати не може — "
     "Telegram такого не дозволяє."
 )
-ADMIN_USERS_TRUNCATED = "\nПоказано {shown} із {total}. Повний список — у базі даних."
 
 ADMIN_DISCOUNTS_EMPTY = "Зараз немає активних знижок."
 ADMIN_DISCOUNTS_HEADER = "<b>Активні знижки</b> — {count}\n"
@@ -334,6 +334,55 @@ ADMIN_GRANT_CONFIRM_BUTTON = "✅ Надати"
 ADMIN_GRANT_CANCEL_BUTTON = "✖️ Скасувати"
 ADMIN_GRANT_DONE = "Знижку надано: {who} — {what}{period}."
 ADMIN_GRANT_CANCELLED = "Скасовано."
+# --- 🔗 Надіслати запрошення (admin sends a channel link by hand) ----------------------------
+#
+# For a member who paid but never got in: the bot failed to deliver a link, or they never used
+# the one they got. The admin names them and the bot creates a fresh single-use link.
+
+ADMIN_INVITE_ASK_WHO = (
+    "Кому надіслати запрошення в закритий канал?\n\n"
+    "Надішліть @username або числовий id.\n"
+    "Щоб скасувати — /cancel"
+)
+
+ADMIN_INVITE_BAD_TARGET = "Не схоже на @username або id. Спробуйте ще раз або /cancel"
+
+#: The bot cannot message someone it has never spoken to, and cannot turn a username into an id.
+ADMIN_INVITE_UNKNOWN = (
+    "Не знайшов такого учасника серед тих, хто запускав бота.\n\n"
+    "Бот не може надіслати повідомлення першим тому, хто не натискав /start, "
+    "і не може знайти id за @username. Попросіть учасника відкрити бота — "
+    "або надішліть числовий id, якщо він у вас є."
+)
+
+ADMIN_INVITE_CONFIRM = (
+    "Надіслати запрошення?\n\n"
+    "Учасник: {handle}\n"
+    "Підписка: {status}{until}\n\n"
+    "Посилання буде одноразовим і діятиме {days} дні."
+)
+
+#: Shown inside the confirmation when the subscription is not active. Not a refusal: an admin
+#: sending a link by hand is usually fixing exactly this — a payment the bot failed to record.
+ADMIN_INVITE_CONFIRM_WARNING = (
+    "\n\n⚠️ Підписка не активна. Запрошення все одно буде надіслано, якщо ви підтвердите."
+)
+
+ADMIN_INVITE_CONFIRM_YES = "✅ Надіслати"
+ADMIN_INVITE_CONFIRM_NO = "Скасувати"
+
+ADMIN_INVITE_SENT = "✅ Запрошення надіслано: {handle}"
+
+ADMIN_INVITE_UNREACHABLE = (
+    "Посилання створено, але надіслати не вдалося: {handle} заблокував бота "
+    "або не запускав його. Передайте посилання іншим шляхом:\n\n{link}"
+)
+
+ADMIN_INVITE_NO_LINK = (
+    "Не вдалося створити посилання. Перевірте, що бот — адміністратор каналу "
+    "з правом «Запрошувати користувачів», і що CHANNEL_ID заданий."
+)
+
 ADMIN_GRANT_BAD_TARGET = (
     "Не розпізнав. Надішліть <b>@username</b> або числовий <b>id</b>, або /cancel."
 )
@@ -408,6 +457,23 @@ ADMIN_ADDED_NOT_ENOUGH = (
     "\n"
     "Зробіть бота адміністратором з правами «Запрошувати користувачів» та «Видаляти учасників»."
 )
+
+#: One paid member is still outside the channel after a retry. Everything an admin needs to
+#: finish it by hand is in the line: the handle to search, the id the 🔗 screen accepts, the
+#: name for someone with no username, and why the automatic path did not work.
+ADMIN_INVITE_ESCALATION = (
+    "⚠️ <b>Учасник оплатив, але не в каналі</b>\n\n"
+    "{handle} · id <code>{user_id}</code> · {name}\n"
+    "Причина: {reason}\n\n"
+    "Запрошення вже надсилалося двічі. Надішліть вручну: 🔗 Надіслати запрошення."
+)
+
+#: Why the automatic path did not finish. Admin-facing, one per branch.
+INVITE_REASON_NEVER_SENT = "посилання жодного разу не надсилалося"
+INVITE_REASON_NOT_USED = "посилання надіслано, але учасник не приєднався"
+INVITE_REASON_NO_LINK = "не вдалося створити посилання (права бота в каналі?)"
+INVITE_REASON_UNREACHABLE = "учасник заблокував бота або не запускав його"
+INVITE_REASON_UNKNOWN = "не вдалося перевірити участь у каналі: {error}"
 
 ADMIN_INVITE_FAILED = (
     "⚠️ <b>Не вдалося створити запрошення</b>\n\n"

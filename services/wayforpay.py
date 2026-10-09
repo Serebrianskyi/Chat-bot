@@ -113,6 +113,40 @@ def sign(secret_key: str, fields: list[str]) -> str:
     return hmac.new(secret_key.encode("utf-8"), message, hashlib.md5).hexdigest()
 
 
+def refine_status(
+    mapped: PaymentStatus, *, gateway_status: str | None, amount: Decimal | None, card_pan: str
+) -> PaymentStatus:
+    """Demote a ``Declined`` that carries no payment detail back to "not paid yet".
+
+    Production, 2026-10-09: a single poll run checked 77 invoices created one minute earlier and
+    WayForPay answered ``Declined`` with a blank ``amount`` for every one of them. Taken at face
+    value that is 77 refused cards; in reality nobody had opened the links yet.
+
+    The consequence was severe, because ``DENIED`` is terminal: the order left the poll query for
+    good roughly a minute after being issued, so a member who then paid — the link stays valid for
+    ``orderTimeout``, two hours — was never asked about again. Their money was taken and no invite
+    was ever sent. This is the shape of "paid but never joined the channel".
+
+    A real refusal and an untouched invoice are told apart by what the gateway sends alongside the
+    status: a card that was actually refused comes back with the ``amount`` it was refused for and
+    a masked ``cardPan``. Neither is present when nothing has been attempted, and a signed
+    response is not required to carry them (``verify_response`` signs absent fields as empty).
+
+    So a detail-less ``Declined`` becomes ``PENDING_PAYMENT``, which keeps the order pollable and
+    still lets the invoice-timeout rule write it off as abandoned two hours later. A refusal that
+    does carry detail stays ``DENIED``.
+    """
+    if mapped is not PaymentStatus.DENIED:
+        return mapped
+    if amount is not None or card_pan.strip():
+        return mapped
+    log.info(
+        "Treating %r with no amount and no cardPan as not-yet-paid rather than refused",
+        gateway_status,
+    )
+    return PaymentStatus.PENDING_PAYMENT
+
+
 def map_status(transaction_status: str | None) -> PaymentStatus:
     """Translate a gateway status, defaulting to ERROR for anything unrecognised.
 
@@ -292,15 +326,21 @@ class WayForPayClient:
         self.verify_response(data)
 
         gateway_status = data.get("transactionStatus")
+        amount = parse_amount(
+            data.get("amount"),
+            order_reference=order_reference,
+            gateway_status=gateway_status,
+        )
         return TransactionStatus(
             order_reference=order_reference,
-            status=map_status(gateway_status),
-            gateway_status=gateway_status,
-            amount=parse_amount(
-                data.get("amount"),
-                order_reference=order_reference,
+            status=refine_status(
+                map_status(gateway_status),
                 gateway_status=gateway_status,
+                amount=amount,
+                card_pan=str(data.get("cardPan") or ""),
             ),
+            gateway_status=gateway_status,
+            amount=amount,
             currency=data.get("currency"),
             reason_code=str(data["reasonCode"]) if data.get("reasonCode") is not None else None,
             rec_token=data.get("recToken"),

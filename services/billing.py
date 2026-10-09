@@ -13,18 +13,20 @@ Two jobs, both idempotent (A.20):
 Neither job removes a member from the community. That is deferred; see ``TODO(removal)``.
 """
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramForbiddenError
+from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import texts
 from db.models import (
+    AuditLog,
     Payment,
     PaymentStatus,
     Subscription,
@@ -492,3 +494,328 @@ async def process_due_subscriptions(
 
     log.info("process_due_subscriptions: %s", counts)
     return counts
+
+
+# --- job 3: reconcile orders that were written off ------------------------------------------
+
+
+async def reconcile_written_off(
+    session_factory: async_sessionmaker,
+    client: WayForPayClient,
+    bot: Bot,
+    *,
+    admin_ids: frozenset[int],
+    config: BillingConfig,
+    now: datetime | None = None,
+    apply: bool = False,
+) -> dict[str, int]:
+    """Ask WayForPay again about orders this bot wrote off, and credit the ones that were paid.
+
+    Why this exists: until 2026-10-09 a ``Declined`` carrying no payment detail was taken as a
+    refusal and `DENIED` is terminal, so orders left the poll query about a minute after being
+    issued while their payment links stayed live for two hours. Anyone paying after that first
+    poll was never asked about again. ``refine_status`` stops it happening to new invoices; this
+    recovers the ones already lost, which are unreachable by the poller by definition.
+
+    **Only members who currently have no access are considered.** A subscription whose
+    ``expires_at`` is in the future has already been credited — by a real payment or by hand —
+    and re-crediting it would add a second period for one payment (standing rule 5). That is also
+    precisely why the two hand-written credits are safe from this sweep.
+
+    **Nobody who turns out not to have paid is messaged.** A member who never paid hears nothing
+    from this job, by the owner's decision of 2026-10-09: they are to be approached with a
+    discount offer later, not chased now.
+
+    ``apply=False`` (the default) reports what it would credit and writes nothing — a sweep that
+    moves money paths should be read before it is run.
+    """
+    now = now or utcnow()
+    counts = {"checked": 0, "paid": 0, "still_unpaid": 0, "errors": 0}
+
+    async with session_factory() as session:
+        # Terminal rows, newest first, for members who have no access right now.
+        rows = (
+            await session.execute(
+                select(Payment, Subscription)
+                .join(Subscription, Payment.subscription_id == Subscription.id)
+                .where(
+                    Payment.status.in_([PaymentStatus.DENIED, PaymentStatus.CANCELED]),
+                    Subscription.expires_at <= now,
+                )
+                .order_by(Payment.created_at.desc())
+            )
+        ).all()
+
+        for payment, subscription in rows:
+            counts["checked"] += 1
+            try:
+                result = await client.check_status(order_reference=payment.order_reference)
+            except Exception:
+                log.exception("Reconcile failed for %s", payment.order_reference)
+                counts["errors"] += 1
+                continue
+
+            if result.status is not PaymentStatus.COMPLETE:
+                counts["still_unpaid"] += 1
+                # The gateway's answer is kept for the record (standing rule 6) but the row stays
+                # terminal: this sweep must not resurrect dead orders into the poll queue.
+                payment.wayforpay_status = result.gateway_status
+                payment.reason_code = result.reason_code
+                payment.raw_response = result.raw
+                payment.last_checked_at = now
+                continue
+
+            log.warning(
+                "Reconcile: %s was paid after all (%s %s)",
+                payment.order_reference,
+                result.amount,
+                result.currency,
+            )
+            counts["paid"] += 1
+            if not apply:
+                continue
+
+            extended = await subs.apply_payment_result(
+                session,
+                payment=payment,
+                status=result.status,
+                gateway_status=result.gateway_status,
+                amount=result.amount,
+                currency=result.currency,
+                reason_code=result.reason_code,
+                rec_token=result.rec_token,
+                raw=result.raw,
+                now=now,
+            )
+            if not extended:
+                # Refused by the amount check, or the row had already been settled. Either way
+                # ``apply_payment_result`` has recorded why; nothing is sent to the member.
+                continue
+
+            try:
+                await bot.send_message(
+                    subscription.user_id,
+                    texts.PAYMENT_FIRST_CONFIRMED.format(
+                        club=texts.CLUB_NAME, until=texts.day(subscription.expires_at.date())
+                    ),
+                )
+            except TelegramForbiddenError:
+                log.warning("Reconciled but unreachable: %s", subscription.user_id)
+            except Exception:
+                log.exception("Reconciled but could not message %s", subscription.user_id)
+
+            try:
+                await deliver_invite(
+                    session,
+                    bot,
+                    subscription=subscription,
+                    channel_id=config.channel_id,
+                    admin_ids=admin_ids,
+                    now=now,
+                )
+            except Exception:
+                # The period is granted and committed below; the invite is retried by
+                # ``retry_missing_invites``.
+                log.exception("Reconciled %s but the invite failed", subscription.user_id)
+
+        if apply:
+            await session.commit()
+        else:
+            await session.rollback()
+
+    log.info("reconcile_written_off(apply=%s): %s", apply, counts)
+    return counts
+
+
+# --- job 4: get a link to paid members who are still outside the channel ---------------------
+
+
+#: Chat member statuses that mean the member is inside the channel.
+IN_CHANNEL = frozenset({"creator", "administrator", "member", "restricted"})
+
+#: Subscription statuses that mean "this member has paid for the access they hold". TRIAL is
+#: excluded on purpose: a free first period is not a payment, and the owner's instruction of
+#: 2026-10-09 is that members who have not paid are not to be messaged yet.
+PAID_STATUSES = (SubscriptionStatus.ACTIVE, SubscriptionStatus.CANCELLED)
+
+
+async def retry_missing_invites(
+    session_factory: async_sessionmaker,
+    bot: Bot,
+    *,
+    channel_id: str | None,
+    admin_ids: frozenset[int],
+    now: datetime | None = None,
+) -> dict[str, int]:
+    """Get a channel link to every paid-up member who is not in the channel.
+
+    The automatic invite fires exactly once, on the poll that confirms a payment
+    (``poll_open_payments`` → ``deliver_invite``), and never again: a repeat ``complete`` stops at
+    the idempotency guard. So a link that failed to send, or that expired unused, used to leave a
+    paying member permanently outside with nothing watching.
+
+    One retry, then a person. Per the owner's instruction of 2026-10-09: if the automatic retry
+    does not get them in either, an admin is told directly — handle, id, name and reason — and
+    this job stops touching that member. Nobody is pestered on a loop, and nothing is dropped.
+
+    Covered: every member holding paid access (ACTIVE or CANCELLED, not yet expired), **plus**
+    anyone with a confirmed payment who has never been sent a link at all, even if their period
+    has since lapsed — otherwise a payer whose invite failed would drop out of scope the moment
+    their month ran out, and never be seen again.
+
+    Not covered, deliberately: a free trial is not a payment, and an unpaid member is not
+    messaged at all (see PAID_STATUSES and the owner's instruction of 2026-10-09).
+    """
+    now = now or utcnow()
+    counts = {"checked": 0, "in_channel": 0, "retried": 0, "escalated": 0, "skipped": 0}
+
+    if not channel_id:
+        log.error("retry_missing_invites: CHANNEL_ID is not set; cannot check or invite anyone.")
+        return counts
+
+    async with session_factory() as session:
+        candidates = list(
+            (
+                await session.execute(
+                    select(Subscription.user_id).where(
+                        Subscription.status.in_(PAID_STATUSES),
+                        Subscription.expires_at > now,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+        # Safety net for the one way a payer could otherwise be missed for good: they paid, the
+        # invite failed, and their month ran out before anybody noticed — at which point the
+        # filter above stops seeing them. Anyone with a confirmed payment who has never once been
+        # sent a link is included regardless of expiry, because what they bought was never
+        # delivered. It cannot reach a member who has not paid: a `complete` payment is required.
+        held = set(candidates)
+        confirmed_payers = (
+            (
+                await session.execute(
+                    select(Payment.user_id)
+                    .where(Payment.status == PaymentStatus.COMPLETE)
+                    .distinct()
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for payer in confirmed_payers:
+            if payer in held:
+                continue
+            if await _has_action(session, payer, Action.INVITE_SENT) or await _has_action(
+                session, payer, Action.INVITE_RETRIED
+            ):
+                continue
+            log.warning("Paid but never invited and the period has lapsed: %s", payer)
+            candidates.append(payer)
+            held.add(payer)
+
+        for user_id in candidates:
+            counts["checked"] += 1
+
+            already_retried = await _has_action(session, user_id, Action.INVITE_RETRIED)
+            already_escalated = await _has_action(session, user_id, Action.INVITE_ESCALATED)
+            if already_escalated:
+                # A human was told about this one. Leave it to them.
+                counts["skipped"] += 1
+                continue
+
+            status, error = await _channel_status(bot, channel_id, user_id)
+            if status in IN_CHANNEL:
+                counts["in_channel"] += 1
+                continue
+
+            ever_invited = await _has_action(session, user_id, Action.INVITE_SENT)
+            if error is not None:
+                reason = texts.INVITE_REASON_UNKNOWN.format(error=error)
+            elif not ever_invited:
+                reason = texts.INVITE_REASON_NEVER_SENT
+            else:
+                reason = texts.INVITE_REASON_NOT_USED
+
+            if not already_retried:
+                delivered, link = await subs.send_manual_invite(
+                    session,
+                    bot,
+                    user_id=user_id,
+                    # The bot acts for the club here; the lowest admin id owns the record, as in
+                    # the missing-payment alert.
+                    actor_id=min(admin_ids) if admin_ids else user_id,
+                    channel_id=channel_id,
+                    now=now,
+                )
+                await record_action(
+                    session,
+                    actor_id=min(admin_ids) if admin_ids else user_id,
+                    action=Action.INVITE_RETRIED,
+                    target_user_id=user_id,
+                    details={"delivered": delivered, "had_link": link is not None},
+                )
+                if delivered:
+                    counts["retried"] += 1
+                    continue
+                # The retry itself failed, so there is no point waiting for a second pass.
+                reason = (
+                    texts.INVITE_REASON_NO_LINK if link is None else texts.INVITE_REASON_UNREACHABLE
+                )
+
+            user = await session.get(User, user_id)
+            handle = f"@{user.username}" if user and user.username else "(без username)"
+            name = (user.first_name if user and user.first_name else "—") or "—"
+            await notify_admins(
+                bot,
+                admin_ids,
+                texts.ADMIN_INVITE_ESCALATION.format(
+                    handle=handle, user_id=user_id, name=name, reason=reason
+                ),
+            )
+            await record_action(
+                session,
+                actor_id=min(admin_ids) if admin_ids else user_id,
+                action=Action.INVITE_ESCALATED,
+                target_user_id=user_id,
+                details={"reason": reason},
+            )
+            counts["escalated"] += 1
+
+        await session.commit()
+
+    log.info("retry_missing_invites: %s", counts)
+    return counts
+
+
+async def _has_action(session: AsyncSession, user_id: int, action: str) -> bool:
+    """Whether this member already has an audit row for ``action``.
+
+    The audit log is the memory of what has been tried, so no column had to be added for it.
+    """
+    found = await session.scalar(
+        select(AuditLog.id)
+        .where(AuditLog.target_user_id == user_id, AuditLog.action == action)
+        .limit(1)
+    )
+    return found is not None
+
+
+async def _channel_status(bot: Bot, channel_id: str, user_id: int) -> tuple[str | None, str | None]:
+    """``(status, error)`` for one member. Never raises: one unreadable member cannot stop the job.
+
+    ``RetryAfter`` is honoured rather than skipped (standing rule 10): the member is retried once
+    after the wait Telegram asks for, so a rate limit does not quietly drop them from the sweep.
+    """
+    for attempt in (1, 2):
+        try:
+            member = await bot.get_chat_member(chat_id=channel_id, user_id=user_id)
+            return member.status, None
+        except TelegramRetryAfter as exc:
+            if attempt == 2:
+                return None, type(exc).__name__
+            await asyncio.sleep(exc.retry_after)
+        except Exception as exc:  # noqa: BLE001 - the reason is reported to an admin
+            return None, type(exc).__name__
+    return None, "RetryAfter"

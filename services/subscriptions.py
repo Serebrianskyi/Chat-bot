@@ -10,13 +10,16 @@ Date arithmetic lives in ``services.pricing``; this module owns the database tra
 Every function takes ``now`` rather than reading the clock, so the jobs are testable.
 """
 
+import asyncio
 import logging
 from datetime import datetime
 from decimal import Decimal
 
+from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import texts
 from db.models import Payment, PaymentStatus, Subscription, SubscriptionStatus, utcnow
 from services import discounts as discount_service
 from services.audit import Action, record_action
@@ -309,6 +312,67 @@ async def invite_to_community(bot, *, chat_id: str, user_id: int) -> str | None:
             chat_id,
         )
         return None
+
+
+async def send_manual_invite(
+    session: AsyncSession,
+    bot,
+    *,
+    user_id: int,
+    actor_id: int,
+    channel_id: str,
+    now: datetime,
+) -> tuple[bool, str | None]:
+    """An admin sends one member a channel link by hand. Returns (delivered, link).
+
+    Separate from ``billing.deliver_invite`` for one reason that matters: the audit row must name
+    the **admin** as actor, not the member (standing rule 2). ``deliver_invite`` runs off a
+    confirmed payment and records the member as their own actor, which would be a lie here.
+
+    It also takes a bare ``user_id`` rather than a ``Subscription``, so an admin can invite
+    somebody whose payment the bot never managed to record — which is the situation this exists
+    for. Whether that is appropriate is the admin's judgement, made at the confirmation step.
+
+    ``(False, link)`` means the link exists but the DM did not arrive: the member blocked the bot
+    or never started it. The link is handed back so the admin can pass it on another way rather
+    than it being silently thrown away — a created invite link cannot be recovered afterwards.
+    """
+    link = await invite_to_community(bot, chat_id=channel_id, user_id=user_id)
+    if link is None:
+        return False, None
+
+    message = texts.INVITE_TO_COMMUNITY.format(
+        club=texts.CLUB_NAME, link=link, days=INVITE_VALID_DAYS
+    )
+    delivered = True
+    for attempt in (1, 2):
+        try:
+            await bot.send_message(user_id, message)
+            break
+        except TelegramForbiddenError:
+            log.warning("Manual invite created for %s but they are unreachable", user_id)
+            delivered = False
+            break
+        except TelegramRetryAfter as exc:
+            # Standing rule 10: wait the time Telegram asks for rather than dropping the member.
+            # This runs in a loop over every paid member, so a rate limit is expected, not odd.
+            if attempt == 2:
+                log.error("Rate-limited twice sending %s their invite", user_id)
+                delivered = False
+                break
+            await asyncio.sleep(exc.retry_after)
+
+    # Recorded either way: the link was created and is now live whether or not it was delivered,
+    # and "who issued a link to this channel" is the question an audit of access has to answer.
+    await record_action(
+        session,
+        actor_id=actor_id,
+        action=Action.INVITE_SENT,
+        target_user_id=user_id,
+        details={"channel_id": channel_id, "manual": True, "delivered": delivered},
+    )
+    log.info("Admin %s sent %s a manual invite (delivered=%s)", actor_id, user_id, delivered)
+    return delivered, link
 
 
 async def cancel_autorenew(

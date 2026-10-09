@@ -33,6 +33,10 @@ class Action:
     SUBSCRIPTION_CANCELLED = "subscription.cancelled"
     SUBSCRIPTION_RESUMED = "subscription.resumed"
     INVITE_SENT = "invite.sent"
+    #: One automatic retry was made for a paid member who was not in the channel.
+    INVITE_RETRIED = "invite.retried"
+    #: The retry did not get them in either, so an admin was told to handle it by hand.
+    INVITE_ESCALATED = "invite.escalated"
     # TODO(phase-2): material.created / material.deleted / category.renamed ...
     # TODO(phase-7): broadcast.sent
 

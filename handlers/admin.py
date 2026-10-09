@@ -26,7 +26,7 @@ from aiogram.filters.callback_data import CallbackData
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 import texts
-from handlers import discounts, participants
+from handlers import discounts, invites, participants
 
 ACCESS_DENIED = texts.ADMIN_ACCESS_DENIED
 MENU_TITLE = texts.ADMIN_MENU_TITLE
@@ -46,13 +46,14 @@ MENU_ITEMS: tuple[tuple[str, str], ...] = (
     (texts.ADMIN_MENU_STATISTICS, "stats"),  # TODO(phase-7)
     (texts.ADMIN_MENU_BROADCAST, "broadcast"),  # TODO(phase-7)
     (texts.ADMIN_MENU_USERS, "users"),  # live
+    (texts.ADMIN_MENU_SEND_INVITE, "send_invite"),  # live
     (texts.ADMIN_MENU_KNOWLEDGE_BASE, "materials"),  # TODO(phase-2)
     (texts.ADMIN_MENU_ADD_SUBSCRIBER, "add_subscriber"),  # TODO(phase-3)
 )
 
 #: Actions that have a real screen. The placeholder handler must not swallow these, and the
 #: denial router must still refuse them for a non-admin.
-IMPLEMENTED_ACTIONS = frozenset({"discounts", "grant_discount", "users"})
+IMPLEMENTED_ACTIONS = frozenset({"discounts", "grant_discount", "users", "send_invite"})
 
 
 class IsAdmin(BaseFilter):
@@ -124,6 +125,7 @@ def build_router() -> Router:
     # Real screens first, so they claim their callbacks before the placeholder does.
     discounts.register(router)
     participants.register(router)
+    invites.register(router)
 
     router.callback_query.register(
         handle_admin_menu,

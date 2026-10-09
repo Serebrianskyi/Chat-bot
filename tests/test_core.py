@@ -641,6 +641,266 @@ async def test_one_broken_row_does_not_cost_everyone_else_their_payment(
     assert broken.last_checked_at == NOW
 
 
+async def test_a_declined_with_no_card_detail_is_not_written_off(session_factory, bot, config):
+    """Production, 2026-10-09: 77 invoices one minute old all came back `Declined` with a blank
+    amount. DENIED is terminal, so each left the poll query about a minute after being issued —
+    and the member who then paid within the link's two-hour window was never asked about again.
+    Money in, no invite. A refusal with no amount and no cardPan must stay pollable."""
+    from services.wayforpay import TransactionStatus, refine_status
+
+    assert (
+        refine_status(PaymentStatus.DENIED, gateway_status="Declined", amount=None, card_pan="")
+        is PaymentStatus.PENDING_PAYMENT
+    )
+    # A card that really was refused comes back with what it was refused for. Still denied.
+    assert (
+        refine_status(
+            PaymentStatus.DENIED,
+            gateway_status="Declined",
+            amount=REGULAR_PRICE,
+            card_pan="44**",
+        )
+        is PaymentStatus.DENIED
+    )
+
+    # End to end: the order stays open, so a payment made later is still confirmed.
+    await seed_due(session_factory)
+    gw = FakeGateway()
+    await process_due_subscriptions(
+        session_factory, gw, bot, admin_ids=frozenset({ADMIN_ID}), config=config, now=NOW
+    )
+    ref = (await one_payment(session_factory)).order_reference
+    gw.status_result = TransactionStatus(
+        order_reference=ref,
+        status=refine_status(
+            PaymentStatus.DENIED, gateway_status="Declined", amount=None, card_pan=""
+        ),
+        gateway_status="Declined",
+        amount=None,
+        currency=None,
+        reason_code="1105",
+        rec_token=None,
+        raw={"transactionStatus": "Declined", "amount": ""},
+    )
+
+    await poll_open_payments(session_factory, gw, bot, config=config, now=NOW)
+    assert (await one_payment(session_factory)).status is PaymentStatus.PENDING_PAYMENT
+
+    # They pay an hour later, inside the invoice window. It must still be picked up.
+    gw.status_result = approved(ref)
+    await poll_open_payments(session_factory, gw, bot, config=config, now=NOW + timedelta(hours=1))
+    sub = await load_sub(session_factory)
+    assert (await one_payment(session_factory)).status is PaymentStatus.COMPLETE
+    assert sub.status is SubscriptionStatus.ACTIVE
+
+
+async def test_reconcile_credits_a_written_off_order_but_never_twice(session_factory, bot, config):
+    """The recovery path for the 77 orders written off on 2026-10-09.
+
+    Two things have to hold: an order that WayForPay says was paid gets credited and invited, and
+    a member who already has access is left alone — re-crediting them would be a second period for
+    one payment (A.11), which is exactly what the hand-written credits must be safe from.
+    """
+    from services.billing import reconcile_written_off
+
+    await seed_due(session_factory)
+    gw = FakeGateway()
+    await process_due_subscriptions(
+        session_factory, gw, bot, admin_ids=frozenset({ADMIN_ID}), config=config, now=NOW
+    )
+    # The invoice is written off the way the bug wrote them off: terminal, unpollable.
+    async with session_factory() as session:
+        payment = await session.scalar(select(Payment))
+        payment.status = PaymentStatus.DENIED
+        await session.commit()
+        ref = payment.order_reference
+
+    gw.status_result = approved(ref)
+
+    # A dry run must not change anything, so it can be read before it is trusted.
+    counts = await reconcile_written_off(
+        session_factory, gw, bot, admin_ids=frozenset({ADMIN_ID}), config=config, now=NOW
+    )
+    assert counts["paid"] == 1
+    assert (await one_payment(session_factory)).status is PaymentStatus.DENIED
+    assert (await load_sub(session_factory)).expires_at == NOW
+
+    await reconcile_written_off(
+        session_factory,
+        gw,
+        bot,
+        admin_ids=frozenset({ADMIN_ID}),
+        config=config,
+        now=NOW,
+        apply=True,
+    )
+    first = (await load_sub(session_factory)).expires_at
+    assert first == NOW + timedelta(days=PERIOD_DAYS)
+    assert (await one_payment(session_factory)).status is PaymentStatus.COMPLETE
+
+    # Now the hazard that the scope guard exists for: a member credited by hand, who therefore
+    # has access but whose own invoice row is still sitting there written off. This is
+    # @darriashine's exact shape. Crediting that row would buy a second period with one payment.
+    credited_id = USER_ID + 11
+    async with session_factory() as session:
+        session.add(User(telegram_id=credited_id, username="handcredited"))
+        sub = Subscription(
+            user_id=credited_id,
+            status=SubscriptionStatus.ACTIVE,
+            price=REGULAR_PRICE,
+            currency=CURRENCY,
+            price_tier=PriceTier.REGULAR,
+            period_days=PERIOD_DAYS,
+            started_at=NOW,
+            expires_at=NOW + timedelta(days=PERIOD_DAYS),  # credited by migration
+        )
+        session.add(sub)
+        await session.flush()
+        session.add(
+            Payment(
+                user_id=credited_id,
+                subscription_id=sub.id,
+                order_reference="sub-credited-1",
+                amount=REGULAR_PRICE,
+                currency=CURRENCY,
+                status=PaymentStatus.CANCELED,  # cancelled by the credit migration
+                created_at=NOW,
+            )
+        )
+        await session.commit()
+
+    gw.status_result = approved("sub-credited-1")
+    second = await reconcile_written_off(
+        session_factory,
+        gw,
+        bot,
+        admin_ids=frozenset({ADMIN_ID}),
+        config=config,
+        now=NOW,
+        apply=True,
+    )
+
+    assert second["checked"] == 0  # neither member is in scope: both already have access
+    assert (await load_sub(session_factory)).expires_at == first
+    credited = await load_sub(session_factory, credited_id)
+    assert credited.expires_at == NOW + timedelta(days=PERIOD_DAYS)  # not extended a second time
+
+
+async def test_invite_retry_tries_once_then_tells_an_admin_and_leaves_non_payers_alone(
+    session_factory, bot, recording_session
+):
+    """Owner's instruction, 2026-10-09: one retry, then a person — and nobody who has not paid.
+
+    A free trial is not a payment, so a TRIAL member must never be messaged by this job even
+    though they hold access.
+    """
+    from services.billing import retry_missing_invites
+
+    trial_id = USER_ID + 7
+    async with session_factory() as session:
+        session.add(User(telegram_id=USER_ID, username="paid", first_name="Дарія"))
+        session.add(User(telegram_id=trial_id, username="freebie"))
+        for uid, status in (
+            (USER_ID, SubscriptionStatus.ACTIVE),
+            (trial_id, SubscriptionStatus.TRIAL),
+        ):
+            session.add(
+                Subscription(
+                    user_id=uid,
+                    status=status,
+                    price=REGULAR_PRICE,
+                    currency=CURRENCY,
+                    price_tier=PriceTier.REGULAR,
+                    period_days=PERIOD_DAYS,
+                    started_at=NOW,
+                    expires_at=NOW + timedelta(days=10),
+                )
+            )
+        await session.commit()
+
+    # Telegram says nobody is in the channel.
+    args = {"channel_id": CHANNEL_ID, "admin_ids": frozenset({ADMIN_ID})}
+    first = await retry_missing_invites(session_factory, bot, now=NOW, **args)
+
+    assert first["checked"] == 1  # the trial member was never even looked at
+    assert first["retried"] == 1
+    sent_to = [c.chat_id for c in recording_session.of_type("SendMessage")]
+    assert USER_ID in sent_to
+    assert trial_id not in sent_to  # an unpaid member hears nothing
+
+    # Still not in the channel on the next run: one retry was the limit, so now a human is told.
+    recording_session.calls.clear()
+    second = await retry_missing_invites(session_factory, bot, now=NOW, **args)
+    assert second["escalated"] == 1
+    assert second["retried"] == 0
+    to_admin = [c for c in recording_session.of_type("SendMessage") if c.chat_id == ADMIN_ID]
+    assert len(to_admin) == 1
+    # Everything needed to finish it by hand: handle, id, name, reason.
+    assert "@paid" in to_admin[0].text
+    assert str(USER_ID) in to_admin[0].text
+    assert "Дарія" in to_admin[0].text
+    assert texts.INVITE_REASON_NOT_USED in to_admin[0].text
+    assert USER_ID not in [c.chat_id for c in recording_session.of_type("SendMessage")][1:]
+
+    # And it stops: an escalated member is not touched again.
+    recording_session.calls.clear()
+    third = await retry_missing_invites(session_factory, bot, now=NOW, **args)
+    assert third["skipped"] == 1 and third["escalated"] == 0
+    assert recording_session.of_type("SendMessage") == []
+
+
+async def test_a_payer_whose_period_lapsed_before_anyone_noticed_still_gets_their_link(
+    session_factory, bot, recording_session
+):
+    """The one way a confirmed payer could otherwise be lost for good.
+
+    They paid, the invite failed, and their month ran out before anybody looked — at which point
+    the "holds paid access" filter stops seeing them and no job would ever mention them again.
+    They paid for something that was never delivered, so a link is owed regardless of expiry.
+    """
+    from services.billing import retry_missing_invites
+
+    async with session_factory() as session:
+        session.add(User(telegram_id=USER_ID, username="lapsed", first_name="Оля"))
+        sub = Subscription(
+            user_id=USER_ID,
+            status=SubscriptionStatus.EXPIRED,
+            price=REGULAR_PRICE,
+            currency=CURRENCY,
+            price_tier=PriceTier.REGULAR,
+            period_days=PERIOD_DAYS,
+            started_at=NOW - timedelta(days=60),
+            expires_at=NOW - timedelta(days=30),  # lapsed a month ago
+        )
+        session.add(sub)
+        await session.flush()
+        session.add(
+            Payment(
+                user_id=USER_ID,
+                subscription_id=sub.id,
+                order_reference="sub-lapsed-1",
+                amount=REGULAR_PRICE,
+                currency=CURRENCY,
+                status=PaymentStatus.COMPLETE,  # the money was confirmed
+                created_at=NOW - timedelta(days=60),
+            )
+        )
+        await session.commit()
+
+    counts = await retry_missing_invites(
+        session_factory,
+        bot,
+        channel_id=CHANNEL_ID,
+        admin_ids=frozenset({ADMIN_ID}),
+        now=NOW,
+    )
+
+    assert counts["retried"] == 1
+    to_member = [c for c in recording_session.of_type("SendMessage") if c.chat_id == USER_ID]
+    assert len(to_member) == 1
+    assert "https://t.me/+default" in to_member[0].text
+
+
 async def test_a_discount_changes_the_invoiced_sum(session_factory, bot, config):
     await seed_due(session_factory, price=Decimal("10.00"))
     async with session_factory() as session:
@@ -846,10 +1106,75 @@ async def test_the_participants_list_shows_members_and_says_what_it_cannot_show(
         bot, make_callback(make_user(ADMIN_ID), AdminMenu(action="users").pack())
     )
 
-    body = recording_session.of_type("SendMessage")[0].text
+    # Sent as several messages — header, then the roster in chunks, then the footer — because
+    # Telegram caps one message at 4096 characters and the roster has to stay complete.
+    body = "\n".join(c.text for c in recording_session.of_type("SendMessage"))
     assert "@m1" in body
     assert texts.money(REGULAR_PRICE, CURRENCY) in body
     assert "Перелік учасників каналу бот отримати не може" in body
+
+
+async def test_an_admin_can_send_a_member_their_channel_link_and_nobody_else_can(
+    dispatcher, bot, session_factory, recording_session
+):
+    """The repair path for a member who paid and never got in — so it must grant access to
+    exactly one person and be closed to everyone else (G1.5, S6)."""
+    from handlers.admin import AdminMenu
+
+    await dispatcher.feed_update(bot, make_message(make_user(USER_ID, username="paid"), "/start"))
+
+    # A non-admin sending the callback by hand is refused, and no link is created for them.
+    recording_session.calls.clear()
+    await dispatcher.feed_update(
+        bot, make_callback(make_user(USER_ID), AdminMenu(action="send_invite").pack())
+    )
+    assert recording_session.of_type("CreateChatInviteLink") == []
+    assert texts.ADMIN_ACCESS_DENIED in recording_session.sent_texts()
+
+    # The admin walk: tap the button, name the member, confirm.
+    admin = make_user(ADMIN_ID, username="boss")
+    await dispatcher.feed_update(
+        bot, make_callback(admin, AdminMenu(action="send_invite").pack(), update_id=2)
+    )
+    await dispatcher.feed_update(bot, make_message(admin, "@paid", update_id=3))
+    recording_session.calls.clear()
+    await dispatcher.feed_update(bot, make_callback(admin, "invite:send", update_id=4))
+
+    created = recording_session.of_type("CreateChatInviteLink")
+    assert len(created) == 1
+    assert created[0].member_limit == 1  # a shared link would let one payment admit a crowd
+
+    # The link goes to the member, not to the admin who asked for it.
+    to_member = [c for c in recording_session.of_type("SendMessage") if c.chat_id == USER_ID]
+    assert len(to_member) == 1
+    assert "https://t.me/+default" in to_member[0].text
+
+    async with session_factory() as session:
+        entry = await session.scalar(select(AuditLog).where(AuditLog.action == "invite.sent"))
+    # The actor is the admin who sent it, not the member. An audit row naming the member as
+    # their own actor would hide who handed out channel access.
+    assert entry.actor_id == ADMIN_ID
+    assert entry.target_user_id == USER_ID
+    assert entry.details["manual"] is True
+    assert entry.details["delivered"] is True
+
+    # A member with no @username is reachable just the same, by numeric id: the bot addresses a
+    # chat by id, and the chat exists because they started the bot. Having no username only makes
+    # them harder for a *person* to find, which is what the id in the participants list is for.
+    nameless_id = USER_ID + 3
+    await dispatcher.feed_update(
+        bot, make_message(make_user(nameless_id, username=None), "/start", update_id=5)
+    )
+    await dispatcher.feed_update(
+        bot, make_callback(admin, AdminMenu(action="send_invite").pack(), update_id=6)
+    )
+    await dispatcher.feed_update(bot, make_message(admin, str(nameless_id), update_id=7))
+    recording_session.calls.clear()
+    await dispatcher.feed_update(bot, make_callback(admin, "invite:send", update_id=8))
+
+    to_nameless = [c for c in recording_session.of_type("SendMessage") if c.chat_id == nameless_id]
+    assert len(to_nameless) == 1
+    assert "https://t.me/+default" in to_nameless[0].text
 
 
 async def test_cancelling_a_subscription_keeps_the_paid_period(dispatcher, bot, session_factory):
@@ -950,6 +1275,8 @@ def test_every_member_facing_message_is_ukrainian_and_formats_cleanly():
         "unpaid": 1,
         "trial": 2,
         "shown": 30,
+        "reason": "посилання надіслано, але учасник не приєднався",
+        "error": "TelegramBadRequest",
     }
     placeholder = re.compile(r"\{(\w+)\}")
     checked = 0

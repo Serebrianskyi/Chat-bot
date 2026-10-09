@@ -30,7 +30,7 @@ into the payment phase.
 ## Current status
 
 Last updated 2026-10-06. **Working and pushed** (`Serebrianskyi/Chat-bot`, branch `main`),
-deployed on Railway. 32 tests, 6 migrations.
+deployed on Railway. 37 tests, 7 migrations.
 
 ### Built
 
@@ -42,12 +42,14 @@ deployed on Railway. 32 tests, 6 migrations.
 | Founding members | 17 usernames seeded by migration with their 8/10 EUR price and a free first period. Idempotent across deploys |
 | Discounts | Percent or fixed price, optional expiry, soft revocation. The charged amount is computed **per invoice**, so a time-limited discount actually ends |
 | WayForPay | `CREATE_INVOICE`, then `CHECK_STATUS` polled every 2 min. Signature verified both ways, amount checked against the invoice, idempotent on a repeated `Approved` |
-| Channel invite | Single-use, 3-day link on a confirmed payment. Every failure path tells the member something true and alerts an admin |
+| Channel invite | Single-use, 3-day link on a confirmed payment. Every failure path tells the member something true and alerts an admin. An admin can also send one by hand from the panel, for a member the automatic path missed |
 | Due dates | Daily job at 09:00 Kyiv invoices whoever has come due, then alerts an admin if still unpaid |
-| Admin panel | 🎟 Знижки · 🎁 Надати знижку · 👥 Учасники. The other four answer "later" |
+| Invite recovery | Daily job at 10:00 Kyiv finds paid members who are not in the channel and sends one retry. If that does not get them in, an admin is told directly — handle, id, name, reason — and the member is not touched again. Scope is everyone holding paid access, **plus** anyone with a confirmed payment who has never been sent a link at all, even if their period has lapsed — otherwise a payer whose invite failed drops out of scope when their month runs out. A free trial is **not** a payment: TRIAL subscriptions are never messaged by it |
+| Reconciliation | `reconcile` re-asks WayForPay about orders this bot wrote off and credits the ones that were really paid, with their invites. Dry run by default. Only members who currently have **no** access are in scope, so a hand-written credit cannot be doubled |
+| Admin panel | 🎟 Знижки · 🎁 Надати знижку · 👥 Учасники · 🔗 Надіслати запрошення. The other four answer "later". 👥 Учасники lists the **whole** roster, split across messages, naming people without a username by their first name |
 | Member area | `/subscription` with status, next amount and date; **Скасувати автопродовження** keeps the paid period |
 | Copy | All Ukrainian, all in `texts.py`. Owner-supplied strings marked `SPEC` |
-| Operator tools | `scripts/discounts.py`, `scripts/run_jobs.py` (`status` is read-only), `scripts/start.sh` |
+| Operator tools | `scripts/discounts.py`, `scripts/run_jobs.py` (`status` is read-only), `scripts/diagnose.py` (read-only: `access` tells a bot failure from a member who never used their link, `reasons` groups what WayForPay actually said), `scripts/start.sh` |
 
 ### Live configuration
 
@@ -74,10 +76,43 @@ is a comparison against `expires_at`.
 7. **Webhooks, Sentry, uptime monitoring, backups** (plan Phase 4) — 7 TODOs. Polling is in use;
    a webhook needs a public HTTPS endpoint.
 
-### Never verified with real money
+### Real money: one payment taken, confirmation never delivered
 
-Nobody has completed a payment. Confirmation → invite has only ever run against fakes, and no
-test can close that gap. It is the single most valuable thing left to try.
+`@darriashine` paid on **2026-10-06** — the first real payment, *per the owner*: there is no
+gateway record of it on this side, which is the whole problem. The confirmation never reached
+them: `poll_open_payments` was crashing on every run (WayForPay answered CHECK_STATUS with a blank
+`amount`, and `Decimal("")` raised out of the job before it could commit), so their invoice timed
+out as unpaid while the money had in fact been taken. The poller is fixed; their period was
+credited by migration `d7e4b2c91a35`.
+
+Two things are still open from it:
+
+- **The channel invite is owed by hand.** `deliver_invite` only ever runs from a confirmed payment
+  inside the poller, so no migration can send it.
+- **No `payments` row is marked settled for them.** The order they paid cannot be identified from
+  the database, so nothing was guessed at. Settle the exact row once the order reference is read
+  off the WayForPay dashboard.
+
+A second, larger fault was found in the logs of **2026-10-09** and fixed the same day: one poll run
+checked 77 invoices a minute old and WayForPay answered `Declined` with a blank `amount` for every
+one. `DENIED` is terminal, so each order left the poll query about a minute after being issued —
+while its payment link stayed valid for two hours. Anyone who paid after that first poll was never
+asked about again: money taken, no invite. `refine_status` now demotes a `Declined` carrying
+neither an `amount` nor a `cardPan` back to `pending_payment`, so the order stays pollable until
+the invoice genuinely times out. A refusal that does carry card detail is still terminal.
+
+Run `python -m scripts.diagnose reasons` against production to confirm the cause from the stored
+bodies, and `access --channel` to list who is still outside the channel.
+
+The fix is **forward-only**: the orders already written off are terminal and the poller will never
+look at them again. Recovering them is what `run_jobs reconcile` is for, and getting a link to
+whoever turns out to have paid is what the 10:00 invite-recovery job and the 🔗 admin screen are
+for. The owner's standing instruction of 2026-10-09: **members who have not paid are not to be
+messaged yet** — a discount offer is planned for them instead — which is why both the sweep and
+the retry job are scoped to paid access only.
+
+So confirmation → invite has still never completed end to end against real money. That remains the
+single most valuable thing left to try, and the fixes above are what make it worth trying again.
 
 ### Phase numbering
 
