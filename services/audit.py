@@ -44,6 +44,9 @@ class Action:
     BROADCAST_SENT = "broadcast.sent"
     #: One row per post the bot published in the channel.
     CHANNEL_POST = "channel.post"
+    #: One row per daily access-recovery sweep, which is also how the job knows it has already
+    #: run today and must not run again on the next deploy.
+    ACCESS_RECOVERED = "access.recovered"
     # TODO(phase-2): material.created / material.deleted / category.renamed ...
 
 

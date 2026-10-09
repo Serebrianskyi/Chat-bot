@@ -140,6 +140,10 @@ PAY_PROMPT = (
 #: Uses {club} rather than the literal name so the button follows CLUB_NAME if it ever changes.
 #: The sum is not on the button: it is in the message directly above it, and Telegram truncates
 #: long button labels on narrow screens.
+#: The pay button a member meets first: at ``/start``, and in the daily "time to pay" DM.
+#: Deliberately **not** the same wording as ``JOIN_CLUB_BUTTON`` — owner's decision, 2026-10-09:
+#: a first-time invitation and a win-back nudge are different approaches and are worded
+#: differently on purpose. Do not unify them.
 PAY_BUTTON = "Стати учасником {club}"
 
 #: SPEC — «Дякуємо! Підписку успішно продовжено»
@@ -622,8 +626,10 @@ ADMIN_BROADCAST_DONE = (
     "Помилки: {failed}"
 )
 
-#: SPEC-adjacent: the owner's wording for the button that takes a member back to payment.
-JOIN_CLUB_BUTTON = "Стати частиною клубу!"
+#: The pay button on a broadcast's follow-up message. Owner's wording, 2026-10-09. Separate from
+#: ``PAY_BUTTON`` on purpose: this one speaks to somebody who has already seen the first offer
+#: and not acted on it.
+JOIN_CLUB_BUTTON = "Долучитися до Клубу"
 
 #: The second message of a broadcast to members who owe money. Deliberately short — the admin's
 #: own text above it is the message; this is only the way back to paying.
@@ -650,13 +656,13 @@ ADMIN_CHANNEL_FAILED = (
 )
 ADMIN_CHANNEL_NO_ID = "CHANNEL_ID не заданий — немає куди публікувати."
 
-# --- the report an admin gets after the bot boots --------------------------------------------
+# --- the report an admin gets from the daily access sweep ------------------------------------
 #
-# The startup sweep acts on its own, on money and on access. Everything it did is reported to
-# an admin in one message, because a recovery nobody is told about is indistinguishable from a
-# recovery that never ran.
+# The sweep acts on its own, on money and on access. Everything it did is reported to an admin
+# in one message, because a recovery nobody is told about is indistinguishable from a recovery
+# that never ran.
 
-ADMIN_STARTUP_HEADER = "🔄 <b>Перевірка після запуску</b>\n"
+ADMIN_STARTUP_HEADER = "🔄 <b>Щоденна перевірка доступів</b>\n"
 ADMIN_STARTUP_RECOVERED = "\n💳 Знайдено оплату, доступ поновлено — {count}:\n"
 ADMIN_STARTUP_LINKS = "\n🔗 Надіслано посилання на канал — {count}:\n"
 ADMIN_STARTUP_NEEDS_YOU = "\n⚠️ Не вдалося — потрібні ви — {count}:\n"

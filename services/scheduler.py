@@ -13,6 +13,7 @@ a job that is already slow because it is talking to WayForPay.
 """
 
 import logging
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -23,7 +24,7 @@ from services.billing import (
     BillingConfig,
     poll_open_payments,
     process_due_subscriptions,
-    retry_missing_invites,
+    recover_access,
 )
 from services.wayforpay import WayForPayClient
 
@@ -36,10 +37,20 @@ POLL_INTERVAL_MINUTES = 2
 #: admin alert is more likely to be acted on during the day.
 DUE_JOB_HOUR = 9
 
-#: Daily check that paid members actually got into the channel. An hour after the due-date job,
-#: so a payment confirmed in the morning has had its invite attempted by the poller first and
-#: this does not duplicate it.
-INVITE_RETRY_HOUR = 10
+#: Daily sweep for members who paid and are not in the channel: reconcile the orders this bot
+#: wrote off, then get a link to whoever is owed one.
+#:
+#: Daily and not at startup. It used to run on boot, which meant a day of deployments sent an
+#: admin the same report over and over; `recover_access` also refuses to repeat inside
+#: `RECOVERY_MIN_INTERVAL`, so the spacing holds even if something else calls it.
+RECOVERY_HOUR = 11
+
+#: **The admin's own clock, not the members'.** This sweep's only output is a report an admin
+#: reads, and the owner is in Poland, so it is scheduled in Warsaw time while everything
+#: member-facing stays on `display_timezone` (Kyiv). Written as a zone rather than an offset so
+#: it stays 11:00 local across both countries' daylight-saving changes, which fall on the same
+#: dates but leave Kyiv an hour ahead all year.
+RECOVERY_TIMEZONE = "Europe/Warsaw"
 
 
 def build_client(settings: Settings) -> WayForPayClient | None:
@@ -134,16 +145,18 @@ def start_scheduler(
     )
 
     scheduler.add_job(
-        retry_missing_invites,
+        recover_access,
         "cron",
-        hour=INVITE_RETRY_HOUR,
+        hour=RECOVERY_HOUR,
         minute=0,
-        id="retry_missing_invites",
+        timezone=ZoneInfo(RECOVERY_TIMEZONE),
+        id="recover_access",
         kwargs={
             "session_factory": session_factory,
+            "client": client,
             "bot": bot,
-            "channel_id": config.channel_id,
             "admin_ids": admin_ids,
+            "config": config,
         },
         coalesce=True,
         max_instances=1,
@@ -152,10 +165,11 @@ def start_scheduler(
     scheduler.start()
     log.info(
         "Billing jobs started: payments polled every %s min, due dates checked daily at "
-        "%s:00, missing invites retried daily at %s:00 %s",
+        "%s:00 %s, access recovered daily at %s:00 %s",
         POLL_INTERVAL_MINUTES,
         DUE_JOB_HOUR,
-        INVITE_RETRY_HOUR,
         settings.display_timezone,
+        RECOVERY_HOUR,
+        RECOVERY_TIMEZONE,
     )
     return scheduler

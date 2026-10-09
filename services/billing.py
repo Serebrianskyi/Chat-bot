@@ -622,7 +622,7 @@ async def reconcile_written_off(
 
             # Nothing else records a confirmed payment: the poller relies on `payments` alone.
             # A credit applied by a job with no human in the loop needs a trace of its own, and
-            # the startup report is built from these rows.
+            # the recovery report is built from these rows.
             await record_action(
                 session,
                 actor_id=subscription.user_id,
@@ -684,7 +684,7 @@ IN_CHANNEL = frozenset({"creator", "administrator", "member", "restricted"})
 PAID_STATUSES = (SubscriptionStatus.ACTIVE, SubscriptionStatus.CANCELLED)
 
 #: How long a freshly sent link is left alone. Without it, a payment confirmed minutes earlier —
-#: by the poller or by the startup reconciliation — would be followed straight away by a "retry",
+#: by the poller or by the daily reconciliation — would be followed straight away by a "retry",
 #: and the member would get two links in a row before having had a chance to open either.
 INVITE_SETTLE_PERIOD = timedelta(hours=1)
 
@@ -718,7 +718,7 @@ async def retry_missing_invites(
     messaged at all (see PAID_STATUSES and the owner's instruction of 2026-10-09).
 
     ``alert_per_member=False`` records the escalation but does not DM anybody about it, for a
-    caller that sends one summary covering the whole run. Without it the startup sweep would
+    caller that sends one summary covering the whole run. Without it the daily sweep would
     send an admin eleven messages to report ten problems.
     """
     now = now or utcnow()
@@ -907,18 +907,40 @@ async def _channel_status(bot: Bot, channel_id: str, user_id: int) -> tuple[str 
     return None, "RetryAfter"
 
 
-# --- startup: nobody who paid should still be waiting ---------------------------------------
+# --- daily: nobody who paid should still be waiting -----------------------------------------
 
 
-#: At most this many members are named per section of the startup report. Telegram rejects a
+#: A recovery sweep is worth doing once a day, not once per deploy. Ten deployments in an
+#: afternoon used to mean ten sweeps and ten admin reports about the same people; this is the
+#: guard that makes "once a day" true however the sweep is triggered.
+RECOVERY_MIN_INTERVAL = timedelta(hours=20)
+
+
+async def recovery_ran_recently(
+    session_factory: async_sessionmaker, *, now: datetime
+) -> datetime | None:
+    """When the last sweep ran, if that was recent enough that this one should be skipped."""
+    async with session_factory() as session:
+        last = await session.scalar(
+            select(AuditLog.created_at)
+            .where(AuditLog.action == Action.ACCESS_RECOVERED)
+            .order_by(AuditLog.created_at.desc())
+            .limit(1)
+        )
+    if last is not None and now - last < RECOVERY_MIN_INTERVAL:
+        return last
+    return None
+
+
+#: At most this many members are named per section of the recovery report. Telegram rejects a
 #: message over 4096 characters, and a truncated count still tells an admin where to look.
 REPORT_LIMIT = 25
 
 
-async def _startup_report(
+async def _recovery_report(
     session_factory: async_sessionmaker, *, since: datetime, failed_steps: list[str]
 ) -> str | None:
-    """Compose the after-boot report from what the sweep actually recorded.
+    """Compose the sweep's report from what it actually recorded.
 
     Built from ``audit_log`` rather than from the jobs' return values on purpose: those rows are
     written after the action succeeded, so the report describes what happened rather than what
@@ -1008,15 +1030,17 @@ async def _startup_report(
     return "".join(parts)
 
 
-async def recover_access_at_startup(
+async def recover_access(
     session_factory: async_sessionmaker,
     client: WayForPayClient | None,
     bot: Bot,
     *,
     admin_ids: frozenset[int],
     config: BillingConfig,
+    now: datetime | None = None,
+    force: bool = False,
 ) -> dict[str, dict[str, int]]:
-    """On every boot: find anyone who paid and is not in the channel, and get them their link.
+    """Once a day: find anyone who paid and is not in the channel, and get them their link.
 
     Two steps, in this order, because the second depends on the first:
 
@@ -1031,16 +1055,32 @@ async def recover_access_at_startup(
     members who have **no** access right now, so a credit cannot be applied twice, and step 2
     sends at most one retry per member before escalating to a person.
 
-    **Nothing here can stop the bot starting.** Each step is wrapped: a WayForPay outage or a
-    Telegram refusal is logged and the bot carries on serving. A recovery sweep that takes the
-    bot down with it would be worse than the problem it fixes.
+    **Once a day, not once per deploy.** It used to run at startup, which meant ten deployments
+    in an afternoon sent an admin ten reports about the same people. It is on the daily schedule
+    now, and ``RECOVERY_MIN_INTERVAL`` enforces the spacing even if something else calls it — a
+    deliberate manual run passes ``force=True`` to say so.
+
+    **Nothing here can stop the caller.** Each step is wrapped: a WayForPay outage or a Telegram
+    refusal is logged and the bot carries on serving. A sweep that took the bot down with it
+    would be worse than the problem it fixes.
     """
+    now = now or utcnow()
     results: dict[str, dict[str, int]] = {}
-    started = utcnow()
+    started = now
     failed_steps: list[str] = []
 
+    if not force:
+        last = await recovery_ran_recently(session_factory, now=now)
+        if last is not None:
+            log.info(
+                "Access recovery already ran at %s, inside %s; skipping",
+                last.isoformat(),
+                RECOVERY_MIN_INTERVAL,
+            )
+            return {"skipped": {"ran_at": int(last.timestamp())}}
+
     if client is None:
-        log.warning("Startup recovery: WayForPay is not configured; skipping reconciliation.")
+        log.warning("Access recovery: WayForPay is not configured; skipping reconciliation.")
     else:
         try:
             results["reconciled"] = await reconcile_written_off(
@@ -1052,7 +1092,7 @@ async def recover_access_at_startup(
                 apply=True,
             )
         except Exception:
-            log.exception("Startup recovery: reconciliation failed; the bot is still running")
+            log.exception("Access recovery: reconciliation failed; the bot is still running")
             failed_steps.append("перевірка оплат")
 
     try:
@@ -1065,20 +1105,39 @@ async def recover_access_at_startup(
             alert_per_member=False,
         )
     except Exception:
-        log.exception("Startup recovery: invite retry failed; the bot is still running")
+        log.exception("Access recovery: invite retry failed; the bot is still running")
         failed_steps.append("надсилання запрошень")
 
     # Tell an admin what happened. A sweep that acts on money and access without anybody being
     # told is indistinguishable from one that never ran — and if a step failed, the server log
     # is the only other place that says so.
     try:
-        report = await _startup_report(session_factory, since=started, failed_steps=failed_steps)
+        report = await _recovery_report(session_factory, since=started, failed_steps=failed_steps)
         if report is not None:
             await notify_admins(bot, admin_ids, report)
         else:
-            log.info("Startup recovery: nothing to report, no admin message sent")
+            log.info("Access recovery: nothing to report, no admin message sent")
     except Exception:
-        log.exception("Startup recovery: could not report to admins")
+        log.exception("Access recovery: could not report to admins")
 
-    log.info("Startup recovery finished: %s", results)
+    # Written last, and whatever happened: this row is the "already ran" marker, so a failed
+    # sweep must still stop the next deploy repeating the whole thing minutes later.
+    try:
+        async with session_factory() as session:
+            await record_action(
+                session,
+                actor_id=min(admin_ids) if admin_ids else 0,
+                action=Action.ACCESS_RECOVERED,
+                details={
+                    "reconciled": results.get("reconciled"),
+                    "invites": results.get("invites"),
+                    "failed_steps": failed_steps,
+                },
+                now=now,
+            )
+            await session.commit()
+    except Exception:
+        log.exception("Access recovery: could not record that it ran")
+
+    log.info("Access recovery finished: %s", results)
     return results

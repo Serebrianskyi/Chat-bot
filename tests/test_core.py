@@ -920,15 +920,17 @@ async def test_a_payer_whose_period_lapsed_before_anyone_noticed_still_gets_thei
     assert "https://t.me/+default" in to_member[0].text
 
 
-async def test_the_startup_sweep_reports_to_an_admin_what_it_did(
+async def test_the_daily_sweep_reports_once_and_will_not_repeat_on_the_next_deploy(
     session_factory, bot, config, recording_session
 ):
-    """The sweep acts on money and access with nobody watching, so it has to say what it did.
+    """The sweep acts on money and access with nobody watching, so it has to say what it did —
+    and say it once.
 
-    A recovery an admin is never told about is indistinguishable from one that never ran — and
-    the report is also where they learn who still needs them.
+    It used to run at startup, so ten deployments in an afternoon meant ten reports about the
+    same people. It is daily now, and refuses to repeat inside RECOVERY_MIN_INTERVAL whatever
+    calls it.
     """
-    from services.billing import recover_access_at_startup
+    from services.billing import RECOVERY_MIN_INTERVAL, recover_access
 
     await seed_due(session_factory)
     gw = FakeGateway()
@@ -943,8 +945,8 @@ async def test_the_startup_sweep_reports_to_an_admin_what_it_did(
     gw.status_result = approved(ref)
 
     recording_session.calls.clear()
-    await recover_access_at_startup(
-        session_factory, gw, bot, admin_ids=frozenset({ADMIN_ID}), config=config
+    await recover_access(
+        session_factory, gw, bot, admin_ids=frozenset({ADMIN_ID}), config=config, now=NOW
     )
 
     to_admin = [c for c in recording_session.of_type("SendMessage") if c.chat_id == ADMIN_ID]
@@ -959,6 +961,30 @@ async def test_the_startup_sweep_reports_to_an_admin_what_it_did(
         entry = await session.scalar(select(AuditLog).where(AuditLog.action == "payment.complete"))
     assert entry.details["recovered"] is True
     assert entry.details["order_reference"] == ref
+
+    # A redeploy minutes later must change nothing and tell nobody.
+    recording_session.calls.clear()
+    again = await recover_access(
+        session_factory,
+        gw,
+        bot,
+        admin_ids=frozenset({ADMIN_ID}),
+        config=config,
+        now=NOW + timedelta(minutes=5),
+    )
+    assert "skipped" in again
+    assert recording_session.of_type("SendMessage") == []
+
+    # A day later it runs again, as a daily job should.
+    tomorrow = await recover_access(
+        session_factory,
+        gw,
+        bot,
+        admin_ids=frozenset({ADMIN_ID}),
+        config=config,
+        now=NOW + RECOVERY_MIN_INTERVAL + timedelta(minutes=1),
+    )
+    assert "skipped" not in tomorrow
 
 
 async def test_a_discount_changes_the_invoiced_sum(session_factory, bot, config):
@@ -1488,7 +1514,7 @@ def test_every_member_facing_message_is_ukrainian_and_formats_cleanly():
         "text": "Привіт!",
         "step": "перевірка оплат",
         "extra": " — не доставлено",
-        "button": "Стати частиною клубу!",
+        "button": "Долучитися до Клубу",
         "price": "8 €",
         "validity": "діє 3 місяці",
         "months": "3 місяці",
