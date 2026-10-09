@@ -609,6 +609,23 @@ async def reconcile_written_off(
                 # ``apply_payment_result`` has recorded why; nothing is sent to the member.
                 continue
 
+            # Nothing else records a confirmed payment: the poller relies on `payments` alone.
+            # A credit applied by a job with no human in the loop needs a trace of its own, and
+            # the startup report is built from these rows.
+            await record_action(
+                session,
+                actor_id=subscription.user_id,
+                action=Action.PAYMENT_COMPLETE,
+                target_user_id=subscription.user_id,
+                details={
+                    "order_reference": payment.order_reference,
+                    "recovered": True,
+                    "amount": str(result.amount),
+                    "currency": result.currency,
+                },
+                now=now,
+            )
+
             try:
                 await bot.send_message(
                     subscription.user_id,
@@ -668,6 +685,7 @@ async def retry_missing_invites(
     channel_id: str | None,
     admin_ids: frozenset[int],
     now: datetime | None = None,
+    alert_per_member: bool = True,
 ) -> dict[str, int]:
     """Get a channel link to every paid-up member who is not in the channel.
 
@@ -687,6 +705,10 @@ async def retry_missing_invites(
 
     Not covered, deliberately: a free trial is not a payment, and an unpaid member is not
     messaged at all (see PAID_STATUSES and the owner's instruction of 2026-10-09).
+
+    ``alert_per_member=False`` records the escalation but does not DM anybody about it, for a
+    caller that sends one summary covering the whole run. Without it the startup sweep would
+    send an admin eleven messages to report ten problems.
     """
     now = now or utcnow()
     counts = {
@@ -803,16 +825,17 @@ async def retry_missing_invites(
                     texts.INVITE_REASON_NO_LINK if link is None else texts.INVITE_REASON_UNREACHABLE
                 )
 
-            user = await session.get(User, user_id)
-            handle = f"@{user.username}" if user and user.username else "(без username)"
-            name = (user.first_name if user and user.first_name else "—") or "—"
-            await notify_admins(
-                bot,
-                admin_ids,
-                texts.ADMIN_INVITE_ESCALATION.format(
-                    handle=handle, user_id=user_id, name=name, reason=reason
-                ),
-            )
+            if alert_per_member:
+                user = await session.get(User, user_id)
+                handle = f"@{user.username}" if user and user.username else "(без username)"
+                name = (user.first_name if user and user.first_name else "—") or "—"
+                await notify_admins(
+                    bot,
+                    admin_ids,
+                    texts.ADMIN_INVITE_ESCALATION.format(
+                        handle=handle, user_id=user_id, name=name, reason=reason
+                    ),
+                )
             await record_action(
                 session,
                 actor_id=min(admin_ids) if admin_ids else user_id,
@@ -876,6 +899,104 @@ async def _channel_status(bot: Bot, channel_id: str, user_id: int) -> tuple[str 
 # --- startup: nobody who paid should still be waiting ---------------------------------------
 
 
+#: At most this many members are named per section of the startup report. Telegram rejects a
+#: message over 4096 characters, and a truncated count still tells an admin where to look.
+REPORT_LIMIT = 25
+
+
+async def _startup_report(
+    session_factory: async_sessionmaker, *, since: datetime, failed_steps: list[str]
+) -> str | None:
+    """Compose the after-boot report from what the sweep actually recorded.
+
+    Built from ``audit_log`` rather than from the jobs' return values on purpose: those rows are
+    written after the action succeeded, so the report describes what happened rather than what
+    was attempted. Returns None when there is nothing to tell anybody — a deploy that found
+    nothing to fix should not DM an admin.
+    """
+    recovered: list[tuple[str, int, str]] = []
+    links: list[tuple[str, int, str]] = []
+    needs_you: list[tuple[str, int, str]] = []
+
+    async with session_factory() as session:
+        rows = (
+            (
+                await session.execute(
+                    select(AuditLog)
+                    .where(
+                        AuditLog.created_at >= since,
+                        AuditLog.action.in_(
+                            [
+                                Action.PAYMENT_COMPLETE,
+                                Action.INVITE_SENT,
+                                Action.INVITE_RETRIED,
+                                Action.INVITE_ESCALATED,
+                            ]
+                        ),
+                    )
+                    .order_by(AuditLog.created_at)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not rows and not failed_steps:
+            return None
+
+        seen: dict[str, set[int]] = {"recovered": set(), "links": set(), "needs_you": set()}
+        for row in rows:
+            user_id = row.target_user_id
+            if user_id is None:
+                continue
+            user = await session.get(User, user_id)
+            handle = (
+                f"@{user.username}"
+                if user and user.username
+                else (user.first_name if user and user.first_name else f"id {user_id}")
+            )
+            detail = row.details or {}
+
+            if row.action == Action.PAYMENT_COMPLETE and user_id not in seen["recovered"]:
+                seen["recovered"].add(user_id)
+                recovered.append((handle, user_id, ""))
+            elif row.action == Action.INVITE_ESCALATED and user_id not in seen["needs_you"]:
+                seen["needs_you"].add(user_id)
+                needs_you.append((handle, user_id, f" — {detail.get('reason', '')}"))
+            elif row.action in (Action.INVITE_SENT, Action.INVITE_RETRIED):
+                if user_id in seen["links"]:
+                    continue
+                seen["links"].add(user_id)
+                extra = "" if detail.get("delivered", True) else texts.ADMIN_STARTUP_UNDELIVERED
+                links.append((handle, user_id, extra))
+
+        # A member who needs a person is not also listed as "done".
+        links = [row for row in links if row[1] not in seen["needs_you"]]
+
+    parts = [texts.ADMIN_STARTUP_HEADER]
+    for header, entries in (
+        (texts.ADMIN_STARTUP_RECOVERED, recovered),
+        (texts.ADMIN_STARTUP_LINKS, links),
+        (texts.ADMIN_STARTUP_NEEDS_YOU, needs_you),
+    ):
+        if not entries:
+            continue
+        parts.append(header.format(count=len(entries)))
+        for handle, user_id, extra in entries[:REPORT_LIMIT]:
+            parts.append(
+                texts.ADMIN_STARTUP_LINE.format(handle=handle, user_id=user_id, extra=extra)
+            )
+        if len(entries) > REPORT_LIMIT:
+            parts.append(texts.ADMIN_STARTUP_MORE.format(count=len(entries) - REPORT_LIMIT))
+
+    for step in failed_steps:
+        parts.append(texts.ADMIN_STARTUP_STEP_FAILED.format(step=step))
+
+    if len(parts) == 1:
+        return None
+    parts.append(texts.ADMIN_STARTUP_FOOTER)
+    return "".join(parts)
+
+
 async def recover_access_at_startup(
     session_factory: async_sessionmaker,
     client: WayForPayClient | None,
@@ -904,6 +1025,8 @@ async def recover_access_at_startup(
     bot down with it would be worse than the problem it fixes.
     """
     results: dict[str, dict[str, int]] = {}
+    started = utcnow()
+    failed_steps: list[str] = []
 
     if client is None:
         log.warning("Startup recovery: WayForPay is not configured; skipping reconciliation.")
@@ -919,6 +1042,7 @@ async def recover_access_at_startup(
             )
         except Exception:
             log.exception("Startup recovery: reconciliation failed; the bot is still running")
+            failed_steps.append("перевірка оплат")
 
     try:
         results["invites"] = await retry_missing_invites(
@@ -926,9 +1050,24 @@ async def recover_access_at_startup(
             bot,
             channel_id=config.channel_id,
             admin_ids=admin_ids,
+            # One report for the whole sweep, below, instead of a DM per member.
+            alert_per_member=False,
         )
     except Exception:
         log.exception("Startup recovery: invite retry failed; the bot is still running")
+        failed_steps.append("надсилання запрошень")
+
+    # Tell an admin what happened. A sweep that acts on money and access without anybody being
+    # told is indistinguishable from one that never ran — and if a step failed, the server log
+    # is the only other place that says so.
+    try:
+        report = await _startup_report(session_factory, since=started, failed_steps=failed_steps)
+        if report is not None:
+            await notify_admins(bot, admin_ids, report)
+        else:
+            log.info("Startup recovery: nothing to report, no admin message sent")
+    except Exception:
+        log.exception("Startup recovery: could not report to admins")
 
     log.info("Startup recovery finished: %s", results)
     return results

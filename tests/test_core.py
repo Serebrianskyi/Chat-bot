@@ -920,6 +920,47 @@ async def test_a_payer_whose_period_lapsed_before_anyone_noticed_still_gets_thei
     assert "https://t.me/+default" in to_member[0].text
 
 
+async def test_the_startup_sweep_reports_to_an_admin_what_it_did(
+    session_factory, bot, config, recording_session
+):
+    """The sweep acts on money and access with nobody watching, so it has to say what it did.
+
+    A recovery an admin is never told about is indistinguishable from one that never ran — and
+    the report is also where they learn who still needs them.
+    """
+    from services.billing import recover_access_at_startup
+
+    await seed_due(session_factory)
+    gw = FakeGateway()
+    await process_due_subscriptions(
+        session_factory, gw, bot, admin_ids=frozenset({ADMIN_ID}), config=config, now=NOW
+    )
+    async with session_factory() as session:
+        payment = await session.scalar(select(Payment))
+        payment.status = PaymentStatus.DENIED  # written off the way the bug wrote them off
+        await session.commit()
+        ref = payment.order_reference
+    gw.status_result = approved(ref)
+
+    recording_session.calls.clear()
+    await recover_access_at_startup(
+        session_factory, gw, bot, admin_ids=frozenset({ADMIN_ID}), config=config
+    )
+
+    to_admin = [c for c in recording_session.of_type("SendMessage") if c.chat_id == ADMIN_ID]
+    assert len(to_admin) == 1  # one report for the run, not one message per member
+    report = to_admin[0].text
+    assert "@member" in report and str(USER_ID) in report
+    assert "Знайдено оплату" in report  # the payment was recovered
+    assert "Надіслано посилання" in report  # and the link went out
+
+    # The credit is on the audit record too: nothing else logs a payment confirmed by a job.
+    async with session_factory() as session:
+        entry = await session.scalar(select(AuditLog).where(AuditLog.action == "payment.complete"))
+    assert entry.details["recovered"] is True
+    assert entry.details["order_reference"] == ref
+
+
 async def test_a_discount_changes_the_invoiced_sum(session_factory, bot, config):
     await seed_due(session_factory, price=Decimal("10.00"))
     async with session_factory() as session:
@@ -1341,6 +1382,8 @@ def test_every_member_facing_message_is_ukrainian_and_formats_cleanly():
         "error": "TelegramBadRequest",
         "preview": "Привіт! Ось ваше посилання.",
         "text": "Привіт!",
+        "step": "перевірка оплат",
+        "extra": " — не доставлено",
     }
     placeholder = re.compile(r"\{(\w+)\}")
     checked = 0

@@ -488,6 +488,29 @@ ADMIN_MESSAGE_EMPTY = "Повідомлення порожнє. Напишіть
 #: a bare forwarded string reads like an automated notice and gets ignored.
 MESSAGE_FROM_ADMIN = "Повідомлення від адміністратора {club}:\n\n{text}"
 
+# --- the report an admin gets after the bot boots --------------------------------------------
+#
+# The startup sweep acts on its own, on money and on access. Everything it did is reported to
+# an admin in one message, because a recovery nobody is told about is indistinguishable from a
+# recovery that never ran.
+
+ADMIN_STARTUP_HEADER = "🔄 <b>Перевірка після запуску</b>\n"
+ADMIN_STARTUP_RECOVERED = "\n💳 Знайдено оплату, доступ поновлено — {count}:\n"
+ADMIN_STARTUP_LINKS = "\n🔗 Надіслано посилання на канал — {count}:\n"
+ADMIN_STARTUP_NEEDS_YOU = "\n⚠️ Не вдалося — потрібні ви — {count}:\n"
+ADMIN_STARTUP_LINE = "• {handle} · id <code>{user_id}</code>{extra}\n"
+ADMIN_STARTUP_MORE = "… і ще {count}\n"
+ADMIN_STARTUP_UNDELIVERED = " — не доставлено"
+
+#: A whole step failed (WayForPay unreachable, Telegram refusing). The bot keeps running, but
+#: an admin has to know that the sweep did not finish.
+ADMIN_STARTUP_STEP_FAILED = "\n❗️ Крок «{step}» не виконався. Деталі — у логах.\n"
+
+ADMIN_STARTUP_FOOTER = (
+    "\nЩоб написати комусь із них — ✍️ Написати учаснику, "
+    "щоб надіслати посилання ще раз — 🔗 Надіслати запрошення."
+)
+
 #: One paid member is still outside the channel after a retry. Everything an admin needs to
 #: finish it by hand is in the line: the handle to search, the id the 🔗 screen accepts, the
 #: name for someone with no username, and why the automatic path did not work.
