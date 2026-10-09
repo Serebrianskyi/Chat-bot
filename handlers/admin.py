@@ -47,6 +47,7 @@ MENU_ITEMS: tuple[tuple[str, str], ...] = (
     (texts.ADMIN_MENU_BROADCAST, "broadcast"),  # TODO(phase-7)
     (texts.ADMIN_MENU_USERS, "users"),  # live
     (texts.ADMIN_MENU_SEND_INVITE, "send_invite"),  # live
+    (texts.ADMIN_MENU_MESSAGE_USER, "message_user"),  # live
     (texts.ADMIN_MENU_KNOWLEDGE_BASE, "materials"),  # TODO(phase-2)
     (texts.ADMIN_MENU_ADD_SUBSCRIBER, "add_subscriber"),  # TODO(phase-3)
 )

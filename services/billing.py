@@ -530,7 +530,13 @@ async def reconcile_written_off(
     moves money paths should be read before it is run.
     """
     now = now or utcnow()
-    counts = {"checked": 0, "paid": 0, "still_unpaid": 0, "errors": 0}
+    counts = {"checked": 0, "paid": 0, "still_unpaid": 0, "errors": 0, "extra_orders": 0}
+    #: Members credited during this sweep. The scope query is evaluated once, so every terminal
+    #: order of theirs is already in the result set — without this, a member invoiced on three
+    #: days running would be credited three times over and sent three confirmations and three
+    #: links. One lost period is what this recovers; a genuine second payment is a question for
+    #: a person, so the remaining orders are named in the log and left alone.
+    credited: set[int] = set()
 
     async with session_factory() as session:
         # Terminal rows, newest first, for members who have no access right now.
@@ -547,6 +553,16 @@ async def reconcile_written_off(
         ).all()
 
         for payment, subscription in rows:
+            if subscription.user_id in credited:
+                log.warning(
+                    "Reconcile: %s also has %s outstanding; not credited, check the dashboard "
+                    "in case they paid more than once",
+                    subscription.user_id,
+                    payment.order_reference,
+                )
+                counts["extra_orders"] += 1
+                continue
+
             counts["checked"] += 1
             try:
                 result = await client.check_status(order_reference=payment.order_reference)
@@ -574,6 +590,7 @@ async def reconcile_written_off(
             counts["paid"] += 1
             if not apply:
                 continue
+            credited.add(subscription.user_id)
 
             extended = await subs.apply_payment_result(
                 session,
@@ -638,6 +655,11 @@ IN_CHANNEL = frozenset({"creator", "administrator", "member", "restricted"})
 #: 2026-10-09 is that members who have not paid are not to be messaged yet.
 PAID_STATUSES = (SubscriptionStatus.ACTIVE, SubscriptionStatus.CANCELLED)
 
+#: How long a freshly sent link is left alone. Without it, a payment confirmed minutes earlier —
+#: by the poller or by the startup reconciliation — would be followed straight away by a "retry",
+#: and the member would get two links in a row before having had a chance to open either.
+INVITE_SETTLE_PERIOD = timedelta(hours=1)
+
 
 async def retry_missing_invites(
     session_factory: async_sessionmaker,
@@ -667,7 +689,14 @@ async def retry_missing_invites(
     messaged at all (see PAID_STATUSES and the owner's instruction of 2026-10-09).
     """
     now = now or utcnow()
-    counts = {"checked": 0, "in_channel": 0, "retried": 0, "escalated": 0, "skipped": 0}
+    counts = {
+        "checked": 0,
+        "in_channel": 0,
+        "retried": 0,
+        "escalated": 0,
+        "skipped": 0,
+        "too_soon": 0,
+    }
 
     if not channel_id:
         log.error("retry_missing_invites: CHANNEL_ID is not set; cannot check or invite anyone.")
@@ -730,6 +759,14 @@ async def retry_missing_invites(
                 counts["in_channel"] += 1
                 continue
 
+            last_sent = await _last_action_at(
+                session, user_id, (Action.INVITE_SENT, Action.INVITE_RETRIED)
+            )
+            if last_sent is not None and now - last_sent < INVITE_SETTLE_PERIOD:
+                # They were sent one moments ago and cannot be expected to have used it yet.
+                counts["too_soon"] += 1
+                continue
+
             ever_invited = await _has_action(session, user_id, Action.INVITE_SENT)
             if error is not None:
                 reason = texts.INVITE_REASON_UNKNOWN.format(error=error)
@@ -756,6 +793,7 @@ async def retry_missing_invites(
                     action=Action.INVITE_RETRIED,
                     target_user_id=user_id,
                     details={"delivered": delivered, "had_link": link is not None},
+                    now=now,
                 )
                 if delivered:
                     counts["retried"] += 1
@@ -781,6 +819,7 @@ async def retry_missing_invites(
                 action=Action.INVITE_ESCALATED,
                 target_user_id=user_id,
                 details={"reason": reason},
+                now=now,
             )
             counts["escalated"] += 1
 
@@ -803,6 +842,18 @@ async def _has_action(session: AsyncSession, user_id: int, action: str) -> bool:
     return found is not None
 
 
+async def _last_action_at(
+    session: AsyncSession, user_id: int, actions: tuple[str, ...]
+) -> datetime | None:
+    """When any of ``actions`` last happened to this member, or None if never."""
+    return await session.scalar(
+        select(AuditLog.created_at)
+        .where(AuditLog.target_user_id == user_id, AuditLog.action.in_(list(actions)))
+        .order_by(AuditLog.created_at.desc())
+        .limit(1)
+    )
+
+
 async def _channel_status(bot: Bot, channel_id: str, user_id: int) -> tuple[str | None, str | None]:
     """``(status, error)`` for one member. Never raises: one unreadable member cannot stop the job.
 
@@ -820,3 +871,64 @@ async def _channel_status(bot: Bot, channel_id: str, user_id: int) -> tuple[str 
         except Exception as exc:  # noqa: BLE001 - the reason is reported to an admin
             return None, type(exc).__name__
     return None, "RetryAfter"
+
+
+# --- startup: nobody who paid should still be waiting ---------------------------------------
+
+
+async def recover_access_at_startup(
+    session_factory: async_sessionmaker,
+    client: WayForPayClient | None,
+    bot: Bot,
+    *,
+    admin_ids: frozenset[int],
+    config: BillingConfig,
+) -> dict[str, dict[str, int]]:
+    """On every boot: find anyone who paid and is not in the channel, and get them their link.
+
+    Two steps, in this order, because the second depends on the first:
+
+    1. ``reconcile_written_off`` — ask WayForPay again about orders this bot wrongly wrote off.
+       Anyone who really paid is credited, which is what makes them visible to step 2. Applied
+       rather than reported: a payer waiting for access is not something to leave in a report
+       nobody runs.
+    2. ``retry_missing_invites`` — send a link to every paid member who is not in the channel,
+       and hand to an admin anyone a retry cannot get in.
+
+    Both are idempotent and both are safe to repeat on every deploy: step 1 only considers
+    members who have **no** access right now, so a credit cannot be applied twice, and step 2
+    sends at most one retry per member before escalating to a person.
+
+    **Nothing here can stop the bot starting.** Each step is wrapped: a WayForPay outage or a
+    Telegram refusal is logged and the bot carries on serving. A recovery sweep that takes the
+    bot down with it would be worse than the problem it fixes.
+    """
+    results: dict[str, dict[str, int]] = {}
+
+    if client is None:
+        log.warning("Startup recovery: WayForPay is not configured; skipping reconciliation.")
+    else:
+        try:
+            results["reconciled"] = await reconcile_written_off(
+                session_factory,
+                client,
+                bot,
+                admin_ids=admin_ids,
+                config=config,
+                apply=True,
+            )
+        except Exception:
+            log.exception("Startup recovery: reconciliation failed; the bot is still running")
+
+    try:
+        results["invites"] = await retry_missing_invites(
+            session_factory,
+            bot,
+            channel_id=config.channel_id,
+            admin_ids=admin_ids,
+        )
+    except Exception:
+        log.exception("Startup recovery: invite retry failed; the bot is still running")
+
+    log.info("Startup recovery finished: %s", results)
+    return results

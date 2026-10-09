@@ -376,9 +376,43 @@ async def send_manual_invite(
         action=Action.INVITE_SENT,
         target_user_id=user_id,
         details={"channel_id": channel_id, "manual": manual, "delivered": delivered},
+        now=now,
     )
     log.info("Admin %s sent %s a manual invite (delivered=%s)", actor_id, user_id, delivered)
     return delivered, link
+
+
+async def send_admin_message(
+    session: AsyncSession, bot, *, user_id: int, actor_id: int, body: str
+) -> bool:
+    """Deliver an admin's own words to one member. Returns whether it arrived.
+
+    The bot is the only channel that reaches a member with no ``@username``: an admin cannot
+    open that chat by hand, because Telegram gives no way to find the person, while the bot has
+    had a chat with them since their first ``/start``.
+
+    The text is wrapped so it reads as coming from a person at the club rather than as another
+    automated notice, and it is stored on the audit row: "what did we actually tell them" is a
+    question that gets asked, and nothing else in the system records an outgoing message (S6).
+    """
+    delivered = True
+    try:
+        await bot.send_message(
+            user_id, texts.MESSAGE_FROM_ADMIN.format(club=texts.CLUB_NAME, text=body)
+        )
+    except TelegramForbiddenError:
+        log.warning("Admin %s could not reach %s: blocked or never started", actor_id, user_id)
+        delivered = False
+
+    await record_action(
+        session,
+        actor_id=actor_id,
+        action=Action.MESSAGE_SENT,
+        target_user_id=user_id,
+        details={"delivered": delivered, "text": body},
+    )
+    log.info("Admin %s messaged %s (delivered=%s)", actor_id, user_id, delivered)
+    return delivered
 
 
 async def cancel_autorenew(

@@ -30,7 +30,7 @@ into the payment phase.
 ## Current status
 
 Last updated 2026-10-06. **Working and pushed** (`Serebrianskyi/Chat-bot`, branch `main`),
-deployed on Railway. 37 tests, 7 migrations.
+deployed on Railway. 38 tests, 7 migrations.
 
 ### Built
 
@@ -44,9 +44,9 @@ deployed on Railway. 37 tests, 7 migrations.
 | WayForPay | `CREATE_INVOICE`, then `CHECK_STATUS` polled every 2 min. Signature verified both ways, amount checked against the invoice, idempotent on a repeated `Approved` |
 | Channel invite | Single-use, 3-day link on a confirmed payment. Every failure path tells the member something true and alerts an admin. An admin can also send one by hand from the panel, for a member the automatic path missed |
 | Due dates | Daily job at 09:00 Kyiv invoices whoever has come due, then alerts an admin if still unpaid |
-| Invite recovery | Daily job at 10:00 Kyiv finds paid members who are not in the channel and sends one retry. If that does not get them in, an admin is told directly — handle, id, name, reason — and the member is not touched again. Scope is everyone holding paid access, **plus** anyone with a confirmed payment who has never been sent a link at all, even if their period has lapsed — otherwise a payer whose invite failed drops out of scope when their month runs out. A free trial is **not** a payment: TRIAL subscriptions are never messaged by it |
-| Reconciliation | `reconcile` re-asks WayForPay about orders this bot wrote off and credits the ones that were really paid, with their invites. Dry run by default. Only members who currently have **no** access are in scope, so a hand-written credit cannot be doubled |
-| Admin panel | 🎟 Знижки · 🎁 Надати знижку · 👥 Учасники · 🔗 Надіслати запрошення. The other four answer "later". 👥 Учасники lists the **whole** roster, split across messages, naming people without a username by their first name |
+| Invite recovery | **Runs on every boot**, and daily at 10:00 Kyiv: finds paid members who are not in the channel and sends one retry. If that does not get them in, an admin is told directly — handle, id, name, reason — and the member is not touched again. Scope is everyone holding paid access, **plus** anyone with a confirmed payment who has never been sent a link at all, even if their period has lapsed — otherwise a payer whose invite failed drops out of scope when their month runs out. A free trial is **not** a payment: TRIAL subscriptions are never messaged by it |
+| Reconciliation | Re-asks WayForPay about orders this bot wrote off and credits the ones really paid, with their invites. **Runs on every boot** (`recover_access_at_startup`), and by hand as `run_jobs reconcile`, which is a dry run until `--apply`. Only members who currently have **no** access are in scope, so a hand-written credit cannot be doubled, and one member is credited at most once per sweep |
+| Admin panel | 🎟 Знижки · 🎁 Надати знижку · 👥 Учасники · 🔗 Надіслати запрошення · ✍️ Написати учаснику (admin dictates, the bot delivers — the only way to reach a member with no username). The other four answer "later". 👥 Учасники lists the **whole** roster, split across messages, naming people without a username by their first name |
 | Member area | `/subscription` with status, next amount and date; **Скасувати автопродовження** keeps the paid period |
 | Copy | All Ukrainian, all in `texts.py`. Owner-supplied strings marked `SPEC` |
 | Operator tools | `scripts/discounts.py`, `scripts/run_jobs.py` (`status` is read-only), `scripts/diagnose.py` (read-only: `access` tells a bot failure from a member who never used their link, `reasons` groups what WayForPay actually said), `scripts/start.sh` |

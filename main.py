@@ -23,7 +23,7 @@ from config import ConfigError, Settings, get_settings
 from db.session import create_engine, create_session_factory
 from handlers import admin, chat_membership, errors, start, subscription
 from middlewares.session import DbSessionMiddleware
-from services.billing import BillingConfig
+from services.billing import BillingConfig, recover_access_at_startup
 from services.commands import register_commands
 from services.scheduler import (
     build_billing_config,
@@ -120,9 +120,23 @@ async def run_polling(settings: Settings, engine: AsyncEngine) -> None:
         scheduler = start_scheduler(
             settings=settings, session_factory=create_session_factory(engine), bot=bot
         )
+
+        # Catch up on anyone who paid and never got into the channel. As a background task, not
+        # awaited: it makes dozens of API calls and the bot should answer /start while it runs.
+        # The reference is held because asyncio only keeps a weak one to a bare task.
+        recovery = asyncio.create_task(
+            recover_access_at_startup(
+                create_session_factory(engine),
+                build_client(settings),
+                bot,
+                admin_ids=settings.admin_id_set,
+                config=build_billing_config(settings),
+            )
+        )
         try:
             await dispatcher.start_polling(bot)
         finally:
+            recovery.cancel()
             if scheduler is not None:
                 scheduler.shutdown(wait=False)
     except TelegramUnauthorizedError:

@@ -9,6 +9,7 @@ lands in the same commit as the change it describes. An action that rolls back m
 leave an audit row claiming it happened.
 """
 
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import select
@@ -37,6 +38,8 @@ class Action:
     INVITE_RETRIED = "invite.retried"
     #: The retry did not get them in either, so an admin was told to handle it by hand.
     INVITE_ESCALATED = "invite.escalated"
+    #: An admin wrote to a member through the bot.
+    MESSAGE_SENT = "message.sent"
     # TODO(phase-2): material.created / material.deleted / category.renamed ...
     # TODO(phase-7): broadcast.sent
 
@@ -48,17 +51,24 @@ async def record_action(
     action: str,
     target_user_id: int | None = None,
     details: dict[str, Any] | None = None,
+    now: datetime | None = None,
 ) -> AuditLog:
     """Append one audit row. The caller commits.
 
     ``details`` is free-form JSON for whatever makes the action reconstructable later —
     the number of days granted, the old and new value, the order reference.
+
+    ``now`` is passed by callers that read these timestamps back as part of a decision — the
+    invite retry asks "was a link sent in the last hour" — so the row lands on the same clock
+    the job is using. Left out, the column default stamps the wall clock, which is right for
+    an action taken by a person at that moment.
     """
     entry = AuditLog(
         actor_id=actor_id,
         action=action,
         target_user_id=target_user_id,
         details=details,
+        **({"created_at": now} if now is not None else {}),
     )
     session.add(entry)
     await session.flush()  # assigns the id without ending the caller's transaction

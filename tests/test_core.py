@@ -828,9 +828,12 @@ async def test_invite_retry_tries_once_then_tells_an_admin_and_leaves_non_payers
     assert USER_ID in sent_to
     assert trial_id not in sent_to  # an unpaid member hears nothing
 
-    # Still not in the channel on the next run: one retry was the limit, so now a human is told.
+    # The next day, still not in the channel. One retry was the limit, so now a human is told.
+    # A day later, not the same instant: a link sent moments ago is left to settle, or a member
+    # would get two in a row from the poller and this job.
+    tomorrow = NOW + timedelta(days=1)
     recording_session.calls.clear()
-    second = await retry_missing_invites(session_factory, bot, now=NOW, **args)
+    second = await retry_missing_invites(session_factory, bot, now=tomorrow, **args)
     assert second["escalated"] == 1
     assert second["retried"] == 0
     to_admin = [c for c in recording_session.of_type("SendMessage") if c.chat_id == ADMIN_ID]
@@ -844,8 +847,24 @@ async def test_invite_retry_tries_once_then_tells_an_admin_and_leaves_non_payers
 
     # And it stops: an escalated member is not touched again.
     recording_session.calls.clear()
-    third = await retry_missing_invites(session_factory, bot, now=NOW, **args)
+    third = await retry_missing_invites(session_factory, bot, now=NOW + timedelta(days=2), **args)
     assert third["skipped"] == 1 and third["escalated"] == 0
+    assert recording_session.of_type("SendMessage") == []
+
+    # A link sent moments ago is never followed by a second one: at startup the reconciliation
+    # confirms a payment and sends a link, and this job runs straight afterwards.
+    async with session_factory() as session:
+        fresh = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
+        fresh.status = SubscriptionStatus.ACTIVE
+        await session.execute(
+            AuditLog.__table__.delete().where(AuditLog.action == "invite.escalated")
+        )
+        await session.commit()
+    recording_session.calls.clear()
+    immediate = await retry_missing_invites(
+        session_factory, bot, now=NOW + timedelta(minutes=5), **args
+    )
+    assert immediate["too_soon"] == 1
     assert recording_session.of_type("SendMessage") == []
 
 
@@ -1177,6 +1196,49 @@ async def test_an_admin_can_send_a_member_their_channel_link_and_nobody_else_can
     assert "https://t.me/+default" in to_nameless[0].text
 
 
+async def test_an_admin_can_write_to_a_member_who_has_no_username(
+    dispatcher, bot, session_factory, recording_session
+):
+    """The fallback when a link alone has not worked, and the only way to reach somebody with no
+    @username: an admin cannot open that chat by hand, the bot can. Gated, and recorded (S6)."""
+    from handlers.admin import AdminMenu
+
+    nameless_id = USER_ID + 21
+    await dispatcher.feed_update(bot, make_message(make_user(nameless_id, username=None), "/start"))
+
+    # Closed to everyone but an admin, like every other panel action (G1.5).
+    recording_session.calls.clear()
+    await dispatcher.feed_update(
+        bot, make_callback(make_user(nameless_id), AdminMenu(action="message_user").pack())
+    )
+    assert texts.ADMIN_ACCESS_DENIED in recording_session.sent_texts()
+
+    admin = make_user(ADMIN_ID, username="boss")
+    await dispatcher.feed_update(
+        bot, make_callback(admin, AdminMenu(action="message_user").pack(), update_id=2)
+    )
+    await dispatcher.feed_update(bot, make_message(admin, str(nameless_id), update_id=3))
+    await dispatcher.feed_update(
+        bot, make_message(admin, "Ваше посилання надіслано, перевірте, будь ласка.", update_id=4)
+    )
+    recording_session.calls.clear()
+    await dispatcher.feed_update(bot, make_callback(admin, "msg:send", update_id=5))
+
+    to_member = [c for c in recording_session.of_type("SendMessage") if c.chat_id == nameless_id]
+    assert len(to_member) == 1
+    # It arrives marked as coming from a person, not as another automated notice.
+    assert "Ваше посилання надіслано" in to_member[0].text
+    assert texts.CLUB_NAME in to_member[0].text
+
+    async with session_factory() as session:
+        entry = await session.scalar(select(AuditLog).where(AuditLog.action == "message.sent"))
+    assert entry.actor_id == ADMIN_ID
+    assert entry.target_user_id == nameless_id
+    assert entry.details["delivered"] is True
+    # What was said is on the record: nothing else in the system stores an outgoing message.
+    assert "Ваше посилання надіслано" in entry.details["text"]
+
+
 async def test_cancelling_a_subscription_keeps_the_paid_period(dispatcher, bot, session_factory):
     """SPEC: «Підписка діє до [дата], далі буде скасована»."""
     from db.models import utcnow
@@ -1277,6 +1339,8 @@ def test_every_member_facing_message_is_ukrainian_and_formats_cleanly():
         "shown": 30,
         "reason": "посилання надіслано, але учасник не приєднався",
         "error": "TelegramBadRequest",
+        "preview": "Привіт! Ось ваше посилання.",
+        "text": "Привіт!",
     }
     placeholder = re.compile(r"\{(\w+)\}")
     checked = 0

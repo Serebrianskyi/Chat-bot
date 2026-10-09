@@ -266,6 +266,7 @@ ADMIN_MENU_ADD_SUBSCRIBER = "➕ Додати учасника"
 ADMIN_MENU_DISCOUNTS = "🎟 Знижки"
 ADMIN_MENU_GRANT_DISCOUNT = "🎁 Надати знижку"
 ADMIN_MENU_SEND_INVITE = "🔗 Надіслати запрошення"
+ADMIN_MENU_MESSAGE_USER = "✍️ Написати учаснику"
 
 # --- the participants list ---
 #
@@ -458,6 +459,35 @@ ADMIN_ADDED_NOT_ENOUGH = (
     "Зробіть бота адміністратором з правами «Запрошувати користувачів» та «Видаляти учасників»."
 )
 
+# --- ✍️ Написати учаснику (admin initiates, the bot delivers) --------------------------------
+#
+# The way to reach a member who has no @username: an admin cannot open that chat by hand, but
+# the bot already has one with everybody who pressed /start.
+
+ADMIN_MESSAGE_ASK_WHO = (
+    "Кому написати?\n\nНадішліть @username або числовий id.\nЩоб скасувати — /cancel"
+)
+
+ADMIN_MESSAGE_ASK_TEXT = (
+    "Що надіслати {handle}?\n\n"
+    "Надішліть його одним повідомленням. Воно піде від імені клубу.\n"
+    "Щоб скасувати — /cancel"
+)
+
+ADMIN_MESSAGE_CONFIRM = "Надіслати це {handle}?\n\n— — —\n{preview}\n— — —"
+
+ADMIN_MESSAGE_CONFIRM_YES = "✅ Надіслати"
+ADMIN_MESSAGE_SENT = "✅ Надіслано: {handle}"
+ADMIN_MESSAGE_UNREACHABLE = (
+    "Не вдалося надіслати: {handle} заблокував бота або не запускав його. "
+    "Повідомлення не доставлено."
+)
+ADMIN_MESSAGE_EMPTY = "Повідомлення порожнє. Напишіть текст або /cancel"
+
+#: How an admin's message arrives for the member. Marked as coming from a person, not the bot:
+#: a bare forwarded string reads like an automated notice and gets ignored.
+MESSAGE_FROM_ADMIN = "Повідомлення від адміністратора {club}:\n\n{text}"
+
 #: One paid member is still outside the channel after a retry. Everything an admin needs to
 #: finish it by hand is in the line: the handle to search, the id the 🔗 screen accepts, the
 #: name for someone with no username, and why the automatic path did not work.
@@ -465,7 +495,8 @@ ADMIN_INVITE_ESCALATION = (
     "⚠️ <b>Учасник оплатив, але не в каналі</b>\n\n"
     "{handle} · id <code>{user_id}</code> · {name}\n"
     "Причина: {reason}\n\n"
-    "Запрошення вже надсилалося двічі. Надішліть вручну: 🔗 Надіслати запрошення."
+    "Запрошення вже надсилалося двічі. Надішліть вручну: 🔗 Надіслати запрошення — "
+    "або напишіть людині: ✍️ Написати учаснику."
 )
 
 #: Why the automatic path did not finish. Admin-facing, one per branch.

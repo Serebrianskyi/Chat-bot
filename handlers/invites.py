@@ -1,4 +1,4 @@
-"""The 🔗 Надіслати запрошення admin screen: send one member a channel link by hand.
+"""Two admin screens for reaching one member directly: 🔗 a channel link, ✍️ a message.
 
 Exists because a payment and a delivered invite are two separate events, and the second one can
 fail on its own — the bot was not an administrator yet, the member had not started the bot, the
@@ -15,6 +15,12 @@ failed to record, so refusing exactly that case would make the screen useless fo
 
 ``services.subscriptions.send_manual_invite`` writes the ``audit_log`` row, with the admin as
 actor (S6).
+
+✍️ Написати учаснику exists for the member with no ``@username``: an admin cannot open that chat
+by hand — Telegram offers no way to find them — but the bot has had a chat with everybody who
+pressed /start, and can address it by numeric id. The admin dictates, the bot delivers, and the
+message is recorded. It is also the fallback the escalation alert points at when a link alone has
+not worked.
 """
 
 import logging
@@ -175,6 +181,96 @@ async def cancel_from_button(query: CallbackQuery, state: FSMContext) -> None:
         await query.message.answer(texts.ADMIN_GRANT_CANCELLED)
 
 
+class MessageUser(StatesGroup):
+    waiting_for_target = State()
+    waiting_for_text = State()
+    waiting_for_confirmation = State()
+
+
+def _send_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=texts.ADMIN_MESSAGE_CONFIRM_YES, callback_data="msg:send")],
+            [InlineKeyboardButton(text=texts.ADMIN_INVITE_CONFIRM_NO, callback_data="msg:cancel")],
+        ]
+    )
+
+
+async def start_message(query: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(MessageUser.waiting_for_target)
+    await query.answer()
+    if query.message:
+        await query.message.answer(texts.ADMIN_MESSAGE_ASK_WHO)
+
+
+async def receive_message_target(
+    message: Message, state: FSMContext, session: AsyncSession
+) -> None:
+    raw = (message.text or "").strip()
+    if not raw or (not raw.lstrip("-").isdigit() and not normalise_username(raw)):
+        await message.answer(texts.ADMIN_INVITE_BAD_TARGET)
+        return
+
+    user = await _find_user(session, raw)
+    if user is None:
+        await message.answer(texts.ADMIN_INVITE_UNKNOWN)
+        return
+
+    handle = f"@{user.username}" if user.username else f"id {user.telegram_id}"
+    await state.update_data(target_id=user.telegram_id, handle=handle)
+    await state.set_state(MessageUser.waiting_for_text)
+    await message.answer(texts.ADMIN_MESSAGE_ASK_TEXT.format(handle=handle))
+
+
+async def receive_message_text(message: Message, state: FSMContext) -> None:
+    """Hold the text and show it back before it is sent.
+
+    A message to a member cannot be unsent, so it is quoted for confirmation exactly as it will
+    arrive — the one chance to catch a wrong recipient or a half-typed sentence.
+    """
+    body = (message.text or "").strip()
+    if not body:
+        await message.answer(texts.ADMIN_MESSAGE_EMPTY)
+        return
+
+    data = await state.get_data()
+    await state.update_data(body=body)
+    await state.set_state(MessageUser.waiting_for_confirmation)
+    await message.answer(
+        texts.ADMIN_MESSAGE_CONFIRM.format(handle=data.get("handle", ""), preview=body),
+        reply_markup=_send_keyboard(),
+    )
+
+
+async def confirm_message(query: CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    data = await state.get_data()
+    await state.clear()
+    await query.answer()
+    if query.message is None:
+        return
+
+    target_id = data.get("target_id")
+    body = data.get("body")
+    handle = data.get("handle", str(target_id))
+    if target_id is None or not body:
+        await query.message.answer(texts.ADMIN_GRANT_CANCELLED)
+        return
+
+    delivered = await subs.send_admin_message(
+        session,
+        query.bot,
+        user_id=int(target_id),
+        actor_id=query.from_user.id,
+        body=body,
+    )
+    await session.commit()
+
+    if delivered:
+        await query.message.answer(texts.ADMIN_MESSAGE_SENT.format(handle=handle))
+    else:
+        await query.message.answer(texts.ADMIN_MESSAGE_UNREACHABLE.format(handle=handle))
+
+
 def register(router: Router) -> None:
     """Attach to the gated admin router, so ``IsAdmin`` covers all of this too."""
     router.callback_query.register(start_invite, F.data == "admin:send_invite")
@@ -189,3 +285,17 @@ def register(router: Router) -> None:
         confirm_send, F.data == "invite:send", StateFilter(SendInvite.waiting_for_confirmation)
     )
     router.callback_query.register(cancel_from_button, F.data == "invite:cancel")
+
+    router.callback_query.register(start_message, F.data == "admin:message_user")
+    for state in (
+        MessageUser.waiting_for_target,
+        MessageUser.waiting_for_text,
+        MessageUser.waiting_for_confirmation,
+    ):
+        router.message.register(cancel_invite, Command("cancel"), StateFilter(state))
+    router.message.register(receive_message_target, StateFilter(MessageUser.waiting_for_target))
+    router.message.register(receive_message_text, StateFilter(MessageUser.waiting_for_text))
+    router.callback_query.register(
+        confirm_message, F.data == "msg:send", StateFilter(MessageUser.waiting_for_confirmation)
+    )
+    router.callback_query.register(cancel_from_button, F.data == "msg:cancel")
