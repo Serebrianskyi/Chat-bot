@@ -56,6 +56,23 @@ def hours_phrase(count: int) -> str:
     return f"{count} {noun}"
 
 
+def months_phrase(count: int) -> str:
+    """``3`` -> ``"3 місяці"``. Nominative, for reading after a numeral.
+
+    Same agreement rule as ``hours_phrase``: one hard-coded form would read as broken software
+    for most values — «1 місяців» and «5 місяці» are both wrong.
+    """
+    last_two = count % 100
+    last = count % 10
+    if last == 1 and last_two != 11:
+        noun = "місяць"
+    elif last in (2, 3, 4) and last_two not in (12, 13, 14):
+        noun = "місяці"
+    else:
+        noun = "місяців"
+    return f"{count} {noun}"
+
+
 # --- onboarding -----------------------------------------------------------------------------
 
 #: The club pitch, sent first on /start. The spec's step 2: "інформацію про клуб та тариф" —
@@ -493,7 +510,7 @@ ADMIN_MESSAGE_ASK_WHO = (
 
 ADMIN_MESSAGE_ASK_TEXT = (
     "Що надіслати {handle}?\n\n"
-    "Надішліть його одним повідомленням. Воно піде від імені клубу.\n"
+    "Надішліть текст — або фото з підписом. Це піде від імені клубу.\n"
     "Щоб скасувати — /cancel"
 )
 
@@ -521,9 +538,10 @@ ADMIN_BROADCAST_ASK_AUDIENCE = "<b>Розсилка</b>\n\nКому надісл
 
 ADMIN_BROADCAST_ASK_TEXT = (
     "Кому: <b>{label}</b> — {count} учасник(ів)\n\n"
-    "Напишіть текст розсилки одним повідомленням.\n"
+    "Надішліть текст розсилки — або фото з підписом, якщо потрібне зображення.\n"
     "Щоб скасувати — /cancel"
 )
+
 
 ADMIN_BROADCAST_PREVIEW = "<b>Ось що отримає кожен з {count} учасник(ів):</b>\n— — — — —"
 
@@ -536,6 +554,53 @@ ADMIN_BROADCAST_PREVIEW_WITH_PAY = (
 )
 
 ADMIN_BROADCAST_PREVIEW_PLAIN = "— — — — —\n\nБільше нічого не надсилатиметься."
+
+#: The price step. A win-back message usually carries an offer, so the admin chooses what the
+#: payment link will charge before seeing the preview.
+ADMIN_BROADCAST_ASK_PRICE = (
+    "За якою ціною надсилати посилання на оплату?\n\n"
+    "<b>Звичайна</b> — кожен платить свою поточну ціну.\n"
+    "<b>Спеціальна</b> — ви задаєте ціну або відсоток для всіх у цій групі."
+)
+ADMIN_BROADCAST_PRICE_REGULAR = "💰 Звичайна ціна"
+ADMIN_BROADCAST_PRICE_SPECIAL = "🎟 Спеціальна ціна"
+
+ADMIN_BROADCAST_ASK_AMOUNT = (
+    "Яка ціна?\n\n"
+    "Надішліть <b>суму</b> — наприклад <code>8</code> — "
+    "або <b>відсоток знижки</b> — наприклад <code>20%</code>.\n"
+    "Щоб скасувати — /cancel"
+)
+ADMIN_BROADCAST_BAD_AMOUNT = (
+    "Не зрозумів. Надішліть суму (<code>8</code>) або відсоток (<code>20%</code>), або /cancel"
+)
+
+ADMIN_BROADCAST_ASK_PERIOD = (
+    "На скільки місяців діє ця ціна?\n\n"
+    "Оберіть кнопкою або надішліть число — наприклад <code>4</code>.\n"
+    "Один місяць — це один розрахунковий період ({period} днів)."
+)
+ADMIN_BROADCAST_BAD_PERIOD = (
+    "Потрібне число місяців від 1 до {max_months} — наприклад <code>4</code>. "
+    "Або оберіть кнопкою, або /cancel"
+)
+
+#: Written onto each granted discount so 🎟 Знижки shows where the price came from.
+ADMIN_BROADCAST_NOTE = "ціна з розсилки"
+ADMIN_BROADCAST_PERIOD_FOREVER = "Без обмеження"
+ADMIN_BROADCAST_PERIOD_MONTHS = "{months}"
+
+#: Shown in the preview, above the pay-button note, so the admin sees the offer they configured.
+ADMIN_BROADCAST_PRICE_LINE_SPECIAL = "Ціна в посиланні: <b>{price}</b> ({validity})."
+ADMIN_BROADCAST_PRICE_LINE_REGULAR = "Ціна в посиланні: звичайна для кожного учасника."
+ADMIN_BROADCAST_VALIDITY_FOREVER = "без обмеження в часі"
+ADMIN_BROADCAST_VALIDITY_MONTHS = "діє {months}"
+
+#: One active discount per person is the rule, so a special price replaces whatever they had.
+#: Said out loud before sending, because silently overwriting a promised price costs trust.
+ADMIN_BROADCAST_REPLACES_WARNING = (
+    "\n⚠️ У {count} з них вже є знижка — вона буде замінена цією ціною."
+)
 
 ADMIN_BROADCAST_CONFIRM_YES = "✅ Надіслати"
 ADMIN_BROADCAST_EMPTY = "Текст порожній. Напишіть повідомлення або /cancel"
@@ -564,7 +629,7 @@ BROADCAST_PAY_PROMPT = (
 
 ADMIN_CHANNEL_ASK_TEXT = (
     "<b>Пост у канал</b>\n\n"
-    "Напишіть текст одним повідомленням — бот опублікує його в каналі {club}.\n"
+    "Надішліть текст — або фото з підписом. Бот опублікує це в каналі {club}.\n"
     "Щоб скасувати — /cancel"
 )
 

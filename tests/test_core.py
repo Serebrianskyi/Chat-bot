@@ -1231,19 +1231,38 @@ async def test_a_broadcast_to_unpaid_members_follows_the_text_with_a_pay_button(
         bot, make_callback(admin, AdminMenu(action="broadcast").pack(), update_id=2)
     )
     await dispatcher.feed_update(bot, make_callback(admin, "bcast:unpaid", update_id=3))
-    recording_session.calls.clear()
     await dispatcher.feed_update(
         bot, make_message(admin, "Ціну знижено до 8 € — повертайтесь!", update_id=4)
     )
+    # The price the link will charge is chosen before the preview: a win-back message almost
+    # always carries an offer, and the preview has to show the one that will actually be used.
+    await dispatcher.feed_update(bot, make_callback(admin, "bprice:special", update_id=5))
+    await dispatcher.feed_update(bot, make_message(admin, "8", update_id=6))
+    recording_session.calls.clear()
+    await dispatcher.feed_update(bot, make_callback(admin, "bperiod:3", update_id=7))
 
     preview = recording_session.of_type("SendMessage")
     assert all(c.chat_id == ADMIN_ID for c in preview)  # the member has heard nothing yet
     assert any("Ціну знижено до 8 €" in c.text for c in preview)  # shown exactly as it arrives
     assert any(texts.JOIN_CLUB_BUTTON in c.text for c in preview)  # and what follows it
+    # Months can also be typed, for a duration that is not on a button. Bounded at both ends:
+    # 0 is not "no limit" (that has its own button) and a typo must not price a century.
+    from handlers.broadcast import MAX_MONTHS, parse_months
+
+    assert parse_months("4") == 4
+    assert parse_months(" 12 ") == 12
+    assert parse_months("0") is None
+    assert parse_months(str(MAX_MONTHS + 1)) is None
+    assert parse_months("3 місяці") is None
+
+    # The offer is spelled out: the sum in the currency the club charges, and the duration in
+    # months, agreed properly — «3 місяці», not «3 місяць».
+    offered = texts.money(Decimal("8"), CURRENCY)
+    assert any(offered in c.text and texts.months_phrase(3) in c.text for c in preview)
 
     # Confirm.
     recording_session.calls.clear()
-    await dispatcher.feed_update(bot, make_callback(admin, "bcast:send", update_id=5))
+    await dispatcher.feed_update(bot, make_callback(admin, "bcast:send", update_id=8))
 
     to_member = [c for c in recording_session.of_type("SendMessage") if c.chat_id == USER_ID]
     assert len(to_member) == 2
@@ -1252,13 +1271,22 @@ async def test_a_broadcast_to_unpaid_members_follows_the_text_with_a_pay_button(
     button = to_member[1].reply_markup.inline_keyboard[0][0]
     assert button.text == texts.JOIN_CLUB_BUTTON
     assert button.url  # a real invoice URL from the gateway
-    assert len(fake_wayforpay.invoice_calls) >= 1
+    # The offer is what was actually invoiced, not just what the message claimed.
+    assert fake_wayforpay.invoice_calls[-1]["amount"] == Decimal("8.00")
 
     async with session_factory() as session:
         entry = await session.scalar(select(AuditLog).where(AuditLog.action == "broadcast.sent"))
+        discount = await session.scalar(select(Discount).where(Discount.user_id == USER_ID))
     assert entry.actor_id == ADMIN_ID
     assert entry.details["audience"] == "unpaid"
     assert "Ціну знижено" in entry.details["text"]
+    assert entry.details["offer"]["fixed_price"] == "8"
+    # The price is a real discount, so it shows up in 🎟 Знижки and governs their renewal too.
+    assert discount.fixed_price == Decimal("8")
+    # Three months means three billing periods, so the price covers whole periods rather than
+    # lapsing part-way through one.
+    assert discount.valid_until is not None
+    assert (discount.valid_until - discount.created_at).days == 3 * PERIOD_DAYS
 
 
 async def test_an_admin_can_post_into_the_channel_only_after_confirming(
@@ -1388,6 +1416,10 @@ def test_every_member_facing_message_is_ukrainian_and_formats_cleanly():
         "step": "перевірка оплат",
         "extra": " — не доставлено",
         "button": "Стати частиною клубу!",
+        "price": "8 €",
+        "validity": "діє 3 місяці",
+        "months": "3 місяці",
+        "max_months": 60,
         "sent": 50,
         "blocked": 2,
         "invoiced": 48,

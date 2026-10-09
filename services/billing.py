@@ -94,6 +94,17 @@ async def issue_invoice(
     payment row, and that row is what the gateway's answer is checked against (A.14).
     """
     order_reference = subs.build_order_reference(subscription.user_id, now)
+    # The reference carries a whole-second timestamp, so a second invoice for the same member
+    # inside the same second would collide on the UNIQUE column and abort. That is not
+    # hypothetical: a broadcast reprices and re-invoices members who may have been invoiced by
+    # the daily job moments earlier. Suffix it rather than lose the invoice, keeping the
+    # reference readable for reconciliation against the dashboard.
+    attempt = 1
+    while await session.scalar(
+        select(Payment.id).where(Payment.order_reference == order_reference)
+    ):
+        attempt += 1
+        order_reference = f"{subs.build_order_reference(subscription.user_id, now)}-{attempt}"
 
     user = await session.get(User, subscription.user_id)
     amount, currency, discount = await discount_service.effective_price(

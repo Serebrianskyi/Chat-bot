@@ -19,6 +19,7 @@ Both record an ``audit_log`` row carrying the audience and the text (S6).
 """
 
 import logging
+from decimal import Decimal, InvalidOperation
 
 from aiogram import F, Router
 from aiogram.filters import Command, StateFilter
@@ -30,13 +31,38 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import texts
 from config import Settings
-from db.models import Subscription, User, utcnow
+from db.models import DiscountKind, Subscription, User, utcnow
+from handlers.compose import read_composed
 from handlers.participants import GROUPS, classify
 from services import broadcast as broadcast_service
+from services import discounts as discount_service
 from services.billing import BillingConfig
 from services.wayforpay import WayForPayClient
 
 log = logging.getLogger(__name__)
+
+#: How many months a special price can be made to last. Months, not days: a subscription is
+#: billed monthly, so "three months" is what the club decides and `months × period_days` is the
+#: arithmetic that follows from it rather than a number the admin has to work out.
+MONTH_CHOICES = (1, 2, 3, 6, 12)
+
+#: Upper bound on a typed number of months. The buttons cover the usual offers; typing exists
+#: for the one that is not on them, not for a price that outlives the club.
+MAX_MONTHS = 60
+
+
+def parse_months(raw: str) -> int | None:
+    """``"4"`` -> ``4``. None for anything that is not a usable number of months.
+
+    Bounded at both ends: ``0`` is not "no limit" — that is its own button — and an unbounded
+    number would set a price running for centuries off one typo.
+    """
+    digits = raw.strip()
+    if not digits.isdigit():
+        return None
+    months = int(digits)
+    return months if 1 <= months <= MAX_MONTHS else None
+
 
 #: Audiences that have not paid, and so are sent the payment link after the admin's text. TRIAL
 #: is not here: a free period is running, nothing is owed yet, and a payment button would be
@@ -47,6 +73,9 @@ AUDIENCES_OWED_PAYMENT = frozenset({"unpaid"})
 class Broadcast(StatesGroup):
     waiting_for_audience = State()
     waiting_for_text = State()
+    waiting_for_price = State()
+    waiting_for_amount = State()
+    waiting_for_period = State()
     waiting_for_confirmation = State()
 
 
@@ -121,12 +150,24 @@ async def choose_audience(query: CallbackQuery, state: FSMContext, session: Asyn
     if query.message is None:
         return
 
+    now = utcnow()
     recipients = await _members_of(session, key)
     if not recipients:
         await query.message.answer(texts.ADMIN_BROADCAST_NO_AUDIENCE)
         return
 
-    await state.update_data(audience=key, label=label, recipients=recipients)
+    # How many of them already hold a discount, so the preview can warn that a special price
+    # would replace it. Counted here, against the same recipient list the admin is shown.
+    live = await discount_service.list_active(session, now=now)
+    chosen = set(recipients)
+    already_discounted = len({d.user_id for d in live if d.user_id in chosen})
+
+    await state.update_data(
+        audience=key,
+        label=label,
+        recipients=recipients,
+        already_discounted=already_discounted,
+    )
     await state.set_state(Broadcast.waiting_for_text)
     await query.message.answer(
         texts.ADMIN_BROADCAST_ASK_TEXT.format(label=label, count=len(recipients))
@@ -138,28 +179,208 @@ async def cancel(message: Message, state: FSMContext) -> None:
     await message.answer(texts.ADMIN_GRANT_CANCELLED)
 
 
+def _price_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=texts.ADMIN_BROADCAST_PRICE_REGULAR, callback_data="bprice:regular"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=texts.ADMIN_BROADCAST_PRICE_SPECIAL, callback_data="bprice:special"
+                )
+            ],
+        ]
+    )
+
+
+def _period_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=texts.ADMIN_BROADCAST_PERIOD_MONTHS.format(months=texts.months_phrase(months)),
+                callback_data=f"bperiod:{months}",
+            )
+        ]
+        for months in MONTH_CHOICES
+    ]
+    rows.append(
+        [InlineKeyboardButton(text=texts.ADMIN_BROADCAST_PERIOD_FOREVER, callback_data="bperiod:0")]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 async def receive_broadcast_text(message: Message, state: FSMContext) -> None:
-    """Show the admin the message as the member will receive it, then ask."""
-    body = (message.text or "").strip()
-    if not body:
+    """Hold the text, then ask what the payment link should charge.
+
+    The audiences that are not sent a payment link skip straight to the preview: there is no
+    price to configure when no invoice is being issued.
+    """
+    body, photo = read_composed(message)
+    # An image on its own is a valid post; a message with neither words nor picture is not.
+    if not body and photo is None:
         await message.answer(texts.ADMIN_BROADCAST_EMPTY)
         return
 
+    await state.update_data(body=body, photo=photo)
     data = await state.get_data()
+
+    if data.get("audience") in AUDIENCES_OWED_PAYMENT:
+        await state.set_state(Broadcast.waiting_for_price)
+        await message.answer(texts.ADMIN_BROADCAST_ASK_PRICE, reply_markup=_price_keyboard())
+        return
+
+    await _show_preview(message, state)
+
+
+async def choose_price(query: CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    await query.answer()
+    if query.message is None:
+        return
+    if (query.data or "").endswith("regular"):
+        await _show_preview(query.message, state)
+        return
+    await state.set_state(Broadcast.waiting_for_amount)
+    await query.message.answer(texts.ADMIN_BROADCAST_ASK_AMOUNT)
+
+
+async def receive_amount(message: Message, state: FSMContext, settings: Settings) -> None:
+    """Accept either a sum (``8``) or a percentage (``20%``).
+
+    One step rather than a kind button followed by a number: the ``%`` makes the two forms
+    unambiguous, and an admin writing an offer already thinks in one or the other.
+    """
+    raw = (message.text or "").strip().replace(",", ".")
+    percent: int | None = None
+    fixed: Decimal | None = None
+
+    if raw.endswith("%"):
+        digits = raw[:-1].strip()
+        if digits.isdigit() and 1 <= int(digits) <= 100:
+            percent = int(digits)
+    else:
+        try:
+            value = Decimal(raw)
+        except InvalidOperation:
+            value = None
+        if value is not None and value > 0:
+            fixed = value
+
+    if percent is None and fixed is None:
+        await message.answer(texts.ADMIN_BROADCAST_BAD_AMOUNT)
+        return
+
+    await state.update_data(
+        percent_off=percent,
+        fixed_price=None if fixed is None else str(fixed),
+        currency=settings.subscription_currency,
+    )
+    await state.set_state(Broadcast.waiting_for_period)
+    await message.answer(
+        texts.ADMIN_BROADCAST_ASK_PERIOD.format(period=settings.subscription_period_days),
+        reply_markup=_period_keyboard(),
+    )
+
+
+async def _apply_months(
+    message: Message, state: FSMContext, *, months: int | None, settings: Settings
+) -> None:
+    """Store the duration and move to the preview. ``months=None`` means no end date.
+
+    ``Discount.valid_until`` is computed from days, so the conversion happens once, here, using
+    the club's own billing period rather than a calendar month — the price has to cover whole
+    billing periods or a member's last month would be charged at the old amount.
+    """
+    await state.update_data(
+        months=months,
+        days=months * settings.subscription_period_days if months else None,
+    )
+    await _show_preview(message, state)
+
+
+async def choose_period(query: CallbackQuery, state: FSMContext, settings: Settings) -> None:
+    """A tapped button. ``bperiod:0`` is the "no limit" choice."""
+    months = int((query.data or "bperiod:0").removeprefix("bperiod:"))
+    await query.answer()
+    if query.message:
+        await _apply_months(query.message, state, months=months or None, settings=settings)
+
+
+async def receive_period_months(message: Message, state: FSMContext, settings: Settings) -> None:
+    """A typed number of months, for the duration that is not on a button."""
+    months = parse_months(message.text or "")
+    if months is None:
+        await message.answer(texts.ADMIN_BROADCAST_BAD_PERIOD.format(max_months=MAX_MONTHS))
+        return
+    await _apply_months(message, state, months=months, settings=settings)
+
+
+def _offer_from(data: dict) -> broadcast_service.PriceOffer | None:
+    """The configured price, or None when the regular one is being used."""
+    if data.get("percent_off") is None and data.get("fixed_price") is None:
+        return None
+    fixed = data.get("fixed_price")
+    return broadcast_service.PriceOffer(
+        kind=DiscountKind.PERCENT if data.get("percent_off") else DiscountKind.FIXED_PRICE,
+        percent_off=data.get("percent_off"),
+        fixed_price=None if fixed is None else Decimal(fixed),
+        currency=data.get("currency", "EUR"),
+        days=data.get("days"),
+        note=texts.ADMIN_BROADCAST_NOTE,
+    )
+
+
+async def _show_preview(message: Message, state: FSMContext) -> None:
+    """Everything the admin needs to decide, in the order the member will see it."""
+    data = await state.get_data()
+    body = data.get("body", "")
     recipients = data.get("recipients", [])
-    await state.update_data(body=body)
     await state.set_state(Broadcast.waiting_for_confirmation)
 
     # Three messages, in the order the member will see them: the frame, the text itself exactly
     # as it will arrive, then what follows it. Quoting the text inside a bigger message would
     # change how it looks, which defeats the purpose of a preview.
     await message.answer(texts.ADMIN_BROADCAST_PREVIEW.format(count=len(recipients)))
-    await message.answer(body)
-
-    if data.get("audience") in AUDIENCES_OWED_PAYMENT:
-        tail = texts.ADMIN_BROADCAST_PREVIEW_WITH_PAY.format(button=texts.JOIN_CLUB_BUTTON)
+    photo = data.get("photo")
+    if photo is not None:
+        await message.answer_photo(photo, caption=body or None)
     else:
-        tail = texts.ADMIN_BROADCAST_PREVIEW_PLAIN
+        await message.answer(body)
+
+    if data.get("audience") not in AUDIENCES_OWED_PAYMENT:
+        await message.answer(
+            texts.ADMIN_BROADCAST_PREVIEW_PLAIN,
+            reply_markup=_confirm_keyboard(texts.ADMIN_BROADCAST_CONFIRM_YES, "bcast:send"),
+        )
+        return
+
+    offer = _offer_from(data)
+    tail = texts.ADMIN_BROADCAST_PREVIEW_WITH_PAY.format(button=texts.JOIN_CLUB_BUTTON)
+    if offer is None:
+        tail += "\n" + texts.ADMIN_BROADCAST_PRICE_LINE_REGULAR
+    else:
+        price = (
+            f"−{offer.percent_off}%"
+            if offer.percent_off
+            else texts.money(offer.fixed_price, offer.currency)
+        )
+        months = data.get("months")
+        validity = (
+            texts.ADMIN_BROADCAST_VALIDITY_FOREVER
+            if months is None
+            else texts.ADMIN_BROADCAST_VALIDITY_MONTHS.format(months=texts.months_phrase(months))
+        )
+        tail += "\n" + texts.ADMIN_BROADCAST_PRICE_LINE_SPECIAL.format(
+            price=price, validity=validity
+        )
+        # One active discount per person, so this price replaces whatever they had. Said before
+        # sending, because silently overwriting a promised price is the costly mistake here.
+        replaced = data.get("already_discounted", 0)
+        if replaced:
+            tail += texts.ADMIN_BROADCAST_REPLACES_WARNING.format(count=replaced)
+
     await message.answer(
         tail,
         reply_markup=_confirm_keyboard(texts.ADMIN_BROADCAST_CONFIRM_YES, "bcast:send"),
@@ -182,9 +403,9 @@ async def confirm_broadcast(
         return
 
     recipients: list[int] = data.get("recipients", [])
-    body = data.get("body")
+    body = data.get("body", "")
     audience = data.get("audience", "")
-    if not recipients or not body:
+    if not recipients or not (body or data.get("photo")):
         await query.message.answer(texts.ADMIN_GRANT_CANCELLED)
         return
 
@@ -198,9 +419,11 @@ async def confirm_broadcast(
         query.bot,
         user_ids=recipients,
         text=body,
+        photo=data.get("photo"),
         actor_id=query.from_user.id,
         audience=audience,
         with_invoice=with_invoice,
+        offer=_offer_from(data) if with_invoice else None,
         client=wayforpay if with_invoice else None,
         config=billing_config if with_invoice else None,
     )
@@ -226,15 +449,20 @@ async def start_channel_post(query: CallbackQuery, state: FSMContext) -> None:
 
 
 async def receive_channel_text(message: Message, state: FSMContext) -> None:
-    body = (message.text or "").strip()
-    if not body:
+    body, photo = read_composed(message)
+    if not body and photo is None:
         await message.answer(texts.ADMIN_BROADCAST_EMPTY)
         return
 
-    await state.update_data(body=body)
+    await state.update_data(body=body, photo=photo)
     await state.set_state(ChannelPost.waiting_for_confirmation)
     await message.answer(texts.ADMIN_CHANNEL_PREVIEW)
-    await message.answer(body)
+    # Shown the way it will appear in the channel, image and all — a quoted description of a
+    # picture is not a preview of it.
+    if photo is not None:
+        await message.answer_photo(photo, caption=body or None)
+    else:
+        await message.answer(body)
     await message.answer(
         texts.ADMIN_CHANNEL_PREVIEW_FOOTER,
         reply_markup=_confirm_keyboard(texts.ADMIN_CHANNEL_CONFIRM_YES, "post:send"),
@@ -253,8 +481,8 @@ async def confirm_channel_post(
     if query.message is None:
         return
 
-    body = data.get("body")
-    if not body:
+    body = data.get("body", "")
+    if not (body or data.get("photo")):
         await query.message.answer(texts.ADMIN_GRANT_CANCELLED)
         return
     if not settings.channel_id:
@@ -266,6 +494,7 @@ async def confirm_channel_post(
         query.bot,
         channel_id=settings.channel_id,
         text=body,
+        photo=data.get("photo"),
         actor_id=query.from_user.id,
     )
     await query.message.answer(texts.ADMIN_CHANNEL_SENT if posted else texts.ADMIN_CHANNEL_FAILED)
@@ -289,6 +518,14 @@ def register(router: Router) -> None:
     for key, _label, _action in GROUPS:
         router.callback_query.register(choose_audience, F.data == f"bcast:{key}")
     router.message.register(receive_broadcast_text, StateFilter(Broadcast.waiting_for_text))
+    router.callback_query.register(
+        choose_price, F.data.startswith("bprice:"), StateFilter(Broadcast.waiting_for_price)
+    )
+    router.message.register(receive_amount, StateFilter(Broadcast.waiting_for_amount))
+    router.callback_query.register(
+        choose_period, F.data.startswith("bperiod:"), StateFilter(Broadcast.waiting_for_period)
+    )
+    router.message.register(receive_period_months, StateFilter(Broadcast.waiting_for_period))
     router.callback_query.register(
         confirm_broadcast, F.data == "bcast:send", StateFilter(Broadcast.waiting_for_confirmation)
     )

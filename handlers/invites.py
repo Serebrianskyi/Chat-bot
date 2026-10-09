@@ -36,6 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import texts
 from config import Settings
 from db.models import SubscriptionStatus, User, normalise_username, utcnow
+from handlers.compose import read_composed
 from services import subscriptions as subs
 
 log = logging.getLogger(__name__)
@@ -223,21 +224,24 @@ async def receive_message_target(
 
 
 async def receive_message_text(message: Message, state: FSMContext) -> None:
-    """Hold the text and show it back before it is sent.
+    """Hold what the admin composed and show it back before it is sent.
 
-    A message to a member cannot be unsent, so it is quoted for confirmation exactly as it will
-    arrive — the one chance to catch a wrong recipient or a half-typed sentence.
+    A message to a member cannot be unsent, so it is shown for confirmation exactly as it will
+    arrive — the one chance to catch a wrong recipient or a half-typed sentence. An attached
+    image is shown as an image, not described.
     """
-    body = (message.text or "").strip()
-    if not body:
+    body, photo = read_composed(message)
+    if not body and photo is None:
         await message.answer(texts.ADMIN_MESSAGE_EMPTY)
         return
 
     data = await state.get_data()
-    await state.update_data(body=body)
+    await state.update_data(body=body, photo=photo)
     await state.set_state(MessageUser.waiting_for_confirmation)
+    if photo is not None:
+        await message.answer_photo(photo, caption=body or None)
     await message.answer(
-        texts.ADMIN_MESSAGE_CONFIRM.format(handle=data.get("handle", ""), preview=body),
+        texts.ADMIN_MESSAGE_CONFIRM.format(handle=data.get("handle", ""), preview=body or "—"),
         reply_markup=_send_keyboard(),
     )
 
@@ -250,9 +254,9 @@ async def confirm_message(query: CallbackQuery, state: FSMContext, session: Asyn
         return
 
     target_id = data.get("target_id")
-    body = data.get("body")
+    body = data.get("body", "")
     handle = data.get("handle", str(target_id))
-    if target_id is None or not body:
+    if target_id is None or not (body or data.get("photo")):
         await query.message.answer(texts.ADMIN_GRANT_CANCELLED)
         return
 
@@ -262,6 +266,7 @@ async def confirm_message(query: CallbackQuery, state: FSMContext, session: Asyn
         user_id=int(target_id),
         actor_id=query.from_user.id,
         body=body,
+        photo=data.get("photo"),
     )
     await session.commit()
 

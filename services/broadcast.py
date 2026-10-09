@@ -21,6 +21,7 @@ import asyncio
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
+from decimal import Decimal
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
@@ -28,8 +29,9 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 import texts
-from db.models import Payment, Subscription, utcnow
+from db.models import DiscountKind, Payment, PaymentStatus, Subscription, utcnow
 from services import billing
+from services import discounts as discount_service
 from services import subscriptions as subs
 from services.audit import Action, record_action
 from services.wayforpay import WayForPayClient
@@ -44,6 +46,26 @@ MESSAGES_PER_SECOND = 20
 SEND_INTERVAL = 1 / MESSAGES_PER_SECOND
 
 
+@dataclass(frozen=True)
+class PriceOffer:
+    """The price the broadcast's payment links should charge.
+
+    Applied by granting each recipient a real ``Discount``, so the amount flows through
+    ``effective_price`` like every other price in the system rather than through a second,
+    parallel pricing path. It is therefore visible in 🎟 Знижки, revocable, and it governs the
+    member's renewals too until it expires.
+
+    ``days=None`` means the price has no end date.
+    """
+
+    kind: DiscountKind
+    currency: str
+    percent_off: int | None = None
+    fixed_price: Decimal | None = None
+    days: int | None = None
+    note: str | None = None
+
+
 @dataclass
 class BroadcastResult:
     """What a broadcast actually did. Reported to the admin who started it."""
@@ -52,6 +74,8 @@ class BroadcastResult:
     blocked: int = 0
     failed: int = 0
     invoiced: int = 0
+    #: How many were given the special price.
+    repriced: int = 0
     #: Members the payment link could not be built for, so an admin can follow up by hand.
     no_invoice: list[int] = field(default_factory=list)
 
@@ -71,15 +95,22 @@ def pay_keyboard(invoice_url: str) -> InlineKeyboardMarkup:
     )
 
 
-async def _send(bot: Bot, chat_id: int, text: str, **kwargs) -> str:
+async def _send(bot: Bot, chat_id: int, text: str, *, photo: str | None = None, **kwargs) -> str:
     """Send one message, honouring ``RetryAfter``. Returns 'sent', 'blocked' or 'failed'.
+
+    With ``photo`` — a Telegram ``file_id`` — the text travels as the image's caption. A
+    ``file_id`` is reusable, so the admin's upload is sent once to Telegram and then referenced
+    for every recipient rather than re-uploaded per member.
 
     The wait is obeyed rather than the member skipped: dropping somebody from a broadcast
     because Telegram asked us to slow down is the failure mode rule 10 exists to prevent.
     """
     for attempt in (1, 2, 3):
         try:
-            await bot.send_message(chat_id, text, **kwargs)
+            if photo is not None:
+                await bot.send_photo(chat_id, photo=photo, caption=text or None, **kwargs)
+            else:
+                await bot.send_message(chat_id, text, **kwargs)
             return "sent"
         except TelegramForbiddenError:
             # Blocked the bot, or never started it. Not an error worth failing a broadcast over.
@@ -102,22 +133,25 @@ async def _invoice(
     subscription: Subscription,
     config: billing.BillingConfig,
     now: datetime,
+    reuse_open: bool = True,
 ) -> Payment | None:
     """A usable invoice for one member: the open one if it is still fresh, else a new one.
 
     An open invoice older than the gateway's ``orderTimeout`` is dead at WayForPay even though
     our row still looks open, so reusing it would hand the member a link that fails. Anything
     younger is reused, which keeps a broadcast from creating a second order for every member who
-    already had one.
+    already had one. ``reuse_open=False`` when a new price is being applied: the open invoice
+    carries the old amount, so reusing it would advertise the offer and charge the old price.
 
     The row is returned rather than just its URL, so the sum quoted in the message is the sum on
     the invoice. Recomputing the price separately is how a message ends up advertising one amount
     and charging another.
     """
-    existing = await subs.open_payment(session, subscription.id)
-    if existing is not None and existing.invoice_url:
-        if now - existing.created_at < config.invoice_timeout:
-            return existing
+    if reuse_open:
+        existing = await subs.open_payment(session, subscription.id)
+        if existing is not None and existing.invoice_url:
+            if now - existing.created_at < config.invoice_timeout:
+                return existing
 
     try:
         return await billing.issue_invoice(
@@ -136,7 +170,9 @@ async def send_broadcast(
     text: str,
     actor_id: int,
     audience: str,
+    photo: str | None = None,
     with_invoice: bool = False,
+    offer: PriceOffer | None = None,
     client: WayForPayClient | None = None,
     config: billing.BillingConfig | None = None,
     now: datetime | None = None,
@@ -167,6 +203,16 @@ async def send_broadcast(
                 "audience": audience,
                 "recipients": len(user_ids),
                 "with_invoice": with_invoice,
+                "photo": photo,
+                "offer": None
+                if offer is None
+                else {
+                    "kind": offer.kind.value,
+                    "percent_off": offer.percent_off,
+                    "fixed_price": None if offer.fixed_price is None else str(offer.fixed_price),
+                    "currency": offer.currency,
+                    "days": offer.days,
+                },
                 "text": text,
             },
             now=now,
@@ -174,7 +220,7 @@ async def send_broadcast(
         await session.commit()
 
     for user_id in user_ids:
-        outcome = await _send(bot, user_id, text)
+        outcome = await _send(bot, user_id, text, photo=photo)
         if outcome == "blocked":
             result.blocked += 1
             continue
@@ -191,8 +237,43 @@ async def send_broadcast(
                 if subscription is None:
                     result.no_invoice.append(user_id)
                 else:
+                    if offer is not None:
+                        # The open invoice, if any, quotes the price from before this offer.
+                        # Leaving it payable would let the member pay the old amount from an
+                        # older message, so it is written off here: the new link replaces it.
+                        stale = await subs.open_payment(session, subscription.id)
+                        if stale is not None:
+                            stale.status = PaymentStatus.CANCELED
+
+                        # Granted before the invoice is built, because issue_invoice computes the
+                        # amount from whatever discount is live at that moment. grant() revokes
+                        # whatever the member had before — one active discount per person — which
+                        # the admin was warned about at the preview.
+                        try:
+                            await discount_service.grant(
+                                session,
+                                actor_id=actor_id,
+                                telegram_id=user_id,
+                                kind=offer.kind,
+                                percent_off=offer.percent_off,
+                                fixed_price=offer.fixed_price,
+                                currency=offer.currency,
+                                days=offer.days,
+                                note=offer.note,
+                                now=now,
+                            )
+                            await session.flush()
+                            result.repriced += 1
+                        except Exception:
+                            log.exception("Broadcast: could not reprice %s", user_id)
+
                     payment = await _invoice(
-                        session, client, subscription=subscription, config=config, now=now
+                        session,
+                        client,
+                        subscription=subscription,
+                        config=config,
+                        now=now,
+                        reuse_open=offer is None,
                     )
                     if payment is None or not payment.invoice_url:
                         result.no_invoice.append(user_id)
@@ -234,6 +315,7 @@ async def post_to_channel(
     channel_id: str,
     text: str,
     actor_id: int,
+    photo: str | None = None,
     now: datetime | None = None,
 ) -> bool:
     """Publish an admin's text in the channel as the bot. Returns whether it posted.
@@ -245,7 +327,10 @@ async def post_to_channel(
     now = now or utcnow()
     posted = True
     try:
-        await bot.send_message(channel_id, text)
+        if photo is not None:
+            await bot.send_photo(channel_id, photo=photo, caption=text or None)
+        else:
+            await bot.send_message(channel_id, text)
     except Exception:
         log.exception("Could not post to channel %s", channel_id)
         posted = False
@@ -255,7 +340,12 @@ async def post_to_channel(
             session,
             actor_id=actor_id,
             action=Action.CHANNEL_POST,
-            details={"channel_id": channel_id, "posted": posted, "text": text},
+            details={
+                "channel_id": channel_id,
+                "posted": posted,
+                "text": text,
+                "photo": photo,
+            },
             now=now,
         )
         await session.commit()

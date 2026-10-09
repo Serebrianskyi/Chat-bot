@@ -50,7 +50,7 @@ deployed on Railway. 39 tests, 7 migrations.
 | Admin panel | 🎟 Знижки · 🎁 Надати знижку · 👥 Учасники · 🔗 Надіслати запрошення · ✍️ Написати учаснику (admin dictates, the bot delivers — the only way to reach a member with no username) · 📣 Розсилка · 📢 Написати в канал. The other four answer "later". 👥 Учасники opens on counts with a button per group — 🔄 автопродовження · ⏹ скасували автопродовження · 🎁 пробний період · ⏳ очікують оплати · ♾ безстрокові · ❓ без підписки — so it stays one message as the club grows; tapping a group lists only that group, naming people without a username by their first name |
 | Member area | `/subscription` with status, next amount and date; **Скасувати автопродовження** keeps the paid period |
 | Copy | All Ukrainian, all in `texts.py`. Owner-supplied strings marked `SPEC` |
-| Broadcast | 📣 Розсилка: pick a group (the same groups 👥 Учасники uses) → write the text → **see it rendered exactly as it will arrive** → confirm. For ⏳ Очікують оплати each recipient also gets a second message with «Стати частиною клубу!» and their own live invoice, since the text alone gives them no way to act. Held to 20 messages/second, honours `RetryAfter` without skipping or duplicating anybody (rule 10). One `audit_log` row per broadcast, carrying the audience and the text |
+| Broadcast | 📣 Розсилка: pick a group (the same groups 👥 Учасники uses) → write the text → choose the price the link will charge (💰 звичайна, or 🎟 спеціальна: a sum like `8` or a percentage like `20%`, lasting 1/2/3/6/12 months by button, any number of months up to 60 by typing it, or without limit — months, because the club bills monthly, converted to `months × period_days` so a price always covers whole billing periods) → **see it rendered exactly as it will arrive** → confirm. A special price is applied by granting each recipient a real `Discount`, so it flows through `effective_price` like every other price, shows up in 🎟 Знижки and is revocable — and because the rule is one active discount per person, the preview says how many existing discounts it would replace. For ⏳ Очікують оплати each recipient also gets a second message with «Стати частиною клубу!» and their own live invoice, since the text alone gives them no way to act. Held to 20 messages/second, honours `RetryAfter` without skipping or duplicating anybody (rule 10). One `audit_log` row per broadcast, carrying the audience, the text and the photo `file_id`. A message may be text, or a photo whose caption is the text — one message per send; collecting several messages into one broadcast is **parked** (see below) |
 | Channel posts | 📢 Написати в канал: the bot publishes an admin's text in the private channel, with the same preview-then-confirm step, so the club can speak there as well as read |
 | Operator tools | `scripts/discounts.py`, `scripts/run_jobs.py` (`status` is read-only), `scripts/diagnose.py` (read-only: `access` tells a bot failure from a member who never used their link, `reasons` groups what WayForPay actually said), `scripts/start.sh` |
 
@@ -63,6 +63,18 @@ administrator with *Invite users via link* and *Ban users*. Admins: `158032815`,
 invoices them and no screen shows them a due date. Granted by migration `c3a1f0d27b94`, marked
 `source='lifetime'`. A sentinel date rather than a nullable column, because every job and screen
 is a comparison against `expires_at`.
+
+### Parked mid-change
+
+**Composing a broadcast from several messages.** The ask: an admin sends the photo and the words
+as separate messages rather than one. The groundwork was started and then reverted on request, so
+the tree is consistent at one-message-per-step; `handlers/compose.py` carries the shape it would
+take. What it needs: a collecting state that appends each message to a `parts` list in FSM data
+until a «✅ Готово» button is tapped, `replay()` to preview the parts in order, and
+`send_broadcast` taking `parts` instead of `text`/`photo` — with the rate limit counting every
+part, not every recipient. Albums (several photos sent as one group) are a separate problem: they
+arrive as separate updates sharing a `media_group_id` and need batching middleware plus
+`send_media_group`.
 
 ### Not built — in the order I would do it
 

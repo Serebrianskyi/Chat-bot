@@ -27,6 +27,9 @@ from services.pricing import decide_price, extend, first_expiry
 
 log = logging.getLogger(__name__)
 
+#: Telegram's limit on a photo caption. A message may be 4096 characters; a caption may not.
+CAPTION_LIMIT = 1024
+
 #: How long a single-use invite stays usable. Long enough to notice the message, short enough
 #: that a forwarded link is useless by the time it travels.
 INVITE_VALID_DAYS = 3
@@ -383,7 +386,13 @@ async def send_manual_invite(
 
 
 async def send_admin_message(
-    session: AsyncSession, bot, *, user_id: int, actor_id: int, body: str
+    session: AsyncSession,
+    bot,
+    *,
+    user_id: int,
+    actor_id: int,
+    body: str,
+    photo: str | None = None,
 ) -> bool:
     """Deliver an admin's own words to one member. Returns whether it arrived.
 
@@ -395,11 +404,20 @@ async def send_admin_message(
     automated notice, and it is stored on the audit row: "what did we actually tell them" is a
     question that gets asked, and nothing else in the system records an outgoing message (S6).
     """
+    wrapped = texts.MESSAGE_FROM_ADMIN.format(club=texts.CLUB_NAME, text=body)
     delivered = True
     try:
-        await bot.send_message(
-            user_id, texts.MESSAGE_FROM_ADMIN.format(club=texts.CLUB_NAME, text=body)
-        )
+        if photo is not None:
+            # Telegram caps a caption at 1024 characters against 4096 for a message, so a long
+            # note with a picture goes as the caption only if it fits, and as its own message
+            # after the picture if it does not. Truncation would eat the admin's words.
+            if len(wrapped) <= CAPTION_LIMIT:
+                await bot.send_photo(user_id, photo=photo, caption=wrapped)
+            else:
+                await bot.send_photo(user_id, photo=photo)
+                await bot.send_message(user_id, wrapped)
+        else:
+            await bot.send_message(user_id, wrapped)
     except TelegramForbiddenError:
         log.warning("Admin %s could not reach %s: blocked or never started", actor_id, user_id)
         delivered = False
@@ -409,7 +427,7 @@ async def send_admin_message(
         actor_id=actor_id,
         action=Action.MESSAGE_SENT,
         target_user_id=user_id,
-        details={"delivered": delivered, "text": body},
+        details={"delivered": delivered, "text": body, "photo": photo},
     )
     log.info("Admin %s messaged %s (delivered=%s)", actor_id, user_id, delivered)
     return delivered
