@@ -274,11 +274,33 @@ ADMIN_MENU_MESSAGE_USER = "✍️ Написати учаснику"
 # this is not a channel roster and the message says so — otherwise the count looks wrong.
 
 ADMIN_USERS_EMPTY = "Ще ніхто не запускав бота."
-ADMIN_USERS_HEADER = (
-    "<b>Учасники бота</b> — {total}\n"
-    "Активних: {active} · очікують оплати: {unpaid} · пробний період: {trial}\n"
-    "\n"
-)
+
+#: The 👥 Учасники screen opens on counts alone, with a button per group. A flat roster grew to
+#: 85 people and several messages, and it only grows; this stays one message however large the
+#: club gets, and an admin opens only the group they care about.
+ADMIN_USERS_SUMMARY = "<b>Учасники бота</b> — {total}\n\nОберіть групу:"
+
+#: Group labels. Also the button text, with the count appended.
+ADMIN_GROUP_AUTO = "🔄 Автопродовження"
+ADMIN_GROUP_CANCELLED = "⏹ Скасували автопродовження"
+ADMIN_GROUP_TRIAL = "🎁 Пробний період"
+ADMIN_GROUP_UNPAID = "⏳ Очікують оплати"
+ADMIN_GROUP_LIFETIME = "♾ Безстрокові"
+ADMIN_GROUP_NO_SUB = "❓ Без підписки"
+
+ADMIN_USERS_GROUP_HEADER = "<b>{label}</b> — {count}\n"
+ADMIN_USERS_GROUP_EMPTY = "У цій групі нікого немає."
+
+#: What each group means, under its heading — the difference between "cancelled" and "awaiting
+#: payment" is not obvious from the name, and acting on the wrong group costs a member.
+ADMIN_GROUP_NOTES = {
+    "auto": "Оплачено, наступне списання автоматичне.",
+    "cancelled": "Оплачено, але автопродовження вимкнено — доступ до вказаної дати.",
+    "trial": "Безкоштовний перший період, оплати ще не було.",
+    "unpaid": "Доступу немає: не оплатили або підписка завершилася.",
+    "lifetime": "Доступ без дати завершення.",
+    "no_sub": "Запустили бота, але підписки немає — таке можливе лише після ручної правки.",
+}
 #: One line per member: handle, status, price, until.
 ADMIN_USER_LINE = "• {handle} — {status}, {amount}, до {until}"
 ADMIN_USERS_FOOTER = (

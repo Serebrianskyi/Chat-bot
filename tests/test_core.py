@@ -1152,132 +1152,65 @@ async def test_the_discount_list_shows_live_rows_and_who_has_not_claimed(
     assert "ще не активував бота" in body
 
 
-async def test_the_participants_list_shows_members_and_says_what_it_cannot_show(
+async def test_the_participants_screen_groups_members_and_stays_one_message(
     dispatcher, bot, session_factory, recording_session
 ):
-    """It lists people who started the bot. A bot cannot enumerate a channel's members, so the
-    message has to say so or the count reads as if members were missing."""
+    """It opens on counts with a button per group: a flat roster was already several messages at
+    85 members and only grows. Tapping a group sends that group alone.
+
+    A bot cannot enumerate a channel's members, so the screen still has to say so or the count
+    reads as if members were missing.
+    """
     from handlers.admin import AdminMenu
 
+    # One member who owes payment (a regular joiner is due immediately)...
     await dispatcher.feed_update(bot, make_message(make_user(USER_ID, username="m1"), "/start"))
-    recording_session.calls.clear()
+    # ...and one who is paid up and renewing.
+    paying_id = USER_ID + 31
+    from db.models import utcnow
 
+    async with session_factory() as session:
+        session.add(User(telegram_id=paying_id, username="m2"))
+        session.add(
+            Subscription(
+                user_id=paying_id,
+                status=SubscriptionStatus.ACTIVE,
+                price=REGULAR_PRICE,
+                currency=CURRENCY,
+                price_tier=PriceTier.REGULAR,
+                period_days=PERIOD_DAYS,
+                started_at=utcnow(),
+                expires_at=utcnow() + timedelta(days=20),
+            )
+        )
+        await session.commit()
+
+    recording_session.calls.clear()
     await dispatcher.feed_update(
         bot, make_callback(make_user(ADMIN_ID), AdminMenu(action="users").pack())
     )
 
-    # Sent as several messages — header, then the roster in chunks, then the footer — because
-    # Telegram caps one message at 4096 characters and the roster has to stay complete.
+    messages = recording_session.of_type("SendMessage")
+    summary = messages[0].text
+    assert "Учасники бота</b> — 2" in summary
+    # No roster in the summary: that is what keeps it one message as the club grows.
+    assert "@m1" not in summary and "@m2" not in summary
+    buttons = [button.text for row in messages[0].reply_markup.inline_keyboard for button in row]
+    assert f"{texts.ADMIN_GROUP_AUTO} — 1" in buttons
+    assert f"{texts.ADMIN_GROUP_UNPAID} — 1" in buttons
+    # Empty groups get no button at all.
+    assert not any(texts.ADMIN_GROUP_LIFETIME in b for b in buttons)
+    assert "Перелік учасників каналу бот отримати не може" in "\n".join(c.text for c in messages)
+
+    # Tapping one group sends that group, and only that group.
+    recording_session.calls.clear()
+    await dispatcher.feed_update(
+        bot, make_callback(make_user(ADMIN_ID), "admin:users_auto", update_id=2)
+    )
     body = "\n".join(c.text for c in recording_session.of_type("SendMessage"))
-    assert "@m1" in body
+    assert "@m2" in body
+    assert "@m1" not in body
     assert texts.money(REGULAR_PRICE, CURRENCY) in body
-    assert "Перелік учасників каналу бот отримати не може" in body
-
-
-async def test_an_admin_can_send_a_member_their_channel_link_and_nobody_else_can(
-    dispatcher, bot, session_factory, recording_session
-):
-    """The repair path for a member who paid and never got in — so it must grant access to
-    exactly one person and be closed to everyone else (G1.5, S6)."""
-    from handlers.admin import AdminMenu
-
-    await dispatcher.feed_update(bot, make_message(make_user(USER_ID, username="paid"), "/start"))
-
-    # A non-admin sending the callback by hand is refused, and no link is created for them.
-    recording_session.calls.clear()
-    await dispatcher.feed_update(
-        bot, make_callback(make_user(USER_ID), AdminMenu(action="send_invite").pack())
-    )
-    assert recording_session.of_type("CreateChatInviteLink") == []
-    assert texts.ADMIN_ACCESS_DENIED in recording_session.sent_texts()
-
-    # The admin walk: tap the button, name the member, confirm.
-    admin = make_user(ADMIN_ID, username="boss")
-    await dispatcher.feed_update(
-        bot, make_callback(admin, AdminMenu(action="send_invite").pack(), update_id=2)
-    )
-    await dispatcher.feed_update(bot, make_message(admin, "@paid", update_id=3))
-    recording_session.calls.clear()
-    await dispatcher.feed_update(bot, make_callback(admin, "invite:send", update_id=4))
-
-    created = recording_session.of_type("CreateChatInviteLink")
-    assert len(created) == 1
-    assert created[0].member_limit == 1  # a shared link would let one payment admit a crowd
-
-    # The link goes to the member, not to the admin who asked for it.
-    to_member = [c for c in recording_session.of_type("SendMessage") if c.chat_id == USER_ID]
-    assert len(to_member) == 1
-    assert "https://t.me/+default" in to_member[0].text
-
-    async with session_factory() as session:
-        entry = await session.scalar(select(AuditLog).where(AuditLog.action == "invite.sent"))
-    # The actor is the admin who sent it, not the member. An audit row naming the member as
-    # their own actor would hide who handed out channel access.
-    assert entry.actor_id == ADMIN_ID
-    assert entry.target_user_id == USER_ID
-    assert entry.details["manual"] is True
-    assert entry.details["delivered"] is True
-
-    # A member with no @username is reachable just the same, by numeric id: the bot addresses a
-    # chat by id, and the chat exists because they started the bot. Having no username only makes
-    # them harder for a *person* to find, which is what the id in the participants list is for.
-    nameless_id = USER_ID + 3
-    await dispatcher.feed_update(
-        bot, make_message(make_user(nameless_id, username=None), "/start", update_id=5)
-    )
-    await dispatcher.feed_update(
-        bot, make_callback(admin, AdminMenu(action="send_invite").pack(), update_id=6)
-    )
-    await dispatcher.feed_update(bot, make_message(admin, str(nameless_id), update_id=7))
-    recording_session.calls.clear()
-    await dispatcher.feed_update(bot, make_callback(admin, "invite:send", update_id=8))
-
-    to_nameless = [c for c in recording_session.of_type("SendMessage") if c.chat_id == nameless_id]
-    assert len(to_nameless) == 1
-    assert "https://t.me/+default" in to_nameless[0].text
-
-
-async def test_an_admin_can_write_to_a_member_who_has_no_username(
-    dispatcher, bot, session_factory, recording_session
-):
-    """The fallback when a link alone has not worked, and the only way to reach somebody with no
-    @username: an admin cannot open that chat by hand, the bot can. Gated, and recorded (S6)."""
-    from handlers.admin import AdminMenu
-
-    nameless_id = USER_ID + 21
-    await dispatcher.feed_update(bot, make_message(make_user(nameless_id, username=None), "/start"))
-
-    # Closed to everyone but an admin, like every other panel action (G1.5).
-    recording_session.calls.clear()
-    await dispatcher.feed_update(
-        bot, make_callback(make_user(nameless_id), AdminMenu(action="message_user").pack())
-    )
-    assert texts.ADMIN_ACCESS_DENIED in recording_session.sent_texts()
-
-    admin = make_user(ADMIN_ID, username="boss")
-    await dispatcher.feed_update(
-        bot, make_callback(admin, AdminMenu(action="message_user").pack(), update_id=2)
-    )
-    await dispatcher.feed_update(bot, make_message(admin, str(nameless_id), update_id=3))
-    await dispatcher.feed_update(
-        bot, make_message(admin, "Ваше посилання надіслано, перевірте, будь ласка.", update_id=4)
-    )
-    recording_session.calls.clear()
-    await dispatcher.feed_update(bot, make_callback(admin, "msg:send", update_id=5))
-
-    to_member = [c for c in recording_session.of_type("SendMessage") if c.chat_id == nameless_id]
-    assert len(to_member) == 1
-    # It arrives marked as coming from a person, not as another automated notice.
-    assert "Ваше посилання надіслано" in to_member[0].text
-    assert texts.CLUB_NAME in to_member[0].text
-
-    async with session_factory() as session:
-        entry = await session.scalar(select(AuditLog).where(AuditLog.action == "message.sent"))
-    assert entry.actor_id == ADMIN_ID
-    assert entry.target_user_id == nameless_id
-    assert entry.details["delivered"] is True
-    # What was said is on the record: nothing else in the system stores an outgoing message.
-    assert "Ваше посилання надіслано" in entry.details["text"]
 
 
 async def test_cancelling_a_subscription_keeps_the_paid_period(dispatcher, bot, session_factory):
