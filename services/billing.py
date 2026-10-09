@@ -748,6 +748,7 @@ async def retry_missing_invites(
                     actor_id=min(admin_ids) if admin_ids else user_id,
                     channel_id=channel_id,
                     now=now,
+                    manual=False,  # a job did this, not a person; the report says which
                 )
                 await record_action(
                     session,

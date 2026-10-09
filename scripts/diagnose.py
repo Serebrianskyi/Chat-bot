@@ -1,7 +1,8 @@
 """Why does a member who paid not have access? Read-only.
 
     python -m scripts.diagnose access     # who paid, who got a link, who is in the channel
-    python -m scripts.diagnose reasons     # what WayForPay actually said, grouped
+    python -m scripts.diagnose invites    # every link this bot ever sent, per member, with times
+    python -m scripts.diagnose reasons    # what WayForPay actually said, grouped
     python -m scripts.diagnose access --channel   # as above, plus a live membership check
 
 Written for one question: of the people who paid, which ones did the bot fail and which ones
@@ -24,6 +25,7 @@ import argparse
 import asyncio
 import sys
 from collections import Counter, defaultdict
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
@@ -235,9 +237,85 @@ async def cmd_reasons() -> int:
     return 0
 
 
+#: How each recorded invite event reads in the timeline.
+EVENT_LABELS = {
+    Action.INVITE_SENT: "link sent",
+    Action.INVITE_RETRIED: "retry sent",
+    Action.INVITE_ESCALATED: "given to an admin",
+}
+
+
+async def cmd_invites(check_channel: bool) -> int:
+    """Every invite this bot has ever issued, per member, in local time.
+
+    This is how you check that somebody who had no link now has one: the ``audit_log`` row is
+    written only after the send, so a line here is evidence the message left the bot — not an
+    intention to send it. ``delivered=False`` means the link was created but the member could not
+    be reached, which is a different failure and needs a different fix.
+    """
+    settings = get_settings()
+    engine = create_engine(settings.database_url)
+    factory = create_session_factory(engine)
+    tz = ZoneInfo(settings.display_timezone)
+
+    bot = None
+    if check_channel and settings.channel_id:
+        bot = Bot(
+            token=settings.bot_token.get_secret_value(),
+            default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+        )
+
+    try:
+        async with factory() as session:
+            users = {u.telegram_id: u for u in (await session.execute(select(User))).scalars()}
+            rows = list(
+                (
+                    await session.execute(
+                        select(AuditLog)
+                        .where(AuditLog.action.in_(list(EVENT_LABELS)))
+                        .order_by(AuditLog.created_at)
+                    )
+                ).scalars()
+            )
+
+            if not rows:
+                print("No invite has ever been recorded. Nobody has been sent a link.")
+                return 0
+
+            events: dict[int, list[AuditLog]] = defaultdict(list)
+            for row in rows:
+                if row.target_user_id is not None:
+                    events[row.target_user_id].append(row)
+
+            print(f"{len(rows)} invite events for {len(events)} members, times in {tz}\n")
+            for uid, member_events in events.items():
+                status = ""
+                if bot is not None:
+                    live = await _membership(bot, settings.channel_id, uid)
+                    status = f"  [channel: {live}]"
+                print(f"{_handle(users.get(uid), uid)}{status}")
+                for event in member_events:
+                    detail = event.details or {}
+                    when = event.created_at.astimezone(tz).strftime("%d.%m %H:%M")
+                    label = EVENT_LABELS.get(event.action, event.action)
+                    # Who caused it: an admin pressing the button, or a job acting for the club.
+                    by = "manually" if detail.get("manual") else "automatically"
+                    bits = [f"    {when}  {label} {by}"]
+                    if "delivered" in detail:
+                        bits.append("delivered" if detail["delivered"] else "NOT DELIVERED")
+                    if detail.get("reason"):
+                        bits.append(str(detail["reason"]))
+                    print(" · ".join(bits))
+    finally:
+        if bot is not None:
+            await bot.session.close()
+        await engine.dispose()
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("report", choices=["access", "reasons"])
+    parser.add_argument("report", choices=["access", "invites", "reasons"])
     parser.add_argument(
         "--channel",
         action="store_true",
@@ -246,6 +324,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.report == "reasons":
         return asyncio.run(cmd_reasons())
+    if args.report == "invites":
+        return asyncio.run(cmd_invites(check_channel=args.channel))
     return asyncio.run(cmd_access(check_channel=args.channel))
 
 

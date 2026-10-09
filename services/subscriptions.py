@@ -322,8 +322,14 @@ async def send_manual_invite(
     actor_id: int,
     channel_id: str,
     now: datetime,
+    manual: bool = True,
 ) -> tuple[bool, str | None]:
-    """An admin sends one member a channel link by hand. Returns (delivered, link).
+    """Send one member a channel link outside the payment flow. Returns (delivered, link).
+
+    ``manual`` records whether a person pressed the button or a job did it. It is written into
+    the audit row and read back by ``scripts.diagnose invites``, which is where somebody decides
+    "did the bot handle this or do I still owe them a link" — so labelling an automatic retry as
+    manual would make that report lie.
 
     Separate from ``billing.deliver_invite`` for one reason that matters: the audit row must name
     the **admin** as actor, not the member (standing rule 2). ``deliver_invite`` runs off a
@@ -369,7 +375,7 @@ async def send_manual_invite(
         actor_id=actor_id,
         action=Action.INVITE_SENT,
         target_user_id=user_id,
-        details={"channel_id": channel_id, "manual": True, "delivered": delivered},
+        details={"channel_id": channel_id, "manual": manual, "delivered": delivered},
     )
     log.info("Admin %s sent %s a manual invite (delivered=%s)", actor_id, user_id, delivered)
     return delivered, link
