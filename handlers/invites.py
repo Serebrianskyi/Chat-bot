@@ -36,7 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import texts
 from config import Settings
 from db.models import SubscriptionStatus, User, normalise_username, utcnow
-from handlers.compose import read_composed
+from handlers import compose
 from services import subscriptions as subs
 
 log = logging.getLogger(__name__)
@@ -116,7 +116,7 @@ async def receive_target(message: Message, state: FSMContext, session: AsyncSess
         active = False
     else:
         status_name = texts.STATUS_NAMES.get(subscription.status.value, subscription.status.value)
-        until = f", до {texts.day(subscription.expires_at.date())}"
+        until = f", до {texts.day(subscription.expires_at)}"
         active = (
             subscription.status
             in (SubscriptionStatus.ACTIVE, SubscriptionStatus.TRIAL, SubscriptionStatus.CANCELLED)
@@ -223,25 +223,36 @@ async def receive_message_target(
     await message.answer(texts.ADMIN_MESSAGE_ASK_TEXT.format(handle=handle))
 
 
-async def receive_message_text(message: Message, state: FSMContext) -> None:
-    """Hold what the admin composed and show it back before it is sent.
+#: The «Повідомлення від адміністратора …» prefix the send puts on the first part, reserved so a
+#: part that passes the limit check here cannot overflow once wrapped.
+WRAPPER_LENGTH = len(texts.MESSAGE_FROM_ADMIN.format(club=texts.CLUB_NAME, text=""))
+
+
+async def receive_message_part(message: Message, state: FSMContext) -> None:
+    """Take one part of the message. As many as the admin sends, then Готово."""
+    await compose.collect(message, state, cancel_data="msg:cancel", reserved=WRAPPER_LENGTH)
+
+
+async def finish_message(query: CallbackQuery, state: FSMContext) -> None:
+    """Готово: show it back before it is sent.
 
     A message to a member cannot be unsent, so it is shown for confirmation exactly as it will
     arrive — the one chance to catch a wrong recipient or a half-typed sentence. An attached
     image is shown as an image, not described.
     """
-    body, photo = read_composed(message)
-    if not body and photo is None:
-        await message.answer(texts.ADMIN_MESSAGE_EMPTY)
+    data = await state.get_data()
+    await query.answer()
+    if query.message is None:
+        return
+    parts = data.get("parts", [])
+    if not parts:
+        await query.message.answer(texts.ADMIN_COMPOSE_NOTHING)
         return
 
-    data = await state.get_data()
-    await state.update_data(body=body, photo=photo)
     await state.set_state(MessageUser.waiting_for_confirmation)
-    if photo is not None:
-        await message.answer_photo(photo, caption=body or None)
-    await message.answer(
-        texts.ADMIN_MESSAGE_CONFIRM.format(handle=data.get("handle", ""), preview=body or "—"),
+    await compose.replay(query.message, parts)
+    await query.message.answer(
+        texts.ADMIN_MESSAGE_CONFIRM_ASK.format(handle=data.get("handle", "")),
         reply_markup=_send_keyboard(),
     )
 
@@ -254,9 +265,9 @@ async def confirm_message(query: CallbackQuery, state: FSMContext, session: Asyn
         return
 
     target_id = data.get("target_id")
-    body = data.get("body", "")
+    parts: list[dict] = data.get("parts", [])
     handle = data.get("handle", str(target_id))
-    if target_id is None or not (body or data.get("photo")):
+    if target_id is None or not parts:
         await query.message.answer(texts.ADMIN_GRANT_CANCELLED)
         return
 
@@ -265,8 +276,7 @@ async def confirm_message(query: CallbackQuery, state: FSMContext, session: Asyn
         query.bot,
         user_id=int(target_id),
         actor_id=query.from_user.id,
-        body=body,
-        photo=data.get("photo"),
+        parts=parts,
     )
     await session.commit()
 
@@ -299,7 +309,10 @@ def register(router: Router) -> None:
     ):
         router.message.register(cancel_invite, Command("cancel"), StateFilter(state))
     router.message.register(receive_message_target, StateFilter(MessageUser.waiting_for_target))
-    router.message.register(receive_message_text, StateFilter(MessageUser.waiting_for_text))
+    router.message.register(receive_message_part, StateFilter(MessageUser.waiting_for_text))
+    router.callback_query.register(
+        finish_message, F.data == "compose:done", StateFilter(MessageUser.waiting_for_text)
+    )
     router.callback_query.register(
         confirm_message, F.data == "msg:send", StateFilter(MessageUser.waiting_for_confirmation)
     )

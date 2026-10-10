@@ -156,7 +156,7 @@ async def show_group(query: CallbackQuery, session: AsyncSession) -> None:
                 session, subscription=subscription, username=user.username, now=now
             )
             amount = texts.money(price, currency)
-            until = texts.day(subscription.expires_at.date())
+            until = texts.day(subscription.expires_at)
         lines.append(
             texts.ADMIN_USER_LINE.format(
                 handle=_handle(user), status=status_name, amount=amount, until=until

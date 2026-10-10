@@ -30,7 +30,7 @@ into the payment phase.
 ## Current status
 
 Last updated 2026-10-06. **Working and pushed** (`Serebrianskyi/Chat-bot`, branch `main`),
-deployed on Railway. 40 tests, 7 migrations.
+deployed on Railway. 43 tests, 9 migrations.
 
 ### Built
 
@@ -38,7 +38,7 @@ deployed on Railway. 40 tests, 7 migrations.
 | --- | --- |
 | Onboarding | `/start` registers a member, resolves their price, writes a due date, and invoices on the spot. Two messages: the club pitch, then the tariff carrying the **Стати учасником** pay button |
 | Pricing | 10 EUR base. Three tiers: discounted (list or admin grant), already-in-the-channel, new joiner |
-| Free period | Ends on `FREE_PERIOD_UNTIL` — one shared date, not 30 days per person. Set to 2026-11-01 Kyiv. After it, nobody gets one |
+| Free period | Ends on `FREE_PERIOD_UNTIL` — one shared date, not 30 days per person. Set to 2026-11-01 Kyiv. After it, nobody gets one. The 17 free-basis members are on it: status **Пробна підписка**, first payment due 01.11.2026, each keeping their own 8/10 EUR tariff. Migration `e8c5a1f3d209` moved the ones who had been onboarded as ordinary joiners |
 | Founding members | 17 usernames seeded by migration with their 8/10 EUR price and a free first period. Idempotent across deploys |
 | Discounts | Percent or fixed price, optional expiry, soft revocation. The charged amount is computed **per invoice**, so a time-limited discount actually ends |
 | WayForPay | `CREATE_INVOICE`, then `CHECK_STATUS` polled every 2 min. Signature verified both ways, amount checked against the invoice, idempotent on a repeated `Approved` |
@@ -50,7 +50,7 @@ deployed on Railway. 40 tests, 7 migrations.
 | Admin panel | 🎟 Знижки · 🎁 Надати знижку · 👥 Учасники · 🔗 Надіслати запрошення · ✍️ Написати учаснику (admin dictates, the bot delivers — the only way to reach a member with no username) · 📣 Розсилка · 📢 Написати в канал. The other four answer "later". 👥 Учасники opens on counts with a button per group — 🔄 автопродовження · ⏹ скасували автопродовження · 🎁 пробний період · ⏳ очікують оплати · ♾ безстрокові · ❓ без підписки — so it stays one message as the club grows; tapping a group lists only that group, naming people without a username by their first name |
 | Member area | `/subscription` with status, next amount and date; **Скасувати автопродовження** keeps the paid period |
 | Copy | All Ukrainian, all in `texts.py`. Owner-supplied strings marked `SPEC` |
-| Broadcast | 📣 Розсилка: pick a group (the same groups 👥 Учасники uses) → write the text → choose the price the link will charge (💰 звичайна, or 🎟 спеціальна: a sum like `8` or a percentage like `20%`, lasting 1/2/3/6/12 months by button, any number of months up to 60 by typing it, or without limit — months, because the club bills monthly, converted to `months × period_days` so a price always covers whole billing periods) → **see it rendered exactly as it will arrive — including the pay message as its own second message, button in place** → confirm. A special price is applied by granting each recipient a real `Discount`, so it flows through `effective_price` like every other price, shows up in 🎟 Знижки and is revocable — and because the rule is one active discount per person, the preview says how many existing discounts it would replace. For ⏳ Очікують оплати each recipient also gets a second message with its own **Долучитися до Клубу** button and their own live invoice — worded differently from the `/start` button on purpose, since the text alone gives them no way to act. Held to 20 messages/second, honours `RetryAfter` without skipping or duplicating anybody (rule 10). One `audit_log` row per broadcast, carrying the audience, the text and the photo `file_id`. A message may be text, or a photo whose caption is the text — one message per send; collecting several messages into one broadcast is **parked** (see below). ♾ Безстрокові takes the identical flow — price step, real invoice, real button — because that group is the owner's own account and is therefore how a campaign gets rehearsed before members see it |
+| Broadcast | 📣 Розсилка: pick a group (the same groups 👥 Учасники uses) → write the text → choose the price the link will charge (💰 звичайна, or 🎟 спеціальна: a sum like `8` or a percentage like `20%`, lasting 1/2/3/6/12 months by button, any number of months up to 60 by typing it, or without limit — months, because the club bills monthly, converted to `months × period_days` so a price always covers whole billing periods) → **see it rendered exactly as it will arrive — including the pay message as its own second message, button in place** → confirm. A special price is applied by granting each recipient a real `Discount`, so it flows through `effective_price` like every other price, shows up in 🎟 Знижки and is revocable — and because the rule is one active discount per person, the preview says how many existing discounts it would replace. For ⏳ Очікують оплати each recipient also gets a second message with its own **Долучитися до Клубу** button and their own live invoice — worded differently from the `/start` button on purpose, since the text alone gives them no way to act. Held to 20 messages/second, honours `RetryAfter` without skipping or duplicating anybody (rule 10). One `audit_log` row per broadcast, carrying the audience, the text and the photo `file_id`. A post is **composed from as many messages as the admin sends** — text, photo, photo with caption, in any order — ended with «✅ Готово» and delivered in that order. Several messages because a long post with a picture cannot be one Telegram message: attaching a photo drops the ceiling from 4096 characters to 1024. Each part is checked against its own ceiling and refused with the numbers and by how much to cut, since a Premium account can type a caption longer than a bot may send and gets no warning of its own; the send path still splits picture-then-words as a last resort. The pay button goes on the **last** part; collecting several messages into one broadcast is **parked** (see below). ♾ Безстрокові takes the identical flow — price step, real invoice, real button — because that group is the owner's own account and is therefore how a campaign gets rehearsed before members see it |
 | Channel posts | 📢 Написати в канал: the bot publishes an admin's text in the private channel, with the same preview-then-confirm step, so the club can speak there as well as read |
 | Operator tools | `scripts/discounts.py`, `scripts/run_jobs.py` (`status` is read-only), `scripts/diagnose.py` (read-only: `access` tells a bot failure from a member who never used their link, `reasons` groups what WayForPay actually said), `scripts/start.sh` |
 
@@ -63,18 +63,6 @@ administrator with *Invite users via link* and *Ban users*. Admins: `158032815`,
 invoices them and no screen shows them a due date. Granted by migration `c3a1f0d27b94`, marked
 `source='lifetime'`. A sentinel date rather than a nullable column, because every job and screen
 is a comparison against `expires_at`.
-
-### Parked mid-change
-
-**Composing a broadcast from several messages.** The ask: an admin sends the photo and the words
-as separate messages rather than one. The groundwork was started and then reverted on request, so
-the tree is consistent at one-message-per-step; `handlers/compose.py` carries the shape it would
-take. What it needs: a collecting state that appends each message to a `parts` list in FSM data
-until a «✅ Готово» button is tapped, `replay()` to preview the parts in order, and
-`send_broadcast` taking `parts` instead of `text`/`photo` — with the rate limit counting every
-part, not every recipient. Albums (several photos sent as one group) are a separate problem: they
-arrive as separate updates sharing a `media_group_id` and need batching middleware plus
-`send_media_group`.
 
 ### Not built — in the order I would do it
 
@@ -147,7 +135,8 @@ drawing items from the plan's Phases 3 and 5. `docs/phase-2a-scope.md` holds its
 These are the standing gate plus the invariants the plan's risk table depends on.
 
 1. **UTC everywhere.** All timestamps stored in UTC. Convert to local time (Europe/Kyiv) for
-   display only. Time-zone bugs in expiry mean early or late kicks.
+   display only — `texts.day()` does that conversion and is the only place dates are rendered;
+   pass it the stored `datetime`, never `.date()`, or an evening-UTC timestamp shows a day early. Time-zone bugs in expiry mean early or late kicks.
 2. **Audit every admin action.** Every data-changing admin action writes an `audit_log` row
    with actor, action, target and details. Tested per action (S6).
 3. **Secrets only in env vars.** Never commit `.env`. Never log a token, payment key or

@@ -370,7 +370,7 @@ async def poll_open_payments(
                                 subscription.user_id,
                                 template.format(
                                     club=texts.CLUB_NAME,
-                                    until=texts.day(subscription.expires_at.date()),
+                                    until=texts.day(subscription.expires_at),
                                 ),
                             )
                         except TelegramForbiddenError:
@@ -413,10 +413,10 @@ async def process_due_subscriptions(
     """Invoice whoever has come due, then alert admins about whoever has not paid.
 
     Idempotent (A.20): a subscription with an open payment is not invoiced again, and
-    ``admin_notified_at`` stops the same overdue member being reported twice.
+    ``admin_notified_at`` stops the same overdue member being recorded twice.
     """
     now = now or utcnow()
-    counts = {"invoiced": 0, "unreachable": 0, "escalated": 0}
+    counts = {"invoiced": 0, "unreachable": 0, "overdue": 0}
 
     async with session_factory() as session:
         due = (
@@ -465,41 +465,23 @@ async def process_due_subscriptions(
                     counts["unreachable"] += 1
                 subscription.last_reminder_at = now
 
-            # Grace exhausted and still unpaid: tell an admin. Do not remove the member.
+            # Grace exhausted and still unpaid. Recorded, not reported: see `mark_overdue` for
+            # why an admin is no longer DMed about it. The member is not removed either.
             if (
                 subscription.grace_until is not None
                 and subscription.grace_until <= now
                 and subscription.admin_notified_at is None
             ):
-                user = await session.get(User, subscription.user_id)
-                handle = f"@{user.username}" if user and user.username else "(без username)"
-                owed_amount, owed_currency, _ = await discount_service.effective_price(
-                    session,
-                    subscription=subscription,
-                    username=user.username if user else None,
-                    now=now,
-                )
-                await notify_admins(
-                    bot,
-                    admin_ids,
-                    texts.ADMIN_PAYMENT_MISSING.format(
-                        handle=handle,
-                        user_id=subscription.user_id,
-                        amount=texts.money(owed_amount, owed_currency),
-                        since=texts.day(subscription.expires_at.date()),
-                        tier=subscription.price_tier.value,
-                    ),
-                )
                 # actor is the bot acting on the club's behalf; the first admin id owns the record
-                await subs.mark_admin_notified(
+                await subs.mark_overdue(
                     session,
                     subscription=subscription,
                     actor_id=min(admin_ids) if admin_ids else subscription.user_id,
                     now=now,
                 )
-                counts["escalated"] += 1
+                counts["overdue"] += 1
                 # TODO(removal): once enabled and tested, remove the member here instead of
-                #                only alerting. Gate it with the plan's G3.6 and G3.8.
+                #                only recording it. Gate it with the plan's G3.6 and G3.8.
 
         await session.commit()
 
@@ -641,7 +623,7 @@ async def reconcile_written_off(
                 await bot.send_message(
                     subscription.user_id,
                     texts.PAYMENT_FIRST_CONFIRMED.format(
-                        club=texts.CLUB_NAME, until=texts.day(subscription.expires_at.date())
+                        club=texts.CLUB_NAME, until=texts.day(subscription.expires_at)
                     ),
                 )
             except TelegramForbiddenError:

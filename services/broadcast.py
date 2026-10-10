@@ -34,6 +34,7 @@ from services import billing
 from services import discounts as discount_service
 from services import subscriptions as subs
 from services.audit import Action, record_action
+from services.subscriptions import CAPTION_LIMIT
 from services.wayforpay import WayForPayClient
 
 log = logging.getLogger(__name__)
@@ -95,22 +96,15 @@ def pay_keyboard(invoice_url: str) -> InlineKeyboardMarkup:
     )
 
 
-async def _send(bot: Bot, chat_id: int, text: str, *, photo: str | None = None, **kwargs) -> str:
-    """Send one message, honouring ``RetryAfter``. Returns 'sent', 'blocked' or 'failed'.
-
-    With ``photo`` — a Telegram ``file_id`` — the text travels as the image's caption. A
-    ``file_id`` is reusable, so the admin's upload is sent once to Telegram and then referenced
-    for every recipient rather than re-uploaded per member.
+async def _attempt(call, chat_id: int) -> str:
+    """One API call, honouring ``RetryAfter``. Returns 'sent', 'blocked' or 'failed'.
 
     The wait is obeyed rather than the member skipped: dropping somebody from a broadcast
     because Telegram asked us to slow down is the failure mode rule 10 exists to prevent.
     """
     for attempt in (1, 2, 3):
         try:
-            if photo is not None:
-                await bot.send_photo(chat_id, photo=photo, caption=text or None, **kwargs)
-            else:
-                await bot.send_message(chat_id, text, **kwargs)
+            await call()
             return "sent"
         except TelegramForbiddenError:
             # Blocked the bot, or never started it. Not an error worth failing a broadcast over.
@@ -124,6 +118,60 @@ async def _send(bot: Bot, chat_id: int, text: str, *, photo: str | None = None, 
             log.exception("Broadcast send failed for %s", chat_id)
             return "failed"
     return "failed"
+
+
+async def _send(bot: Bot, chat_id: int, text: str, *, photo: str | None = None, **kwargs) -> str:
+    """Send one composed message. Returns 'sent', 'blocked' or 'failed'.
+
+    With ``photo`` — a Telegram ``file_id`` — the text travels as the image's caption. A
+    ``file_id`` is reusable, so the admin's upload is sent once to Telegram and then referenced
+    for every recipient rather than re-uploaded per member.
+
+    **A caption longer than ``CAPTION_LIMIT`` is split**, picture first and words second, because
+    Telegram allows 4096 characters in a message and only 1024 on a caption — and a Premium
+    account can type a longer caption than a bot is allowed to send. Unsplit, the send fails with
+    ``Bad Request: message caption is too long``, which is how a real broadcast preview died
+    (2026-10-10). Truncating instead would silently eat the admin's words.
+
+    When it splits, the keyboard rides on the text: it is the last thing the member reads, and a
+    pay button above the message explaining the offer reads backwards.
+    """
+    if photo is not None and len(text) > CAPTION_LIMIT:
+        outcome = await _attempt(lambda: bot.send_photo(chat_id, photo=photo), chat_id)
+        if outcome != "sent":
+            return outcome
+        return await _attempt(lambda: bot.send_message(chat_id, text, **kwargs), chat_id)
+
+    if photo is not None:
+        return await _attempt(
+            lambda: bot.send_photo(chat_id, photo=photo, caption=text or None, **kwargs),
+            chat_id,
+        )
+    return await _attempt(lambda: bot.send_message(chat_id, text, **kwargs), chat_id)
+
+
+async def send_parts(bot: Bot, chat_id: int, parts: list[dict], *, reply_markup=None) -> str:
+    """Send a composed post, part by part, in order. Returns 'sent', 'blocked' or 'failed'.
+
+    ``reply_markup`` goes on the **last** part: it is the last thing the member reads, and a pay
+    button above the words explaining the offer reads backwards.
+
+    The pause between parts is the same one used between recipients, so the rate limit counts
+    every message the club actually sends rather than every person it sends to (standing rule
+    10) — a three-part broadcast to fifty members is a hundred and fifty messages.
+    """
+    outcome = "sent"
+    for index, part in enumerate(parts):
+        last = index == len(parts) - 1
+        extra = {"reply_markup": reply_markup} if (last and reply_markup is not None) else {}
+        outcome = await _send(bot, chat_id, part.get("text", ""), photo=part.get("photo"), **extra)
+        if outcome != "sent":
+            # Stop at the first failure: the rest would land out of context anyway, and a
+            # blocked member will block every remaining part too.
+            return outcome
+        if not last:
+            await asyncio.sleep(SEND_INTERVAL)
+    return outcome
 
 
 async def _invoice(
@@ -162,22 +210,89 @@ async def _invoice(
         return None
 
 
+async def _prepare_link(
+    session,
+    client: WayForPayClient,
+    *,
+    user_id: int,
+    actor_id: int,
+    offer: "PriceOffer | None",
+    config: billing.BillingConfig,
+    now: datetime,
+    result: "BroadcastResult",
+) -> str | None:
+    """Reprice if there is an offer, then return a usable payment URL — or None.
+
+    None is recorded in ``result.no_invoice`` rather than swallowed: the admin's message still
+    goes out, but somebody has to know which members got it without a way to pay.
+    """
+    subscription = await subs.get_subscription(session, user_id)
+    if subscription is None:
+        result.no_invoice.append(user_id)
+        return None
+
+    if offer is not None:
+        # The open invoice, if any, quotes the price from before this offer. Leaving it payable
+        # would let the member pay the old amount from an older message, so it is written off
+        # here: the new link replaces it.
+        stale = await subs.open_payment(session, subscription.id)
+        if stale is not None:
+            stale.status = PaymentStatus.CANCELED
+
+        # Granted before the invoice is built, because issue_invoice computes the amount from
+        # whatever discount is live at that moment. grant() revokes whatever the member had
+        # before — one active discount per person — which the admin saw warned at the preview.
+        try:
+            await discount_service.grant(
+                session,
+                actor_id=actor_id,
+                telegram_id=user_id,
+                kind=offer.kind,
+                percent_off=offer.percent_off,
+                fixed_price=offer.fixed_price,
+                currency=offer.currency,
+                days=offer.days,
+                note=offer.note,
+                now=now,
+            )
+            await session.flush()
+            result.repriced += 1
+        except Exception:
+            log.exception("Broadcast: could not reprice %s", user_id)
+
+    payment = await _invoice(
+        session,
+        client,
+        subscription=subscription,
+        config=config,
+        now=now,
+        reuse_open=offer is None,
+    )
+    if payment is None or not payment.invoice_url:
+        result.no_invoice.append(user_id)
+        await session.rollback()
+        return None
+
+    url = payment.invoice_url  # read before the commit expires the instance
+    await session.commit()
+    return url
+
+
 async def send_broadcast(
     session_factory: async_sessionmaker,
     bot: Bot,
     *,
     user_ids: list[int],
-    text: str,
+    parts: list[dict],
     actor_id: int,
     audience: str,
-    photo: str | None = None,
     with_invoice: bool = False,
     offer: PriceOffer | None = None,
     client: WayForPayClient | None = None,
     config: billing.BillingConfig | None = None,
     now: datetime | None = None,
 ) -> BroadcastResult:
-    """Send ``text`` to each of ``user_ids``, then a payment link if ``with_invoice``.
+    """Send the composed ``parts`` to each of ``user_ids``, the pay button on the last part.
 
     The recipient list is passed in rather than queried here, so the admin confirms sending to
     exactly the people they were shown a count for — re-running the query at send time could
@@ -203,7 +318,7 @@ async def send_broadcast(
                 "audience": audience,
                 "recipients": len(user_ids),
                 "with_invoice": with_invoice,
-                "photo": photo,
+                "parts": parts,
                 "offer": None
                 if offer is None
                 else {
@@ -213,88 +328,46 @@ async def send_broadcast(
                     "currency": offer.currency,
                     "days": offer.days,
                 },
-                "text": text,
             },
             now=now,
         )
         await session.commit()
 
     for user_id in user_ids:
-        outcome = await _send(bot, user_id, text, photo=photo)
-        if outcome == "blocked":
-            result.blocked += 1
-            continue
-        if outcome == "failed":
-            result.failed += 1
-            continue
-        result.sent += 1
-
+        # The payment link, when this audience gets one. Built first because it rides on the
+        # admin's own message: Telegram will not send a keyboard attached to no text, and the
+        # owner's decision of 2026-10-10 is that nothing of the bot's own goes above the button
+        # — these people have read the pitch once already at /start.
+        url: str | None = None
         if with_invoice and client is not None and config is not None:
             # A fresh session per member: an invoice failure for one must not roll back the
             # invoices already written for the others.
             async with session_factory() as session:
-                subscription = await subs.get_subscription(session, user_id)
-                if subscription is None:
-                    result.no_invoice.append(user_id)
-                else:
-                    if offer is not None:
-                        # The open invoice, if any, quotes the price from before this offer.
-                        # Leaving it payable would let the member pay the old amount from an
-                        # older message, so it is written off here: the new link replaces it.
-                        stale = await subs.open_payment(session, subscription.id)
-                        if stale is not None:
-                            stale.status = PaymentStatus.CANCELED
+                url = await _prepare_link(
+                    session,
+                    client,
+                    user_id=user_id,
+                    actor_id=actor_id,
+                    offer=offer,
+                    config=config,
+                    now=now,
+                    result=result,
+                )
 
-                        # Granted before the invoice is built, because issue_invoice computes the
-                        # amount from whatever discount is live at that moment. grant() revokes
-                        # whatever the member had before — one active discount per person — which
-                        # the admin was warned about at the preview.
-                        try:
-                            await discount_service.grant(
-                                session,
-                                actor_id=actor_id,
-                                telegram_id=user_id,
-                                kind=offer.kind,
-                                percent_off=offer.percent_off,
-                                fixed_price=offer.fixed_price,
-                                currency=offer.currency,
-                                days=offer.days,
-                                note=offer.note,
-                                now=now,
-                            )
-                            await session.flush()
-                            result.repriced += 1
-                        except Exception:
-                            log.exception("Broadcast: could not reprice %s", user_id)
-
-                    payment = await _invoice(
-                        session,
-                        client,
-                        subscription=subscription,
-                        config=config,
-                        now=now,
-                        reuse_open=offer is None,
-                    )
-                    if payment is None or not payment.invoice_url:
-                        result.no_invoice.append(user_id)
-                        await session.rollback()
-                    else:
-                        # Read before the commit expires the instance.
-                        url = payment.invoice_url
-                        quoted = texts.money(payment.amount, payment.currency)
-                        period = subscription.period_days
-                        await session.commit()
-
-                        follow_up = await _send(
-                            bot,
-                            user_id,
-                            texts.BROADCAST_PAY_PROMPT.format(
-                                club=texts.CLUB_NAME, amount=quoted, period=period
-                            ),
-                            reply_markup=pay_keyboard(url),
-                        )
-                        if follow_up == "sent":
-                            result.invoiced += 1
+        outcome = await send_parts(
+            bot, user_id, parts, reply_markup=pay_keyboard(url) if url else None
+        )
+        if outcome == "blocked":
+            result.blocked += 1
+        elif outcome == "failed":
+            result.failed += 1
+        else:
+            # Counted as sent whether or not it carried a button: the admin's words arriving
+            # without a link is a partial success, not a failure, and `no_invoice` already
+            # names whoever needs following up by hand.
+            result.sent += 1
+            if url:
+                result.invoiced += 1
 
         await asyncio.sleep(SEND_INTERVAL)
 
@@ -313,9 +386,8 @@ async def post_to_channel(
     bot: Bot,
     *,
     channel_id: str,
-    text: str,
+    parts: list[dict],
     actor_id: int,
-    photo: str | None = None,
     now: datetime | None = None,
 ) -> bool:
     """Publish an admin's text in the channel as the bot. Returns whether it posted.
@@ -325,27 +397,16 @@ async def post_to_channel(
     private channel is not otherwise attributable to whoever asked for it.
     """
     now = now or utcnow()
-    posted = True
-    try:
-        if photo is not None:
-            await bot.send_photo(channel_id, photo=photo, caption=text or None)
-        else:
-            await bot.send_message(channel_id, text)
-    except Exception:
-        log.exception("Could not post to channel %s", channel_id)
-        posted = False
+    posted = await send_parts(bot, channel_id, parts) == "sent"
+    if not posted:
+        log.error("Could not post to channel %s", channel_id)
 
     async with session_factory() as session:
         await record_action(
             session,
             actor_id=actor_id,
             action=Action.CHANNEL_POST,
-            details={
-                "channel_id": channel_id,
-                "posted": posted,
-                "text": text,
-                "photo": photo,
-            },
+            details={"channel_id": channel_id, "posted": posted, "parts": parts},
             now=now,
         )
         await session.commit()

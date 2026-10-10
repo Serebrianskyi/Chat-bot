@@ -1023,15 +1023,22 @@ async def test_the_due_job_is_idempotent(session_factory, bot, config):
         session_factory, gw, bot, admin_ids=frozenset({ADMIN_ID}), config=config, now=NOW
     )
 
-    assert (first["invoiced"], first["escalated"]) == (1, 1)
-    assert (second["invoiced"], second["escalated"]) == (0, 0)
+    assert (first["invoiced"], first["overdue"]) == (1, 1)
+    assert (second["invoiced"], second["overdue"]) == (0, 0)
     assert len(gw.invoice_calls) == 1
 
 
-async def test_an_overdue_member_is_reported_not_removed(
+async def test_an_overdue_member_is_recorded_not_removed_and_no_admin_is_pestered(
     session_factory, bot, recording_session, config
 ):
-    """Removal is deliberately not enabled until the payment path is proven with real money."""
+    """Removal is deliberately not enabled until the payment path is proven with real money.
+
+    And the admin is no longer DMed about it. On a club where most people have signed up and not
+    yet paid, one alert per member per day was a wall of warnings about members who had never
+    paid and never been in the channel — while the alert's own wording implied they had been
+    (owner's decision, 2026-10-10). Somebody who **paid** and is not in the channel is a
+    different case, and the daily recovery report is what covers it.
+    """
     await seed_due(session_factory, overdue_days=10)
 
     await process_due_subscriptions(
@@ -1044,8 +1051,8 @@ async def test_an_overdue_member_is_reported_not_removed(
     )
 
     assert recording_session.of_type("BanChatMember") == []
-    to_admin = [c for c in recording_session.of_type("SendMessage") if c.chat_id == ADMIN_ID]
-    assert to_admin and "@member" in to_admin[0].text
+    assert [c for c in recording_session.of_type("SendMessage") if c.chat_id == ADMIN_ID] == []
+    # Still on the record, because "when did this member lapse" has to be answerable.
     async with session_factory() as session:
         row = await session.scalar(select(AuditLog).where(AuditLog.action == "payment.missing"))
     assert row is not None and row.target_user_id == USER_ID
@@ -1260,6 +1267,9 @@ async def test_a_broadcast_to_unpaid_members_follows_the_text_with_a_pay_button(
     await dispatcher.feed_update(
         bot, make_message(admin, "Ціну знижено до 8 € — повертайтесь!", update_id=4)
     )
+    # A post is collected from as many messages as the admin sends — a long post with a picture
+    # cannot be one Telegram message — so Готово is what ends it.
+    await dispatcher.feed_update(bot, make_callback(admin, "compose:done", update_id=41))
     # The price the link will charge is chosen before the preview: a win-back message almost
     # always carries an offer, and the preview has to show the one that will actually be used.
     await dispatcher.feed_update(bot, make_callback(admin, "bprice:special", update_id=5))
@@ -1279,6 +1289,9 @@ async def test_a_broadcast_to_unpaid_members_follows_the_text_with_a_pay_button(
         for c in sample
         for row in c.reply_markup.inline_keyboard
     )
+    # The previewed message is the admin's own text, button attached — same shape as the send.
+    previewed = next(c for c in sample if c.text == "Ціну знижено до 8 € — повертайтесь!")
+    assert previewed.reply_markup.inline_keyboard[0][0].text == texts.JOIN_CLUB_BUTTON
     # It carries no URL: the real link is per member, and a plausible dead link would be worse.
     pay_sample = next(
         c for c in sample if c.reply_markup.inline_keyboard[0][0].text == texts.JOIN_CLUB_BUTTON
@@ -1304,11 +1317,13 @@ async def test_a_broadcast_to_unpaid_members_follows_the_text_with_a_pay_button(
     recording_session.calls.clear()
     await dispatcher.feed_update(bot, make_callback(admin, "bcast:send", update_id=8))
 
+    # One message, the admin's own words, with the button under them. Nothing of the bot's own
+    # is added above it: these people read the pitch at /start already, and a second message
+    # quoting the price again read as the bot talking over the admin (owner's call, 2026-10-10).
     to_member = [c for c in recording_session.of_type("SendMessage") if c.chat_id == USER_ID]
-    assert len(to_member) == 2
-    assert "Ціну знижено до 8 €" in to_member[0].text
-    # The second message is the way back to paying, on a live invoice.
-    button = to_member[1].reply_markup.inline_keyboard[0][0]
+    assert len(to_member) == 1
+    assert to_member[0].text == "Ціну знижено до 8 € — повертайтесь!"
+    button = to_member[0].reply_markup.inline_keyboard[0][0]
     assert button.text == texts.JOIN_CLUB_BUTTON
     assert button.url  # a real invoice URL from the gateway
     # The offer is what was actually invoiced, not just what the message claimed.
@@ -1319,7 +1334,8 @@ async def test_a_broadcast_to_unpaid_members_follows_the_text_with_a_pay_button(
         discount = await session.scalar(select(Discount).where(Discount.user_id == USER_ID))
     assert entry.actor_id == ADMIN_ID
     assert entry.details["audience"] == "unpaid"
-    assert "Ціну знижено" in entry.details["text"]
+    # The audit row carries the composed parts, in order.
+    assert "Ціну знижено" in entry.details["parts"][0]["text"]
     assert entry.details["offer"]["fixed_price"] == "8"
     # The price is a real discount, so it shows up in 🎟 Знижки and governs their renewal too.
     assert discount.fixed_price == Decimal("8")
@@ -1365,6 +1381,7 @@ async def test_the_lifetime_group_walks_the_same_broadcast_flow_as_unpaid_member
     await dispatcher.feed_update(bot, make_callback(admin, AdminMenu(action="broadcast").pack()))
     await dispatcher.feed_update(bot, make_callback(admin, "bcast:lifetime", update_id=2))
     await dispatcher.feed_update(bot, make_message(admin, "Тестова розсилка", update_id=3))
+    await dispatcher.feed_update(bot, make_callback(admin, "compose:done", update_id=31))
 
     # The price step is offered, exactly as it is for ⏳ Очікують оплати.
     asked_price = recording_session.of_type("SendMessage")[-1]
@@ -1388,6 +1405,165 @@ async def test_the_lifetime_group_walks_the_same_broadcast_flow_as_unpaid_member
     assert fake_wayforpay.invoice_calls[-1]["amount"] == Decimal("8.00")
 
 
+async def test_text_over_either_telegram_limit_is_refused_with_a_reason(
+    dispatcher, bot, recording_session
+):
+    """Production, 2026-10-10: an admin attached a photo with a long caption and the preview
+    came back empty.
+
+    `answer_photo` failed with «Bad Request: message caption is too long» and the global error
+    handler swallowed it, so the admin saw the opening frame and nothing after it. Telegram
+    allows 4096 characters in a message but only 1024 on a caption — and a Premium account can
+    *type* a longer caption than a bot is allowed to *send*, so there is no warning on the
+    admin's side either.
+
+    They are now told, with the numbers, and the step repeats. Splitting it silently was the
+    first fix and the wrong one: a message that arrives in two pieces is not the message they
+    were shown.
+    """
+    from datetime import UTC, datetime
+
+    from aiogram.types import Chat, Message, PhotoSize, Update
+
+    from handlers.admin import AdminMenu
+    from services.subscriptions import CAPTION_LIMIT
+
+    long_caption = ("Ми знизили ціну! " * 80).strip()  # ~1360 characters
+    assert len(long_caption) > CAPTION_LIMIT
+
+    admin = make_user(ADMIN_ID, username="boss")
+
+    def photo_update(caption, update_id):
+        return Update(
+            update_id=update_id,
+            message=Message(
+                message_id=update_id,
+                date=datetime.now(UTC),
+                chat=Chat(id=ADMIN_ID, type="private"),
+                from_user=admin,
+                caption=caption,
+                photo=[PhotoSize(file_id="BIG", file_unique_id="u", width=1280, height=960)],
+            ),
+        )
+
+    await dispatcher.feed_update(bot, make_message(make_user(USER_ID, username="owes"), "/start"))
+    await dispatcher.feed_update(
+        bot, make_callback(admin, AdminMenu(action="broadcast").pack(), update_id=2)
+    )
+    await dispatcher.feed_update(bot, make_callback(admin, "bcast:unpaid", update_id=3))
+    recording_session.calls.clear()
+    await dispatcher.feed_update(bot, photo_update(long_caption, 4))
+
+    told = recording_session.sent_texts()
+    assert any("задовгий" in t for t in told)
+    assert any(str(len(long_caption)) in t for t in told)  # how long it is
+    assert any(str(len(long_caption) - CAPTION_LIMIT) in t for t in told)  # and by how much
+    assert texts.GENERIC_ERROR not in told  # not a crash swallowed into a generic apology
+    assert recording_session.of_type("SendPhoto") == []  # nothing half-sent
+
+    # The step repeats, so a shorter caption goes straight through.
+    recording_session.calls.clear()
+    await dispatcher.feed_update(bot, photo_update("Ми знизили ціну!", 5))
+    await dispatcher.feed_update(bot, make_callback(admin, "compose:done", update_id=51))
+    await dispatcher.feed_update(bot, make_callback(admin, "bprice:regular", update_id=6))
+    assert len(recording_session.of_type("SendPhoto")) == 1
+
+    # The other ceiling, and the one missed at first: no picture means 4096, not 1024, and a
+    # text-only broadcast over it would have failed in exactly the same way.
+    from services.subscriptions import MESSAGE_LIMIT
+
+    await dispatcher.feed_update(
+        bot, make_callback(admin, AdminMenu(action="broadcast").pack(), update_id=7)
+    )
+    await dispatcher.feed_update(bot, make_callback(admin, "bcast:unpaid", update_id=8))
+    recording_session.calls.clear()
+    await dispatcher.feed_update(bot, make_message(admin, "я" * (MESSAGE_LIMIT + 1), update_id=9))
+    told_text = recording_session.sent_texts()
+    assert any("задовге" in t for t in told_text)
+    assert any(str(MESSAGE_LIMIT) in t for t in told_text)
+    assert texts.GENERIC_ERROR not in told_text
+    # A message one character under the ceiling is accepted.
+    recording_session.calls.clear()
+    await dispatcher.feed_update(bot, make_message(admin, "я" * MESSAGE_LIMIT, update_id=10))
+    assert not any("задовге" in t for t in recording_session.sent_texts())
+
+
+async def test_the_send_path_splits_an_oversized_caption_rather_than_failing(bot):
+    """The compose step refuses these, so this is the last line of defence.
+
+    It still matters: ✍️ Написати учаснику wraps the admin's words in «Повідомлення від
+    адміністратора …», which can push a caption that fitted over the limit.
+    """
+    from services.broadcast import _send
+    from services.subscriptions import CAPTION_LIMIT
+
+    long_text = "х" * (CAPTION_LIMIT + 50)
+    assert await _send(bot, USER_ID, long_text, photo="BIG") == "sent"
+
+    sent = bot.session.calls
+    kinds = [type(c).__name__ for c in sent]
+    assert kinds == ["SendPhoto", "SendMessage"]  # picture first, words second
+    assert sent[0].caption is None  # never truncated into the caption
+    assert sent[1].text == long_text
+
+
+async def test_a_long_post_with_a_picture_is_composed_from_separate_messages(
+    dispatcher, bot, recording_session
+):
+    """The case that forced this: 2000 words **and** a picture cannot be one Telegram message.
+
+    Attaching a photo drops the ceiling from 4096 characters to 1024, so an admin with a long
+    post and an image has no single message that can carry both. They send the picture, then the
+    words, and the bot delivers them in that order as one post.
+    """
+    from datetime import UTC, datetime
+
+    from aiogram.types import Chat, Message, PhotoSize, Update
+
+    from handlers.admin import AdminMenu
+    from services.subscriptions import CAPTION_LIMIT
+
+    long_words = (
+        "Детальна історія клубу. " * 90
+    ).strip()  # ~2100 chars: over a caption, under a message
+    assert CAPTION_LIMIT < len(long_words) < 4096
+
+    admin = make_user(ADMIN_ID, username="boss")
+    picture = Update(
+        update_id=4,
+        message=Message(
+            message_id=4,
+            date=datetime.now(UTC),
+            chat=Chat(id=ADMIN_ID, type="private"),
+            from_user=admin,
+            photo=[PhotoSize(file_id="BIG", file_unique_id="u", width=1280, height=960)],
+        ),
+    )
+
+    await dispatcher.feed_update(bot, make_message(make_user(USER_ID, username="owes"), "/start"))
+    await dispatcher.feed_update(
+        bot, make_callback(admin, AdminMenu(action="broadcast").pack(), update_id=2)
+    )
+    await dispatcher.feed_update(bot, make_callback(admin, "bcast:unpaid", update_id=3))
+
+    # Part one: the picture, no caption. Part two: the words, which would never fit as a caption.
+    await dispatcher.feed_update(bot, picture)
+    await dispatcher.feed_update(bot, make_message(admin, long_words, update_id=5))
+    await dispatcher.feed_update(bot, make_callback(admin, "compose:done", update_id=6))
+    await dispatcher.feed_update(bot, make_callback(admin, "bprice:regular", update_id=7))
+    recording_session.calls.clear()
+    await dispatcher.feed_update(bot, make_callback(admin, "bcast:send", update_id=8))
+
+    to_member_photo = [c for c in recording_session.of_type("SendPhoto") if c.chat_id == USER_ID]
+    to_member_text = [c for c in recording_session.of_type("SendMessage") if c.chat_id == USER_ID]
+    assert len(to_member_photo) == 1
+    assert len(to_member_text) == 1
+    assert to_member_text[0].text == long_words  # nothing truncated to fit a caption
+    # The pay button goes on the last part, so it sits under the words it refers to.
+    assert to_member_photo[0].reply_markup is None
+    assert to_member_text[0].reply_markup.inline_keyboard[0][0].text == texts.JOIN_CLUB_BUTTON
+
+
 async def test_an_admin_can_post_into_the_channel_only_after_confirming(
     dispatcher, bot, recording_session, settings
 ):
@@ -1398,6 +1574,7 @@ async def test_an_admin_can_post_into_the_channel_only_after_confirming(
     await dispatcher.feed_update(bot, make_callback(admin, AdminMenu(action="channel_post").pack()))
     recording_session.calls.clear()
     await dispatcher.feed_update(bot, make_message(admin, "Зустріч у четвер о 19:00", update_id=2))
+    await dispatcher.feed_update(bot, make_callback(admin, "compose:done", update_id=21))
 
     # Preview only: the channel has had nothing.
     assert all(c.chat_id == ADMIN_ID for c in recording_session.of_type("SendMessage"))
@@ -1510,7 +1687,6 @@ def test_every_member_facing_message_is_ukrainian_and_formats_cleanly():
         "shown": 30,
         "reason": "посилання надіслано, але учасник не приєднався",
         "error": "TelegramBadRequest",
-        "preview": "Привіт! Ось ваше посилання.",
         "text": "Привіт!",
         "step": "перевірка оплат",
         "extra": " — не доставлено",
@@ -1519,6 +1695,10 @@ def test_every_member_facing_message_is_ukrainian_and_formats_cleanly():
         "validity": "діє 3 місяці",
         "months": "3 місяці",
         "max_months": 60,
+        "length": 1360,
+        "limit": 1024,
+        "done": "✅ Готово",
+        "over": 336,
         "sent": 50,
         "blocked": 2,
         "invoiced": 48,

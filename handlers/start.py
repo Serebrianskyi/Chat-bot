@@ -174,7 +174,7 @@ async def handle_start(
     # expires the ORM objects, and touching an attribute afterwards would trigger a reload on a
     # dead transaction — surfacing to the member as the generic error instead of a greeting.
     amount = texts.money(subscription.price, subscription.currency)
-    until = texts.day(subscription.expires_at.date())
+    until = texts.day(subscription.expires_at)
     period_days = subscription.period_days
     free_period = subscription.free_period_granted
 

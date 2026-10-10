@@ -77,7 +77,7 @@ async def show_discounts(query: CallbackQuery, session: AsyncSession) -> None:
     lines = [texts.ADMIN_DISCOUNTS_HEADER.format(count=len(active))]
     for discount in active:
         until = (
-            texts.ADMIN_DISCOUNT_UNTIL.format(until=texts.day(discount.valid_until.date()))
+            texts.ADMIN_DISCOUNT_UNTIL.format(until=texts.day(discount.valid_until))
             if discount.valid_until
             else texts.ADMIN_DISCOUNT_FOREVER
         )

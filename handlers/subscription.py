@@ -83,11 +83,9 @@ async def render_subscription(
             status=status_name,
             amount=texts.money(amount, currency),
             period=subscription.period_days,
-            until=texts.day(subscription.expires_at.date()),
+            until=texts.day(subscription.expires_at),
             next_until=texts.day(
-                extend(
-                    subscription.expires_at, now=now, period_days=subscription.period_days
-                ).date()
+                extend(subscription.expires_at, now=now, period_days=subscription.period_days)
             ),
         )
     else:
@@ -95,7 +93,7 @@ async def render_subscription(
             status=status_name,
             amount=texts.money(amount, currency),
             period=subscription.period_days,
-            until=texts.day(subscription.expires_at.date()),
+            until=texts.day(subscription.expires_at),
         )
 
     await message.answer(body, reply_markup=_status_keyboard(subscription.status))
@@ -123,16 +121,14 @@ async def ask_to_cancel(query: CallbackQuery, session: AsyncSession) -> None:
     if subscription is None or subscription.status not in CANCELLABLE:
         if subscription is not None and subscription.status is SubscriptionStatus.CANCELLED:
             await query.message.answer(
-                texts.CANCEL_ALREADY_CANCELLED.format(
-                    until=texts.day(subscription.expires_at.date())
-                )
+                texts.CANCEL_ALREADY_CANCELLED.format(until=texts.day(subscription.expires_at))
             )
         else:
             await query.message.answer(texts.CANCEL_NOTHING_TO_CANCEL)
         return
 
     await query.message.answer(
-        texts.CANCEL_CONFIRM.format(until=texts.day(subscription.expires_at.date())),
+        texts.CANCEL_CONFIRM.format(until=texts.day(subscription.expires_at)),
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [
@@ -163,7 +159,7 @@ async def confirm_cancel(query: CallbackQuery, session: AsyncSession) -> None:
 
     # SPEC wording: «Підписка діє до [дата], далі буде скасована»
     await query.message.answer(
-        texts.AUTORENEW_CANCELLED.format(until=texts.day(subscription.expires_at.date()))
+        texts.AUTORENEW_CANCELLED.format(until=texts.day(subscription.expires_at))
     )
     log.info("%s cancelled autorenew", query.from_user.id)
 
@@ -190,7 +186,7 @@ async def resume(query: CallbackQuery, session: AsyncSession) -> None:
     )
     await session.commit()
     await query.message.answer(
-        texts.AUTORENEW_RESUMED.format(until=texts.day(subscription.expires_at.date()))
+        texts.AUTORENEW_RESUMED.format(until=texts.day(subscription.expires_at))
     )
 
 

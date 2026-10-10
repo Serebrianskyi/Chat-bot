@@ -27,8 +27,12 @@ from services.pricing import decide_price, extend, first_expiry
 
 log = logging.getLogger(__name__)
 
-#: Telegram's limit on a photo caption. A message may be 4096 characters; a caption may not.
+#: Telegram's protocol limits on how much text one send may carry. A caption is far shorter than
+#: a message, which is the whole reason attaching a picture changes what the admin may write.
+#: They live here because this is where the first of them was needed; both are Telegram's
+#: numbers, not ours.
 CAPTION_LIMIT = 1024
+MESSAGE_LIMIT = 4096
 
 #: How long a single-use invite stays usable. Long enough to notice the message, short enough
 #: that a forwarded link is useless by the time it travels.
@@ -263,13 +267,19 @@ async def revoke_for_refund(
     # TODO(removal): once removal is enabled, this is where the member leaves the community.
 
 
-async def mark_admin_notified(
+async def mark_overdue(
     session: AsyncSession, *, subscription: Subscription, actor_id: int, now: datetime
 ) -> None:
-    """Record that an admin was told about a missing payment (A.17, S6).
+    """Record that this subscription's grace ran out unpaid (A.17, S6).
 
-    ``admin_notified_at`` is what makes the job idempotent — without it every run would alert
-    again for the same overdue member.
+    No longer tells an admin. It used to DM one per member, which on a club where most people
+    have signed up and not yet paid meant a daily wall of alerts about members who had never
+    paid and never been in the channel — and the alert's own wording ("не видалено з каналу")
+    implied they had been. Owner's decision, 2026-10-10. The case an admin does need to see,
+    somebody who **paid** and is not in the channel, is what the daily recovery report covers.
+
+    The row stays: it is the only record of when a member lapsed, and ``admin_notified_at``
+    still makes the job idempotent, so one member is recorded once rather than on every run.
     """
     subscription.admin_notified_at = now
     await record_action(
@@ -386,48 +396,42 @@ async def send_manual_invite(
 
 
 async def send_admin_message(
-    session: AsyncSession,
-    bot,
-    *,
-    user_id: int,
-    actor_id: int,
-    body: str,
-    photo: str | None = None,
+    session: AsyncSession, bot, *, user_id: int, actor_id: int, parts: list[dict]
 ) -> bool:
-    """Deliver an admin's own words to one member. Returns whether it arrived.
+    """Deliver an admin's own words to one member. Returns whether they arrived.
 
-    The bot is the only channel that reaches a member with no ``@username``: an admin cannot
-    open that chat by hand, because Telegram gives no way to find the person, while the bot has
-    had a chat with them since their first ``/start``.
+    The bot is the only channel that reaches a member with no ``@username``: an admin cannot open
+    that chat by hand, because Telegram gives no way to find the person, while the bot has had a
+    chat with them since their first ``/start``.
 
-    The text is wrapped so it reads as coming from a person at the club rather than as another
-    automated notice, and it is stored on the audit row: "what did we actually tell them" is a
-    question that gets asked, and nothing else in the system records an outgoing message (S6).
+    The first part is prefixed so the message reads as coming from a person at the club rather
+    than as another automated notice; later parts follow plain, since repeating the preamble
+    above every picture would be noise.
+
+    The parts are stored on the audit row: "what did we actually tell them" is a question that
+    gets asked, and nothing else in the system records an outgoing message (S6).
     """
-    wrapped = texts.MESSAGE_FROM_ADMIN.format(club=texts.CLUB_NAME, text=body)
-    delivered = True
-    try:
-        if photo is not None:
-            # Telegram caps a caption at 1024 characters against 4096 for a message, so a long
-            # note with a picture goes as the caption only if it fits, and as its own message
-            # after the picture if it does not. Truncation would eat the admin's words.
-            if len(wrapped) <= CAPTION_LIMIT:
-                await bot.send_photo(user_id, photo=photo, caption=wrapped)
-            else:
-                await bot.send_photo(user_id, photo=photo)
-                await bot.send_message(user_id, wrapped)
-        else:
-            await bot.send_message(user_id, wrapped)
-    except TelegramForbiddenError:
-        log.warning("Admin %s could not reach %s: blocked or never started", actor_id, user_id)
-        delivered = False
+    from services.broadcast import send_parts
+
+    labelled = [
+        {
+            "text": texts.MESSAGE_FROM_ADMIN.format(club=texts.CLUB_NAME, text=part.get("text", ""))
+            if index == 0
+            else part.get("text", ""),
+            "photo": part.get("photo"),
+        }
+        for index, part in enumerate(parts)
+    ]
+    delivered = await send_parts(bot, user_id, labelled) == "sent"
+    if not delivered:
+        log.warning("Admin %s could not reach %s", actor_id, user_id)
 
     await record_action(
         session,
         actor_id=actor_id,
         action=Action.MESSAGE_SENT,
         target_user_id=user_id,
-        details={"delivered": delivered, "text": body, "photo": photo},
+        details={"delivered": delivered, "parts": parts},
     )
     log.info("Admin %s messaged %s (delivered=%s)", actor_id, user_id, delivered)
     return delivered

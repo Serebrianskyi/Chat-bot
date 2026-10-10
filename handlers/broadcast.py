@@ -32,7 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 import texts
 from config import Settings
 from db.models import DiscountKind, Subscription, User, utcnow
-from handlers.compose import read_composed
+from handlers import compose
 from handlers.participants import GROUPS, classify
 from services import broadcast as broadcast_service
 from services import discounts as discount_service
@@ -198,7 +198,9 @@ async def choose_audience(query: CallbackQuery, state: FSMContext, session: Asyn
     )
     await state.set_state(Broadcast.waiting_for_text)
     await query.message.answer(
-        texts.ADMIN_BROADCAST_ASK_TEXT.format(label=label, count=len(recipients))
+        texts.ADMIN_BROADCAST_ASK_TEXT.format(
+            label=label, count=len(recipients), done=texts.ADMIN_COMPOSE_DONE
+        )
     )
 
 
@@ -240,27 +242,27 @@ def _period_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def receive_broadcast_text(message: Message, state: FSMContext, settings: Settings) -> None:
-    """Hold the text, then ask what the payment link should charge.
+async def receive_broadcast_part(message: Message, state: FSMContext) -> None:
+    """Take one part of the post. The admin sends as many as they like, then taps Готово."""
+    await compose.collect(message, state, cancel_data="bcast:no")
 
-    The audiences that are not sent a payment link skip straight to the preview: there is no
-    price to configure when no invoice is being issued.
-    """
-    body, photo = read_composed(message)
-    # An image on its own is a valid post; a message with neither words nor picture is not.
-    if not body and photo is None:
-        await message.answer(texts.ADMIN_BROADCAST_EMPTY)
-        return
 
-    await state.update_data(body=body, photo=photo)
+async def finish_composing(query: CallbackQuery, state: FSMContext, settings: Settings) -> None:
+    """Готово: on to the price step, or straight to the preview when no link is involved."""
     data = await state.get_data()
+    await query.answer()
+    if query.message is None:
+        return
+    if not data.get("parts"):
+        await query.message.answer(texts.ADMIN_COMPOSE_NOTHING)
+        return
 
     if data.get("audience") in AUDIENCES_WITH_PAY_LINK:
         await state.set_state(Broadcast.waiting_for_price)
-        await message.answer(texts.ADMIN_BROADCAST_ASK_PRICE, reply_markup=_price_keyboard())
+        await query.message.answer(texts.ADMIN_BROADCAST_ASK_PRICE, reply_markup=_price_keyboard())
         return
 
-    await _show_preview(message, state, settings)
+    await _show_preview(query.message, state, settings)
 
 
 async def choose_price(
@@ -365,7 +367,7 @@ def _offer_from(data: dict) -> broadcast_service.PriceOffer | None:
 async def _show_preview(message: Message, state: FSMContext, settings: Settings) -> None:
     """Everything the admin needs to decide, in the order the member will see it."""
     data = await state.get_data()
-    body = data.get("body", "")
+    parts = data.get("parts", [])
     recipients = data.get("recipients", [])
     await state.set_state(Broadcast.waiting_for_confirmation)
 
@@ -373,11 +375,14 @@ async def _show_preview(message: Message, state: FSMContext, settings: Settings)
     # as it will arrive, then what follows it. Quoting the text inside a bigger message would
     # change how it looks, which defeats the purpose of a preview.
     await message.answer(texts.ADMIN_BROADCAST_PREVIEW.format(count=len(recipients)))
-    photo = data.get("photo")
-    if photo is not None:
-        await message.answer_photo(photo, caption=body or None)
-    else:
-        await message.answer(body)
+    # The sample button rides on the last previewed part, because that is where the real one
+    # will be: under the admin's own words, with nothing of the bot's own above it.
+    sample = (
+        {"reply_markup": _sample_pay_keyboard()}
+        if data.get("audience") in AUDIENCES_WITH_PAY_LINK
+        else {}
+    )
+    await compose.replay(message, parts, reply_markup=sample.get("reply_markup"))
 
     if data.get("audience") not in AUDIENCES_WITH_PAY_LINK:
         await message.answer(
@@ -387,26 +392,6 @@ async def _show_preview(message: Message, state: FSMContext, settings: Settings)
         return
 
     offer = _offer_from(data)
-
-    # The second message, shown exactly as it will arrive: its own message, straight after the
-    # main one, with the button in place. Describing it in words left the admin guessing at the
-    # thing most likely to decide whether anybody pays.
-    if offer is None:
-        quoted = texts.money(settings.subscription_price, settings.subscription_currency)
-    elif offer.percent_off:
-        reduced = settings.subscription_price * (100 - offer.percent_off) / 100
-        quoted = texts.money(reduced, settings.subscription_currency)
-    else:
-        quoted = texts.money(offer.fixed_price, offer.currency)
-    await message.answer(
-        texts.BROADCAST_PAY_PROMPT.format(
-            club=texts.CLUB_NAME,
-            amount=quoted,
-            period=settings.subscription_period_days,
-        ),
-        reply_markup=_sample_pay_keyboard(),
-    )
-
     tail = texts.ADMIN_BROADCAST_PREVIEW_WITH_PAY.format(button=texts.JOIN_CLUB_BUTTON)
     if offer is None:
         tail += "\n" + texts.ADMIN_BROADCAST_PRICE_LINE_REGULAR
@@ -453,9 +438,9 @@ async def confirm_broadcast(
         return
 
     recipients: list[int] = data.get("recipients", [])
-    body = data.get("body", "")
+    parts: list[dict] = data.get("parts", [])
     audience = data.get("audience", "")
-    if not recipients or not (body or data.get("photo")):
+    if not recipients or not parts:
         await query.message.answer(texts.ADMIN_GRANT_CANCELLED)
         return
 
@@ -468,8 +453,7 @@ async def confirm_broadcast(
         session_factory,
         query.bot,
         user_ids=recipients,
-        text=body,
-        photo=data.get("photo"),
+        parts=parts,
         actor_id=query.from_user.id,
         audience=audience,
         with_invoice=with_invoice,
@@ -495,25 +479,33 @@ async def start_channel_post(query: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(ChannelPost.waiting_for_text)
     await query.answer()
     if query.message:
-        await query.message.answer(texts.ADMIN_CHANNEL_ASK_TEXT.format(club=texts.CLUB_NAME))
+        await query.message.answer(
+            texts.ADMIN_CHANNEL_ASK_TEXT.format(club=texts.CLUB_NAME, done=texts.ADMIN_COMPOSE_DONE)
+        )
 
 
-async def receive_channel_text(message: Message, state: FSMContext) -> None:
-    body, photo = read_composed(message)
-    if not body and photo is None:
-        await message.answer(texts.ADMIN_BROADCAST_EMPTY)
+async def receive_channel_part(message: Message, state: FSMContext) -> None:
+    """Take one part of the post."""
+    await compose.collect(message, state, cancel_data="bcast:no")
+
+
+async def finish_channel_post(query: CallbackQuery, state: FSMContext) -> None:
+    """Готово: show the post as the channel will carry it, then ask."""
+    data = await state.get_data()
+    await query.answer()
+    if query.message is None:
+        return
+    parts = data.get("parts", [])
+    if not parts:
+        await query.message.answer(texts.ADMIN_COMPOSE_NOTHING)
         return
 
-    await state.update_data(body=body, photo=photo)
     await state.set_state(ChannelPost.waiting_for_confirmation)
-    await message.answer(texts.ADMIN_CHANNEL_PREVIEW)
-    # Shown the way it will appear in the channel, image and all — a quoted description of a
+    await query.message.answer(texts.ADMIN_CHANNEL_PREVIEW)
+    # Shown the way it will appear in the channel, images and all — a quoted description of a
     # picture is not a preview of it.
-    if photo is not None:
-        await message.answer_photo(photo, caption=body or None)
-    else:
-        await message.answer(body)
-    await message.answer(
+    await compose.replay(query.message, parts)
+    await query.message.answer(
         texts.ADMIN_CHANNEL_PREVIEW_FOOTER,
         reply_markup=_confirm_keyboard(texts.ADMIN_CHANNEL_CONFIRM_YES, "post:send"),
     )
@@ -531,8 +523,8 @@ async def confirm_channel_post(
     if query.message is None:
         return
 
-    body = data.get("body", "")
-    if not (body or data.get("photo")):
+    parts: list[dict] = data.get("parts", [])
+    if not parts:
         await query.message.answer(texts.ADMIN_GRANT_CANCELLED)
         return
     if not settings.channel_id:
@@ -543,8 +535,7 @@ async def confirm_channel_post(
         session_factory,
         query.bot,
         channel_id=settings.channel_id,
-        text=body,
-        photo=data.get("photo"),
+        parts=parts,
         actor_id=query.from_user.id,
     )
     await query.message.answer(texts.ADMIN_CHANNEL_SENT if posted else texts.ADMIN_CHANNEL_FAILED)
@@ -567,7 +558,10 @@ def register(router: Router) -> None:
 
     for key, _label, _action in GROUPS:
         router.callback_query.register(choose_audience, F.data == f"bcast:{key}")
-    router.message.register(receive_broadcast_text, StateFilter(Broadcast.waiting_for_text))
+    router.message.register(receive_broadcast_part, StateFilter(Broadcast.waiting_for_text))
+    router.callback_query.register(
+        finish_composing, F.data == "compose:done", StateFilter(Broadcast.waiting_for_text)
+    )
     router.callback_query.register(
         choose_price, F.data.startswith("bprice:"), StateFilter(Broadcast.waiting_for_price)
     )
@@ -580,7 +574,10 @@ def register(router: Router) -> None:
         confirm_broadcast, F.data == "bcast:send", StateFilter(Broadcast.waiting_for_confirmation)
     )
 
-    router.message.register(receive_channel_text, StateFilter(ChannelPost.waiting_for_text))
+    router.message.register(receive_channel_part, StateFilter(ChannelPost.waiting_for_text))
+    router.callback_query.register(
+        finish_channel_post, F.data == "compose:done", StateFilter(ChannelPost.waiting_for_text)
+    )
     router.callback_query.register(
         confirm_channel_post,
         F.data == "post:send",

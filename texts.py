@@ -11,8 +11,9 @@ was written to match that voice.
 Placeholders use ``str.format``: ``{amount}``, ``{until}``, ``{hours}``.
 """
 
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 CLUB_NAME = "Your Story Club"
 
@@ -33,8 +34,27 @@ def money(amount: Decimal, currency: str) -> str:
     return f"{shown} {CURRENCY_DISPLAY.get(currency, currency)}"
 
 
-def day(value: date) -> str:
-    """A date as a member should read it: ``31.12.2026``."""
+#: The clock members read dates on. Timestamps are stored UTC (standing gate S1) and converted
+#: here, at the only place that renders them — without this, a subscription ending at 00:00 Kyiv
+#: is stored as 22:00 the previous day in UTC and every screen shows the wrong date.
+#:
+#: Duplicated from ``Settings.display_timezone``'s default rather than read from it: importing
+#: config here would validate the environment at import time, which no test or script should
+#: have to satisfy just to format a date. Keep the two in step.
+DISPLAY_TIMEZONE = ZoneInfo("Europe/Kyiv")
+
+
+def day(value: date | datetime) -> str:
+    """A date as a member should read it: ``31.12.2026``.
+
+    Given an aware ``datetime`` — which is what every stored timestamp is — the instant is
+    converted to ``DISPLAY_TIMEZONE`` first. A plain ``date`` is taken as already local.
+    """
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            msg = f"day() needs an aware datetime, got naive {value!r}"
+            raise ValueError(msg)
+        value = value.astimezone(DISPLAY_TIMEZONE).date()
     return value.strftime("%d.%m.%Y")
 
 
@@ -255,7 +275,9 @@ SUBSCRIPTION_STATUS_UNPAID = (
 )
 
 STATUS_NAMES = {
-    "trial": "пробний період",
+    # Owner's wording, 2026-10-10. Capitalised because it is a label for a kind of
+    # subscription, not an adjective: «Статус: Пробна підписка».
+    "trial": "Пробна підписка",
     "active": "активна",
     "past_due": "очікує оплати",
     "expired": "неактивна",
@@ -305,7 +327,7 @@ ADMIN_USERS_SUMMARY = "<b>Учасники бота</b> — {total}\n\nОбер�
 #: Group labels. Also the button text, with the count appended.
 ADMIN_GROUP_AUTO = "🔄 Автопродовження"
 ADMIN_GROUP_CANCELLED = "⏹ Скасували автопродовження"
-ADMIN_GROUP_TRIAL = "🎁 Пробний період"
+ADMIN_GROUP_TRIAL = "🎁 Пробна підписка"
 ADMIN_GROUP_UNPAID = "⏳ Очікують оплати"
 ADMIN_GROUP_LIFETIME = "♾ Безстрокові"
 ADMIN_GROUP_NO_SUB = "❓ Без підписки"
@@ -437,15 +459,6 @@ ADMIN_GRANT_BAD_PRICE = "Потрібне число більше за нуль.
 ADMIN_DISCOUNT_REVOKE_BUTTON = "Скасувати знижку"
 ADMIN_DISCOUNT_REVOKED = "Знижку для {who} скасовано."
 
-ADMIN_PAYMENT_MISSING = (
-    "⚠️ <b>Немає оплати</b>\n\n"
-    "Учасник: {handle} (id <code>{user_id}</code>)\n"
-    "Сума: {amount}\n"
-    "Термін вийшов: {since}\n"
-    "Тариф: {tier}\n\n"
-    "З каналу не видалено — автоматичне видалення ще не увімкнене."
-)
-
 # --- staged for later phases ------------------------------------------------------------------
 #
 # Written now because the spec supplies the wording; not referenced by any handler yet.
@@ -514,11 +527,14 @@ ADMIN_MESSAGE_ASK_WHO = (
 
 ADMIN_MESSAGE_ASK_TEXT = (
     "Що надіслати {handle}?\n\n"
-    "Надішліть текст — або фото з підписом. Це піде від імені клубу.\n"
+    "Надсилайте повідомлення — текст, фото, фото з підписом. Можна кілька. "
+    "Вони підуть від імені клубу.\n\n"
+    "Коли закінчите — натисніть «{done}».\n"
     "Щоб скасувати — /cancel"
 )
 
-ADMIN_MESSAGE_CONFIRM = "Надіслати це {handle}?\n\n— — —\n{preview}\n— — —"
+#: The message itself was just replayed above, so this only has to ask.
+ADMIN_MESSAGE_CONFIRM_ASK = "— — —\n\nНадіслати це {handle}?"
 
 ADMIN_MESSAGE_CONFIRM_YES = "✅ Надіслати"
 ADMIN_MESSAGE_SENT = "✅ Надіслано: {handle}"
@@ -542,9 +558,21 @@ ADMIN_BROADCAST_ASK_AUDIENCE = "<b>Розсилка</b>\n\nКому надісл
 
 ADMIN_BROADCAST_ASK_TEXT = (
     "Кому: <b>{label}</b> — {count} учасник(ів)\n\n"
-    "Надішліть текст розсилки — або фото з підписом, якщо потрібне зображення.\n"
+    "Надсилайте повідомлення — текст, фото, фото з підписом. Можна кілька, одне за одним: "
+    "учасник отримає їх у тому ж порядку.\n\n"
+    "Коли закінчите — натисніть «{done}».\n"
     "Щоб скасувати — /cancel"
 )
+
+#: Acknowledged after each part, so the admin can see the post being built up and has the
+#: finishing button within reach instead of scrolling back for it.
+ADMIN_COMPOSE_ADDED = "Додано. Частин: {count}. Надсилайте ще або завершуйте."
+ADMIN_COMPOSE_DONE = "✅ Готово"
+ADMIN_COMPOSE_NOTHING = "Ви ще нічого не надіслали. Надішліть повідомлення або /cancel"
+
+#: Stands in for a part that is a picture with no words, so the preview still shows its place
+#: in the order.
+ADMIN_COMPOSE_PHOTO_ONLY = "(фото без підпису)"
 
 
 ADMIN_BROADCAST_PREVIEW = "<b>Ось що отримає кожен з {count} учасник(ів):</b>\n— — — — —"
@@ -553,7 +581,7 @@ ADMIN_BROADCAST_PREVIEW = "<b>Ось що отримає кожен з {count} �
 #: has to say what is sample about it: the link, which is built per member at send time.
 ADMIN_BROADCAST_PREVIEW_WITH_PAY = (
     "— — — — —\n\n"
-    "Друге повідомлення — вище. Кнопка «{button}» у ньому показана як приклад: "
+    "Кнопка «{button}» буде під вашим повідомленням. Вище вона показана як приклад: "
     "справжнє посилання створюється для кожного учасника окремо."
 )
 
@@ -615,6 +643,25 @@ ADMIN_BROADCAST_REPLACES_WARNING = (
 
 ADMIN_BROADCAST_CONFIRM_YES = "✅ Надіслати"
 ADMIN_BROADCAST_EMPTY = "Текст порожній. Напишіть повідомлення або /cancel"
+
+#: A photo caption longer than Telegram allows a bot to send. Said plainly, with the numbers,
+#: because the admin cannot see the limit: a Telegram Premium account can type a caption longer
+#: than any bot is permitted to send, so there is no warning on their side. Before this, the
+#: send failed with «message caption is too long», the error handler swallowed it, and the admin
+#: was left looking at an empty preview (2026-10-10).
+ADMIN_CAPTION_TOO_LONG = (
+    "Підпис до фото задовгий: {length} символів, а Telegram дозволяє {limit}.\n"
+    "Скоротіть його на {over} — або надішліть текст без фото, "
+    "там ліміт 4096 символів.\n"
+    "Щоб скасувати — /cancel"
+)
+
+#: The same thing for a message with no picture, where the ceiling is 4096 rather than 1024.
+ADMIN_TEXT_TOO_LONG = (
+    "Повідомлення задовге: {length} символів, а Telegram дозволяє {limit}.\n"
+    "Скоротіть його на {over}.\n"
+    "Щоб скасувати — /cancel"
+)
 ADMIN_BROADCAST_NO_AUDIENCE = "У цій групі зараз нікого немає."
 ADMIN_BROADCAST_STARTED = "Надсилаю — {count} учасник(ів). Напишу, коли завершу."
 
@@ -631,18 +678,14 @@ ADMIN_BROADCAST_DONE = (
 #: and not acted on it.
 JOIN_CLUB_BUTTON = "Долучитися до Клубу"
 
-#: The second message of a broadcast to members who owe money. Deliberately short — the admin's
-#: own text above it is the message; this is only the way back to paying.
-BROADCAST_PAY_PROMPT = (
-    "Щоб приєднатися до {club} — натисніть кнопку нижче.\nВартість: {amount} за {period} днів."
-)
-
 
 # --- 📢 Написати в канал ---------------------------------------------------------------------
 
 ADMIN_CHANNEL_ASK_TEXT = (
     "<b>Пост у канал</b>\n\n"
-    "Надішліть текст — або фото з підписом. Бот опублікує це в каналі {club}.\n"
+    "Надсилайте повідомлення — текст, фото, фото з підписом. Можна кілька: бот опублікує їх "
+    "у каналі {club} у тому ж порядку.\n\n"
+    "Коли закінчите — натисніть «{done}».\n"
     "Щоб скасувати — /cancel"
 )
 
