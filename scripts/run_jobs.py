@@ -6,6 +6,7 @@ convenient while testing, and both are safe to run by hand because both are idem
     python -m scripts.run_jobs due     # invoice whoever has come due, then alert admins
     python -m scripts.run_jobs poll    # ask WayForPay about invoices that have not settled
     python -m scripts.run_jobs status  # show what the jobs would see, changing nothing
+    python -m scripts.run_jobs remind  # warn whoever renews tomorrow (automatic or by hand)
     python -m scripts.run_jobs invites # get a link to paid members who are not in the channel
     python -m scripts.run_jobs recover # the full daily sweep now, ignoring the once-a-day guard
     python -m scripts.run_jobs reconcile          # dry run: which written-off orders were paid
@@ -35,6 +36,7 @@ from services.billing import (
     reconcile_written_off,
     recover_access,
     retry_missing_invites,
+    send_renewal_reminders,
 )
 from services.scheduler import build_billing_config, build_client
 from texts import day, money
@@ -117,6 +119,8 @@ async def _run(job: str, apply: bool = False) -> int:
                 config=config,
                 force=True,
             )
+        elif job == "remind":
+            counts = await send_renewal_reminders(factory, client, bot, config=config)
         elif job == "invites":
             counts = await retry_missing_invites(
                 factory,
@@ -135,7 +139,10 @@ async def _run(job: str, apply: bool = False) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("job", choices=["due", "poll", "status", "reconcile", "invites", "recover"])
+    parser.add_argument(
+        "job",
+        choices=["due", "poll", "status", "reconcile", "invites", "recover", "remind"],
+    )
     parser.add_argument(
         "--apply",
         action="store_true",

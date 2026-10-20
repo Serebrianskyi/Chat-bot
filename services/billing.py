@@ -21,7 +21,7 @@ from datetime import datetime, timedelta
 from aiogram import Bot
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import texts
@@ -75,6 +75,24 @@ def _pay_keyboard(invoice_url: str) -> InlineKeyboardMarkup:
     )
 
 
+async def _unique_order_reference(session: AsyncSession, user_id: int, now: datetime) -> str:
+    """An order reference nothing else holds.
+
+    The reference carries a whole-second timestamp, so a second order for the same member inside
+    the same second would collide on the UNIQUE column and abort. That is not hypothetical: a
+    broadcast reprices and re-invoices members the daily job may have touched moments earlier,
+    and a renewal charge lands on the same morning as the due-date sweep. Suffixed rather than
+    randomised, so the reference stays readable for reconciliation against the dashboard.
+    """
+    base = subs.build_order_reference(user_id, now)
+    reference = base
+    attempt = 1
+    while await session.scalar(select(Payment.id).where(Payment.order_reference == reference)):
+        attempt += 1
+        reference = f"{base}-{attempt}"
+    return reference
+
+
 async def issue_invoice(
     session: AsyncSession,
     client: WayForPayClient,
@@ -93,18 +111,7 @@ async def issue_invoice(
     afterwards, with no job needed to expire anything. Whatever is charged is recorded on the
     payment row, and that row is what the gateway's answer is checked against (A.14).
     """
-    order_reference = subs.build_order_reference(subscription.user_id, now)
-    # The reference carries a whole-second timestamp, so a second invoice for the same member
-    # inside the same second would collide on the UNIQUE column and abort. That is not
-    # hypothetical: a broadcast reprices and re-invoices members who may have been invoiced by
-    # the daily job moments earlier. Suffix it rather than lose the invoice, keeping the
-    # reference readable for reconciliation against the dashboard.
-    attempt = 1
-    while await session.scalar(
-        select(Payment.id).where(Payment.order_reference == order_reference)
-    ):
-        attempt += 1
-        order_reference = f"{subs.build_order_reference(subscription.user_id, now)}-{attempt}"
+    order_reference = await _unique_order_reference(session, subscription.user_id, now)
 
     user = await session.get(User, subscription.user_id)
     amount, currency, discount = await discount_service.effective_price(
@@ -398,6 +405,307 @@ async def poll_open_payments(
     return counts
 
 
+#: How long before a declined card is charged again. Matches `texts.RETRY_AFTER_HOURS`, which is
+#: what the member is told, so the promise and the behaviour cannot drift.
+CHARGE_RETRY_AFTER = timedelta(hours=texts.RETRY_AFTER_HOURS)
+
+#: How many times a card is charged for one period before the subscription is cancelled. Owner's
+#: decision, 2026-10-20: declined once says «Наступна спроба: <tomorrow>», declined twice says
+#: «Підписка скасована». Charging a failing card every morning indefinitely is what this replaces.
+MAX_CHARGE_ATTEMPTS = 2
+
+#: How long before expiry the member is warned that a charge is coming. One day, because the copy
+#: says «Завтра відбудеться автоматичне списання».
+REMINDER_LEAD = timedelta(days=1)
+
+
+async def attempt_charge(
+    session: AsyncSession,
+    client: WayForPayClient,
+    bot: Bot,
+    *,
+    subscription: Subscription,
+    config: BillingConfig,
+    now: datetime,
+) -> bool:
+    """Take this period's money from the stored card. True when it worked.
+
+    The renewal path. ``CHARGE`` is synchronous, so the answer is known here and nothing is left
+    for the poller — but the ``payments`` row is written **before** the call, so a charge that
+    takes money and then loses the connection is still reconcilable by order reference.
+
+    The amount is computed per charge from this member's own price, discount included, exactly as
+    an invoice is. A discount that expires therefore raises the next charge with no job needed.
+
+    Declined is not retried immediately: the member is told «спробуємо ще раз через 24 години» and
+    ``CHARGE_RETRY_AFTER`` is what makes that true. Without it the daily job would charge a
+    failing card every morning and the copy would be a lie.
+    """
+    # A charge attempted recently is not repeated — see CHARGE_RETRY_AFTER. Read from the
+    # payments table rather than a new column: the row is already the record of the attempt.
+    last_attempt = await session.scalar(
+        select(Payment.created_at)
+        .where(Payment.subscription_id == subscription.id)
+        .order_by(Payment.created_at.desc())
+        .limit(1)
+    )
+    if last_attempt is not None and now - last_attempt < CHARGE_RETRY_AFTER:
+        log.info(
+            "Not charging %s yet: last attempt %s, retry after %s",
+            subscription.user_id,
+            last_attempt.isoformat(),
+            CHARGE_RETRY_AFTER,
+        )
+        return False
+
+    user = await session.get(User, subscription.user_id)
+    amount, currency, _ = await discount_service.effective_price(
+        session,
+        subscription=subscription,
+        username=user.username if user else None,
+        now=now,
+    )
+    order_reference = await _unique_order_reference(session, subscription.user_id, now)
+
+    payment = Payment(
+        user_id=subscription.user_id,
+        subscription_id=subscription.id,
+        order_reference=order_reference,
+        amount=amount,
+        currency=currency,
+        status=PaymentStatus.PENDING,  # money is in flight the moment the request leaves
+        created_at=now,
+    )
+    session.add(payment)
+    await session.flush()
+
+    try:
+        result = await client.charge(
+            order_reference=order_reference,
+            order_date=int(now.timestamp()),
+            amount=amount,
+            currency=currency,
+            product_name=config.product_name,
+            rec_token=subscription.wayforpay_rec_token or "",
+        )
+    except Exception:
+        # The row stays PENDING on purpose, unlike a failed CREATE_INVOICE which is deleted: a
+        # CHARGE that errored may still have taken the money, so the poller must ask about it.
+        log.exception("CHARGE failed for %s", order_reference)
+        payment.status = PaymentStatus.ERROR
+        payment.last_checked_at = now
+        return False
+
+    extended = await subs.apply_payment_result(
+        session,
+        payment=payment,
+        status=result.status,
+        gateway_status=result.gateway_status,
+        amount=result.amount,
+        currency=result.currency,
+        reason_code=result.reason_code,
+        rec_token=result.rec_token,
+        raw=result.raw,
+        now=now,
+    )
+
+    if extended:
+        # A renewal, not a first payment: they are already in the channel, so no invite.
+        try:
+            await bot.send_message(
+                subscription.user_id,
+                texts.PAYMENT_RENEWED.format(until=texts.day(subscription.expires_at)),
+            )
+        except TelegramForbiddenError:
+            log.warning("Renewed but unreachable: %s", subscription.user_id)
+        except Exception:
+            log.exception("Renewed but could not message %s", subscription.user_id)
+        log.info("Renewed %s to %s", subscription.user_id, subscription.expires_at)
+        return True
+
+    # Declined. How many times this period's charge has been refused decides what happens next:
+    # one more attempt tomorrow, or the subscription ends. Counted from the payments table —
+    # `expires_at` does not move on a failure, so it is a stable anchor for "this period".
+    attempts = await session.scalar(
+        select(func.count(Payment.id)).where(
+            Payment.subscription_id == subscription.id,
+            Payment.status == PaymentStatus.DENIED,
+            Payment.created_at >= subscription.expires_at,
+        )
+    )
+    attempts = attempts or 0
+
+    if attempts < MAX_CHARGE_ATTEMPTS:
+        message = texts.CHARGE_DECLINED_FIRST.format(
+            club=texts.CLUB_NAME,
+            amount=texts.money(amount, currency),
+            retry_on=texts.day(now + CHARGE_RETRY_AFTER),
+        )
+    else:
+        # Out of attempts. Access ends today and the stored card is forgotten, so nothing can be
+        # charged again by accident — the same guarantee `cancel_autorenew` gives.
+        subscription.expires_at = now
+        subscription.status = SubscriptionStatus.CANCELLED
+        subscription.wayforpay_rec_token = None
+        subscription.grace_until = None
+        await record_action(
+            session,
+            actor_id=subscription.user_id,
+            action=Action.SUBSCRIPTION_CANCELLED,
+            target_user_id=subscription.user_id,
+            details={
+                "reason": "card declined",
+                "attempts": attempts,
+                "expires_at": now.isoformat(),
+            },
+            now=now,
+        )
+        message = texts.CHARGE_DECLINED_FINAL.format(
+            club=texts.CLUB_NAME,
+            amount=texts.money(amount, currency),
+            until=texts.day(now),
+        )
+
+    try:
+        await bot.send_message(subscription.user_id, message)
+    except TelegramForbiddenError:
+        log.warning("Charge failed and unreachable: %s", subscription.user_id)
+    except Exception:
+        log.exception("Charge failed and could not message %s", subscription.user_id)
+    log.warning(
+        "CHARGE declined for %s (attempt %s of %s): %s / %s",
+        subscription.user_id,
+        attempts,
+        MAX_CHARGE_ATTEMPTS,
+        result.gateway_status,
+        result.reason_code,
+    )
+    return False
+
+
+async def send_renewal_reminders(
+    session_factory: async_sessionmaker,
+    client: WayForPayClient | None,
+    bot: Bot,
+    *,
+    config: BillingConfig,
+    now: datetime | None = None,
+) -> dict[str, int]:
+    """Warn members a day before their period ends. Daily.
+
+    Two different messages, because two different things are about to happen:
+
+    * **a stored card** — money will be taken on its own, so the warning is to check the balance
+      («Завтра відбудеться автоматичне списання»);
+    * **no stored card** — nothing will be taken and they must pay by hand, so the reminder
+      carries a payment link. Today that is everybody: no token can be obtained on the current
+      integration (docs/telegram-bot-payments-design.md §1a).
+
+    ``last_reminder_at`` makes it fire once per period (G3.7): a job that runs daily must not
+    send the same warning every morning of the window.
+    """
+    now = now or utcnow()
+    counts = {"automatic": 0, "manual": 0, "unreachable": 0, "skipped": 0}
+
+    async with session_factory() as session:
+        upcoming = (
+            (
+                await session.execute(
+                    select(Subscription).where(
+                        Subscription.status.in_(
+                            [SubscriptionStatus.ACTIVE, SubscriptionStatus.TRIAL]
+                        ),
+                        Subscription.expires_at > now,
+                        Subscription.expires_at <= now + REMINDER_LEAD,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+        for subscription in upcoming:
+            # Already warned about *this* period? `last_reminder_at` is reset whenever the period
+            # moves, so a stamp inside the current window means the member has been told.
+            # Inclusive on purpose: a reminder sent at the exact instant the window opened — the
+            # ordinary case when the job and the window line up — belongs to this period.
+            if (
+                subscription.last_reminder_at is not None
+                and subscription.last_reminder_at >= subscription.expires_at - REMINDER_LEAD
+            ):
+                counts["skipped"] += 1
+                continue
+
+            user = await session.get(User, subscription.user_id)
+            amount, currency, _ = await discount_service.effective_price(
+                session,
+                subscription=subscription,
+                username=user.username if user else None,
+                now=now,
+            )
+
+            if subscription.wayforpay_rec_token:
+                delivered = await _tell(bot, subscription.user_id, texts.RENEWAL_REMINDER)
+                counts["automatic"] += delivered
+            else:
+                # The link is issued now rather than described, so the reminder is actionable.
+                payment = None
+                if client is not None:
+                    existing = await subs.open_payment(session, subscription.id)
+                    if existing is not None and existing.invoice_url:
+                        payment = existing
+                    else:
+                        try:
+                            payment = await issue_invoice(
+                                session,
+                                client,
+                                subscription=subscription,
+                                config=config,
+                                now=now,
+                            )
+                        except Exception:
+                            log.exception(
+                                "Could not invoice %s for a reminder", subscription.user_id
+                            )
+                            payment = None
+
+                text = texts.RENEWAL_MANUAL_DUE.format(
+                    club=texts.CLUB_NAME,
+                    amount=texts.money(amount, currency),
+                    period=subscription.period_days,
+                )
+                delivered = await _tell(
+                    bot,
+                    subscription.user_id,
+                    text,
+                    reply_markup=_pay_keyboard(payment.invoice_url or "") if payment else None,
+                )
+                counts["manual"] += delivered
+
+            if not delivered:
+                counts["unreachable"] += 1
+            subscription.last_reminder_at = now
+
+        await session.commit()
+
+    log.info("send_renewal_reminders: %s", counts)
+    return counts
+
+
+async def _tell(bot: Bot, chat_id: int, text: str, *, reply_markup=None) -> int:
+    """Send one message, returning 1 if it arrived. Unreachable is counted, never raised."""
+    try:
+        extra = {"reply_markup": reply_markup} if reply_markup else {}
+        await bot.send_message(chat_id, text, **extra)
+    except TelegramForbiddenError:
+        log.warning("Cannot reach %s", chat_id)
+        return 0
+    except Exception:
+        log.exception("Could not message %s", chat_id)
+        return 0
+    return 1
+
+
 # --- job 2: chase due subscriptions --------------------------------------------------------
 
 
@@ -410,13 +718,16 @@ async def process_due_subscriptions(
     config: BillingConfig,
     now: datetime | None = None,
 ) -> dict[str, int]:
-    """Invoice whoever has come due, then alert admins about whoever has not paid.
+    """Renew or invoice whoever has come due, then record whoever has not paid.
+
+    A member with a stored ``recToken`` is **charged**; one without is sent a payment link. That
+    split is the design doc's Job 1 table, and it is what makes «оплата автоматична» true.
 
     Idempotent (A.20): a subscription with an open payment is not invoiced again, and
     ``admin_notified_at`` stops the same overdue member being recorded twice.
     """
     now = now or utcnow()
-    counts = {"invoiced": 0, "unreachable": 0, "overdue": 0}
+    counts = {"invoiced": 0, "renewed": 0, "charge_failed": 0, "unreachable": 0, "overdue": 0}
 
     async with session_factory() as session:
         due = (
@@ -445,25 +756,48 @@ async def process_due_subscriptions(
             if subscription.status is not SubscriptionStatus.PAST_DUE:
                 subscription.status = SubscriptionStatus.PAST_DUE
 
-            existing = await subs.open_payment(session, subscription.id)
-            if existing is None:
-                try:
-                    payment = await issue_invoice(
-                        session,
-                        client,
-                        subscription=subscription,
-                        config=config,
-                        now=now,
-                    )
-                except WayForPayError:
-                    log.exception("Could not invoice %s", subscription.user_id)
+            # A stored card means the money is taken, not asked for. This is the whole promise
+            # `PAYMENT_FIRST_CONFIRMED` makes — «оплата автоматична» — and until renewals existed
+            # the bot was saying something untrue. See the design doc's Job 1 table.
+            if subscription.wayforpay_rec_token:
+                if await attempt_charge(
+                    session,
+                    client,
+                    bot,
+                    subscription=subscription,
+                    config=config,
+                    now=now,
+                ):
+                    counts["renewed"] += 1
+                    # Paid: expires_at is in the future again, so none of the chasing below
+                    # applies and grace from this period is irrelevant.
                     continue
+                counts["charge_failed"] += 1
+                # Falls through: they keep access through grace and the usual chasing resumes,
+                # but no invoice is sent — a member with a card on file is not asked to pay by
+                # hand until the retries have run out.
+            else:
+                existing = await subs.open_payment(session, subscription.id)
+                if existing is None:
+                    try:
+                        payment = await issue_invoice(
+                            session,
+                            client,
+                            subscription=subscription,
+                            config=config,
+                            now=now,
+                        )
+                    except WayForPayError:
+                        log.exception("Could not invoice %s", subscription.user_id)
+                        continue
 
-                delivered = await send_payment_link(bot, subscription=subscription, payment=payment)
-                counts["invoiced"] += 1
-                if not delivered:
-                    counts["unreachable"] += 1
-                subscription.last_reminder_at = now
+                    delivered = await send_payment_link(
+                        bot, subscription=subscription, payment=payment
+                    )
+                    counts["invoiced"] += 1
+                    if not delivered:
+                        counts["unreachable"] += 1
+                    subscription.last_reminder_at = now
 
             # Grace exhausted and still unpaid. Recorded, not reported: see `mark_overdue` for
             # why an admin is no longer DMed about it. The member is not removed either.

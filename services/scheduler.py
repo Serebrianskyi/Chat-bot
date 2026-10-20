@@ -25,6 +25,7 @@ from services.billing import (
     poll_open_payments,
     process_due_subscriptions,
     recover_access,
+    send_renewal_reminders,
 )
 from services.wayforpay import WayForPayClient
 
@@ -144,6 +145,21 @@ def start_scheduler(
         max_instances=1,
     )
 
+    scheduler.add_job(
+        send_renewal_reminders,
+        "cron",
+        hour=DUE_JOB_HOUR,
+        minute=30,
+        id="send_renewal_reminders",
+        kwargs={
+            "session_factory": session_factory,
+            "client": client,
+            "bot": bot,
+            "config": config,
+        },
+        coalesce=True,
+        max_instances=1,
+    )
     scheduler.add_job(
         recover_access,
         "cron",

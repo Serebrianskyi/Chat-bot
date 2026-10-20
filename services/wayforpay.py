@@ -2,9 +2,9 @@
 
 Every call is ``POST https://api.wayforpay.com/api``, differing only by ``transactionType``.
 
-Only two transaction types are implemented. ``CHARGE`` (renewal from a stored ``recToken``) is
-deliberately left out of this slice — see docs/phase-2a-scope.md — but ``recToken`` is captured
-whenever WayForPay returns it, so adding renewals later needs no migration.
+Three transaction types: ``CREATE_INVOICE`` (first payment), ``CHECK_STATUS`` (confirmation) and
+``CHARGE`` (renewal from a stored ``recToken``). ``CHARGE`` answers synchronously, so a renewal
+needs no polling; the other two are a request and a later question.
 
 Signature rules, all HMAC-MD5 over ``;``-joined UTF-8 keyed with the merchant secret:
 
@@ -311,6 +311,69 @@ class WayForPayClient:
 
         return Invoice(order_reference=order_reference, invoice_url=invoice_url, raw=data)
 
+    async def charge(
+        self,
+        *,
+        order_reference: str,
+        order_date: int,
+        amount: Decimal,
+        currency: str,
+        product_name: str,
+        rec_token: str,
+    ) -> TransactionStatus:
+        """Take money from a stored card. The renewal path.
+
+        ``CHARGE`` is **synchronous**: the body that comes back carries the real
+        ``transactionStatus``, so unlike ``CREATE_INVOICE`` there is nothing to poll for and the
+        answer is financial — which is why it is signature-verified before anything is believed.
+
+        The request signature is the same field list as ``CREATE_INVOICE`` (see
+        docs/telegram-bot-payments-design.md §2); ``recToken`` is not part of it.
+
+        No WayForPay-side subscription is involved. The club's own ``expires_at`` is the
+        schedule and this executes one charge against it, which is what makes per-user pricing
+        possible — the amount is this member's amount, not a figure fixed at enrolment.
+
+        Source: wiki.wayforpay.com/en/view/852194 (charge, host2host), read 2026-10-20.
+        """
+        payload: dict[str, Any] = {
+            "transactionType": "CHARGE",
+            "merchantAccount": self._merchant_account,
+            "merchantDomainName": self._merchant_domain,
+            "apiVersion": 1,
+            # Both mandatory for CHARGE, unlike CREATE_INVOICE — omitting them is rejected.
+            # SALE takes the money now; AUTH would only hold it and need a later Settle.
+            "merchantTransactionType": "SALE",
+            # NON3DS because nobody is present: a renewal runs from a cron job, and a 3-D Secure
+            # challenge needs a cardholder to answer it. AUTO lets WayForPay decide and may
+            # therefore pick a challenge that can never be completed. If an acquirer insists on
+            # 3DS for stored-card charges this is the field to revisit.
+            "merchantTransactionSecureType": "NON3DS",
+            "orderReference": order_reference,
+            "orderDate": order_date,
+            "amount": format_amount(amount),
+            "currency": currency,
+            "productName": [product_name],
+            "productPrice": [format_amount(amount)],
+            "productCount": [1],
+            "recToken": rec_token,
+            "merchantSignature": sign(
+                self._secret_key,
+                self.invoice_signature_fields(
+                    order_reference=order_reference,
+                    order_date=order_date,
+                    amount=amount,
+                    currency=currency,
+                    product_name=product_name,
+                    product_count=1,
+                ),
+            ),
+        }
+
+        data = await self._post(payload)
+        self.verify_response(data)
+        return self._read_transaction(order_reference, data)
+
     async def check_status(self, *, order_reference: str) -> TransactionStatus:
         """Ask whether an order was actually paid. The authoritative answer."""
         payload = {
@@ -324,7 +387,15 @@ class WayForPayClient:
         }
         data = await self._post(payload)
         self.verify_response(data)
+        return self._read_transaction(order_reference, data)
 
+    def _read_transaction(self, order_reference: str, data: dict[str, Any]) -> TransactionStatus:
+        """Turn a verified response body into a TransactionStatus.
+
+        Shared by ``CHECK_STATUS`` and ``CHARGE`` on purpose: both answer the same question and
+        both must read a blank amount, an unrecognised status and a detail-less ``Declined`` the
+        same way. Two copies would drift, and the thing they would drift on is money.
+        """
         gateway_status = data.get("transactionStatus")
         amount = parse_amount(
             data.get("amount"),

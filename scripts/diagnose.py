@@ -3,6 +3,8 @@
     python -m scripts.diagnose access     # who paid, who got a link, who is in the channel
     python -m scripts.diagnose invites    # every link this bot ever sent, per member, with times
     python -m scripts.diagnose reasons    # what WayForPay actually said, grouped
+    python -m scripts.diagnose order <order_reference>   # one stored gateway body, in full
+    python -m scripts.diagnose fields     # every field WayForPay has ever sent, read or ignored
     python -m scripts.diagnose access --channel   # as above, plus a live membership check
 
 Written for one question: of the people who paid, which ones did the bot fail and which ones
@@ -40,6 +42,7 @@ from services.audit import Action
 # The same definition the retry job uses. Imported rather than repeated: a diagnostic that
 # disagrees with the job about who is in the channel is worse than no diagnostic.
 from services.billing import IN_CHANNEL
+from services.wayforpay import RESPONSE_SIGNATURE_FIELDS
 from texts import day, money
 
 
@@ -313,15 +316,171 @@ async def cmd_invites(check_channel: bool) -> int:
     return 0
 
 
+#: Never printed. The signature is the secret key's output, so dumping it would publish a
+#: derivative of the credential (standing gate S5) — and it answers no question anybody has.
+MASKED_FIELDS = frozenset({"merchantSignature"})
+
+#: The field this command exists to look for. WayForPay issues a token on Purchase or Card
+#: Verify and delivers it to `serviceUrl`; whether `CHECK_STATUS` also returns it for an invoice
+#: is undocumented, and the answer decides whether automatic renewals need the Phase 4 webhook.
+#: See docs/telegram-bot-payments-design.md §1a.
+TOKEN_FIELD = "recToken"  # noqa: S105 - a field name, not a secret
+
+
+async def cmd_order(order_reference: str) -> int:
+    """Print the stored gateway body for one order, in full, with the signature withheld.
+
+    Read-only. This is how a question about what WayForPay actually sends gets answered from
+    evidence rather than from documentation that does not say.
+    """
+    settings = get_settings()
+    engine = create_engine(settings.database_url)
+    factory = create_session_factory(engine)
+    try:
+        async with factory() as session:
+            payment = await session.scalar(
+                select(Payment).where(Payment.order_reference == order_reference)
+            )
+            if payment is None:
+                print(f"No payment with order_reference {order_reference!r}.")
+                print("List what there is with:  python -m scripts.diagnose reasons")
+                return 1
+
+            user = await session.get(User, payment.user_id)
+            print(f"order            {payment.order_reference}")
+            print(f"member           {_handle(user, payment.user_id)}")
+            print(f"our status       {payment.status.value}")
+            print(f"gateway status   {payment.wayforpay_status}")
+            print(f"reason code      {payment.reason_code}")
+            print(f"amount           {money(payment.amount, payment.currency)}")
+            print(f"created          {payment.created_at.isoformat()}")
+            checked = payment.last_checked_at
+            print(f"last checked     {checked and checked.isoformat()}")
+            print(f"settled          {payment.settled_at and payment.settled_at.isoformat()}")
+
+            raw = payment.raw_response if isinstance(payment.raw_response, dict) else None
+            if not raw:
+                print("\nNo gateway body stored for this order yet.")
+                return 0
+
+            print("\nstored gateway body:")
+            for key in sorted(raw):
+                value = "(withheld)" if key in MASKED_FIELDS else raw[key]
+                print(f"  {key:<28} {value!r}")
+
+            # Two separate questions: did WayForPay send it, and did we keep it. Both answered
+            # here, because "the token arrived" is useless if it was not stored.
+            subscription = await session.scalar(
+                select(Subscription).where(Subscription.user_id == payment.user_id)
+            )
+            stored = subscription.wayforpay_rec_token if subscription else None
+
+            print()
+            if raw.get(TOKEN_FIELD):
+                print(f"✅ {TOKEN_FIELD} IS present in the body WayForPay sent.")
+                if stored:
+                    print(f"✅ and it is stored on the subscription: {stored[:8]}…")
+                    print("   Automatic renewals will work — CHARGE takes over from here.")
+                else:
+                    print("⚠️  but the subscription holds no token. That should not happen;")
+                    print("    check the poller's log for this order reference.")
+            else:
+                print(f"❌ {TOKEN_FIELD} is NOT in this body.")
+                print("   If this was a paid invoice, CHECK_STATUS does not carry the token and")
+                print("   automatic renewal needs the serviceUrl callback (Phase 4 webhook).")
+                print("   See docs/telegram-bot-payments-design.md §1a.")
+                if stored:
+                    print(
+                        f"\n   (the subscription holds a token from elsewhere: {stored[:8]}…)"
+                    )
+    finally:
+        await engine.dispose()
+    return 0
+
+
+#: Every field the code reads out of a gateway body: what `services.wayforpay` pulls from a
+#: response, plus the signature's own field list. Anything outside this set is arriving and being
+#: thrown away, which is the question `fields` exists to answer — a `recToken` sitting unread in
+#: the bodies would be exactly that kind of miss.
+READ_FIELDS = frozenset(RESPONSE_SIGNATURE_FIELDS) | {
+    "merchantSignature",
+    "recToken",
+    "invoiceUrl",
+    "reason",  # printed by `reasons`
+}
+
+
+async def cmd_fields() -> int:
+    """Every field present in the bodies we have stored, and whether the code reads it.
+
+    Read-only. `payments.raw_response` keeps the whole body before any business logic (standing
+    rule 6), so this can answer "is WayForPay telling us something we ignore?" from evidence
+    rather than from documentation.
+    """
+    settings = get_settings()
+    engine = create_engine(settings.database_url)
+    factory = create_session_factory(engine)
+    try:
+        async with factory() as session:
+            payments = list((await session.execute(select(Payment))).scalars())
+            bodies = [p.raw_response for p in payments if isinstance(p.raw_response, dict)]
+            if not bodies:
+                print("No gateway bodies stored yet — nothing to inspect.")
+                return 0
+
+            seen: Counter[str] = Counter()
+            samples: dict[str, object] = {}
+            for body in bodies:
+                for key, value in body.items():
+                    seen[key] += 1
+                    if key not in samples and value not in (None, "", []):
+                        samples[key] = value
+
+            print(f"{len(bodies)} stored bodies from {len(payments)} payments\n")
+            print(f"{'field':<28}{'seen in':<10}{'':<6}example")
+            ignored: list[str] = []
+            for key, count in sorted(seen.items(), key=lambda kv: (-kv[1], kv[0])):
+                mark = "read" if key in READ_FIELDS else "IGNORED"
+                if key not in READ_FIELDS:
+                    ignored.append(key)
+                shown = "(withheld)" if key in MASKED_FIELDS else repr(samples.get(key))
+                print(f"{key:<28}{count:<10}{mark:<9}{shown}")
+
+            print()
+            if ignored:
+                print(f"⚠️  {len(ignored)} field(s) arriving and never read: {', '.join(ignored)}")
+                print("    Worth a look — one of them may be the thing a feature is waiting on.")
+            else:
+                print("Every field present is read by the code.")
+
+            if not any(TOKEN_FIELD in body for body in bodies):
+                print(f"\n{TOKEN_FIELD} has never appeared in any stored body.")
+                print("See docs/telegram-bot-payments-design.md §1a for what that means.")
+    finally:
+        await engine.dispose()
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("report", choices=["access", "invites", "reasons"])
+    parser.add_argument("report", choices=["access", "invites", "reasons", "order", "fields"])
+    parser.add_argument(
+        "order_reference",
+        nargs="?",
+        help="order only: which order's stored gateway body to print",
+    )
     parser.add_argument(
         "--channel",
         action="store_true",
         help="also ask Telegram whether each payer is in the channel (one API call per member)",
     )
     args = parser.parse_args(argv)
+    if args.report == "fields":
+        return asyncio.run(cmd_fields())
+    if args.report == "order":
+        if not args.order_reference:
+            parser.error("order needs an order_reference")
+        return asyncio.run(cmd_order(args.order_reference))
     if args.report == "reasons":
         return asyncio.run(cmd_reasons())
     if args.report == "invites":

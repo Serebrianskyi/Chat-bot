@@ -178,6 +178,20 @@ async def apply_payment_result(
     payment.reason_code = reason_code
     payment.raw_response = raw
 
+    # Captured from **any** body that carries one, before every other decision. It used to be
+    # stored only on the transition to COMPLETE, which threw the token away if it arrived in a
+    # later CHECK_STATUS of an already-settled order, or alongside an amount we refused. A token
+    # is not access — storing one grants nothing — so there is no reason to gate it on anything.
+    if rec_token:
+        token_holder = (
+            await session.get(Subscription, payment.subscription_id)
+            if payment.subscription_id is not None
+            else None
+        )
+        if token_holder is not None and token_holder.wayforpay_rec_token != rec_token:
+            token_holder.wayforpay_rec_token = rec_token
+            log.info("Stored a recToken for %s from %s", token_holder.user_id, gateway_status)
+
     if payment.status is PaymentStatus.COMPLETE:
         log.info("Order %s already complete; ignoring repeat result", payment.order_reference)
         return False
@@ -222,9 +236,6 @@ async def apply_payment_result(
     subscription.grace_until = None
     subscription.last_reminder_at = None
     subscription.admin_notified_at = None
-    if rec_token:
-        # Captured now so renewals can be built later without a migration.
-        subscription.wayforpay_rec_token = rec_token
 
     log.info(
         "Order %s complete; %s now expires %s",
@@ -437,6 +448,55 @@ async def send_admin_message(
     return delivered
 
 
+async def gift_months(
+    session: AsyncSession,
+    *,
+    subscription: Subscription,
+    months: int,
+    actor_id: int,
+    now: datetime,
+) -> datetime:
+    """Extend a member's access for free. Returns the new expiry.
+
+    Uses the same ``extend`` the payment path uses, one period per month, so a gift behaves
+    exactly like a payment would: it **adds** to a date that is still in the future rather than
+    overwriting it. Setting an absolute date instead is the mistake this exists to prevent — a
+    member paid up until December would silently lose the weeks they already hold.
+
+    A lapsed subscription extends from ``now``, so a gifted month is a month from today and not
+    one backdated into the gap.
+
+    ``free_period_granted`` is deliberately **not** touched: that flag records the single free
+    first period the onboarding offer gives, and a gift is not that. The chase stamps are cleared
+    because they describe a hunt for a payment that is no longer owed.
+    """
+    expiry = subscription.expires_at
+    for _ in range(months):
+        expiry = extend(expiry, now=now, period_days=subscription.period_days)
+
+    subscription.expires_at = expiry
+    subscription.status = SubscriptionStatus.ACTIVE
+    subscription.grace_until = None
+    subscription.last_reminder_at = None
+    subscription.admin_notified_at = None
+
+    await record_action(
+        session,
+        actor_id=actor_id,
+        action=Action.SUBSCRIPTION_EXTENDED,
+        target_user_id=subscription.user_id,
+        details={
+            "gift": True,
+            "months": months,
+            "period_days": subscription.period_days,
+            "expires_at": expiry.isoformat(),
+        },
+        now=now,
+    )
+    log.info("Admin %s gifted %s %s month(s) -> %s", actor_id, subscription.user_id, months, expiry)
+    return expiry
+
+
 async def cancel_autorenew(
     session: AsyncSession, *, subscription: Subscription, actor_id: int, now: datetime
 ) -> None:
@@ -483,4 +543,6 @@ async def resume_autorenew(
 #                path has been exercised against real money; gate it with G3.6 and G3.8.
 # TODO(phase-3): grant / extend / revoke by hand from the admin panel, each writing audit_log.
 # TODO(phase-3): single-use invite links (create_chat_invite_link, member_limit=1).
-# TODO(renewals): CHARGE with wayforpay_rec_token, so renewal needs no user action.
+# TODO(renewals): request a recToken on CREATE_INVOICE. `billing.attempt_charge` is written and
+#                 tested, but it only fires for a subscription that *has* a token, and nothing
+#                 asks WayForPay to issue one — so every renewal is still a manual link today.

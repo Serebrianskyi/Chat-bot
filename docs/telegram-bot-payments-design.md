@@ -24,6 +24,55 @@ when asked.
 
 ---
 
+## 1a. Correction, 2026-10-20 — how a `recToken` is actually obtained
+
+WayForPay support, asked directly:
+
+> Оскільки ви приймаєте платежі за API, ви маєте передавати у запиті параметри регулярності. У
+> такому випадку платіж буде вважатися регулярним… Якщо платіж було прийнято без даних
+> параметрів, зробити його регулярним вже неможливо.
+
+Checked against their documentation the same day:
+
+- **`CREATE_INVOICE` accepts no recurring parameters at all.** Its parameter list is
+  `transactionType, merchantAccount, merchantAuthType, merchantDomainName, merchantSignature,
+  apiVersion, language, serviceUrl, orderReference, amount, currency, alternativeAmount,
+  alternativeCurrency, orderTimeout, productName[], productPrice[], productCount[],
+  paymentSystems, clientFirstName, clientLastName, clientEmail, clientPhone`. No `regularMode`,
+  `regularAmount`, `dateNext` or `dateEnd`.
+  ([create invoice](https://wiki.wayforpay.com/en/view/608996852))
+- **A `recToken` is issued by `Purchase` (full card details entered) or `Card Verify`** — not by
+  paying an invoice link.
+  ([tokenization](https://wiki.wayforpay.com/display/WADE/Tokenization))
+- **For an invoice, `recToken` arrives in the `serviceUrl` notification**, not in the
+  `CREATE_INVOICE` response. Whether `CHECK_STATUS` also returns it is **unverified**; the code
+  reads it if present (`services/wayforpay.py`), and nothing has ever come back.
+- A payment already taken without regularity parameters **cannot be made regular afterwards**, so
+  there is no retroactive fix for the periods already sold.
+
+### What this means for §1
+
+§1 chose merchant-driven `CHARGE` over WayForPay-side regularity, and that choice still holds —
+`CHARGE` is implemented and tested (`billing.attempt_charge`). But §1 assumed the token would
+simply arrive with the first payment. It will not, on the current `CREATE_INVOICE` integration.
+
+Either route to automatic renewal needs something this deployment does not have:
+
+| Route | Needs |
+|---|---|
+| `recToken` + our own `CHARGE` | a token, which arrives at `serviceUrl` → **a public HTTPS endpoint** (Phase 4), or confirmation that `CHECK_STATUS` returns one |
+| WayForPay-side regularity | the `Purchase` flow instead of `CREATE_INVOICE`, plus either `serviceUrl` or polling the regular-payments `STATUS` API |
+
+So automatic renewal is blocked on the **Phase 4 webhook**, not on a payload tweak. `serviceUrl`
+is an optional `CREATE_INVOICE` parameter and `web/routes.py` already reserves
+`POST /payments/wayforpay` for it.
+
+`CHARGE` also requires `merchantTransactionType` and `merchantTransactionSecureType`, both
+mandatory and both absent from the first implementation — corrected the same day, `SALE` and
+`NON3DS` (nobody is present at a renewal to answer a 3-D Secure challenge).
+
+---
+
 ## 2. Mechanism
 
 Every call is `POST https://api.wayforpay.com/api`, differing by `transactionType`.

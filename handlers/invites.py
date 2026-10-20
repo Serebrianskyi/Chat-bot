@@ -26,6 +26,7 @@ not worked.
 import logging
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramForbiddenError
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -37,7 +38,9 @@ import texts
 from config import Settings
 from db.models import SubscriptionStatus, User, normalise_username, utcnow
 from handlers import compose
+from handlers.broadcast import MAX_MONTHS, parse_months
 from services import subscriptions as subs
+from services.pricing import extend
 
 log = logging.getLogger(__name__)
 
@@ -84,6 +87,7 @@ async def _find_user(session: AsyncSession, raw: str) -> User | None:
 
 
 async def start_invite(query: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()  # never inherit an abandoned walk
     await state.set_state(SendInvite.waiting_for_target)
     await query.answer()
     if query.message:
@@ -198,6 +202,7 @@ def _send_keyboard() -> InlineKeyboardMarkup:
 
 
 async def start_message(query: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()  # never inherit the parts of an abandoned message
     await state.set_state(MessageUser.waiting_for_target)
     await query.answer()
     if query.message:
@@ -286,6 +291,194 @@ async def confirm_message(query: CallbackQuery, state: FSMContext, session: Asyn
         await query.message.answer(texts.ADMIN_MESSAGE_UNREACHABLE.format(handle=handle))
 
 
+class GiftMonths(StatesGroup):
+    waiting_for_target = State()
+    waiting_for_months = State()
+    waiting_for_confirmation = State()
+
+
+#: Offered as gift lengths. Same choices as a special price, and a number may be typed.
+GIFT_MONTH_CHOICES = (1, 2, 3, 6, 12)
+
+
+def _gift_months_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=texts.months_phrase(months), callback_data=f"gift:months:{months}"
+                )
+            ]
+            for months in GIFT_MONTH_CHOICES
+        ]
+    )
+
+
+def _gift_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=texts.ADMIN_GIFT_CONFIRM_YES, callback_data="gift:send")],
+            [InlineKeyboardButton(text=texts.ADMIN_INVITE_CONFIRM_NO, callback_data="gift:cancel")],
+        ]
+    )
+
+
+async def start_gift(query: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()  # never inherit an abandoned walk
+    await state.set_state(GiftMonths.waiting_for_target)
+    await query.answer()
+    if query.message:
+        await query.message.answer(texts.ADMIN_GIFT_ASK_WHO)
+
+
+async def receive_gift_target(
+    message: Message, state: FSMContext, session: AsyncSession, settings: Settings
+) -> None:
+    """Resolve the member, and refuse early if there is nothing to extend."""
+    raw = (message.text or "").strip()
+    if not raw or (not raw.lstrip("-").isdigit() and not normalise_username(raw)):
+        await message.answer(texts.ADMIN_INVITE_BAD_TARGET)
+        return
+
+    user = await _find_user(session, raw)
+    if user is None:
+        await message.answer(texts.ADMIN_INVITE_UNKNOWN)
+        return
+
+    # A gift extends an existing subscription. Somebody who has never run /start has no row to
+    # extend, and inventing one here would duplicate what onboarding does — including the price
+    # decision, which depends on whether they were already in the channel.
+    subscription = await subs.get_subscription(session, user.telegram_id)
+    if subscription is None:
+        await message.answer(texts.ADMIN_GIFT_NO_SUBSCRIPTION)
+        return
+
+    handle = f"@{user.username}" if user.username else f"id {user.telegram_id}"
+    await state.update_data(target_id=user.telegram_id, handle=handle)
+    await state.set_state(GiftMonths.waiting_for_months)
+    await message.answer(
+        texts.ADMIN_GIFT_ASK_MONTHS.format(handle=handle, period=settings.subscription_period_days),
+        reply_markup=_gift_months_keyboard(),
+    )
+
+
+async def _show_gift_confirmation(
+    message: Message, state: FSMContext, session: AsyncSession, *, months: int
+) -> None:
+    """Quote the dates before and after, so a wrong number is visible rather than inferred."""
+    data = await state.get_data()
+    target_id = data.get("target_id")
+    subscription = await subs.get_subscription(session, int(target_id))
+    if subscription is None:
+        await message.answer(texts.ADMIN_GIFT_NO_SUBSCRIPTION)
+        await state.clear()
+        return
+
+    now = utcnow()
+    new_until = subscription.expires_at
+    for _ in range(months):
+        new_until = extend(new_until, now=now, period_days=subscription.period_days)
+
+    body = texts.ADMIN_GIFT_CONFIRM.format(
+        handle=data.get("handle", ""),
+        months=texts.months_phrase(months),
+        status=texts.STATUS_NAMES.get(subscription.status.value, subscription.status.value),
+        until=texts.day(subscription.expires_at),
+        new_until=texts.day(new_until),
+    )
+    if subscription.expires_at <= now:
+        body += texts.ADMIN_GIFT_CONFIRM_LAPSED
+
+    await state.update_data(months=months)
+    await state.set_state(GiftMonths.waiting_for_confirmation)
+    await message.answer(body, reply_markup=_gift_confirm_keyboard())
+
+
+async def choose_gift_months(
+    query: CallbackQuery, state: FSMContext, session: AsyncSession
+) -> None:
+    months = int((query.data or "gift:months:1").rsplit(":", 1)[1])
+    await query.answer()
+    if query.message:
+        await _show_gift_confirmation(query.message, state, session, months=months)
+
+
+async def receive_gift_months(message: Message, state: FSMContext, session: AsyncSession) -> None:
+    """A typed number of months, for a length that is not on a button."""
+    months = parse_months(message.text or "")
+    if months is None:
+        await message.answer(texts.ADMIN_BROADCAST_BAD_PERIOD.format(max_months=MAX_MONTHS))
+        return
+    await _show_gift_confirmation(message, state, session, months=months)
+
+
+async def confirm_gift(
+    query: CallbackQuery, state: FSMContext, session: AsyncSession, settings: Settings
+) -> None:
+    data = await state.get_data()
+    await state.clear()
+    await query.answer()
+    if query.message is None:
+        return
+
+    target_id = data.get("target_id")
+    months = data.get("months")
+    handle = data.get("handle", str(target_id))
+    if target_id is None or not months:
+        await query.message.answer(texts.ADMIN_GRANT_CANCELLED)
+        return
+
+    subscription = await subs.get_subscription(session, int(target_id))
+    if subscription is None:
+        await query.message.answer(texts.ADMIN_GIFT_NO_SUBSCRIPTION)
+        return
+
+    new_until = await subs.gift_months(
+        session,
+        subscription=subscription,
+        months=months,
+        actor_id=query.from_user.id,
+        now=utcnow(),
+    )
+    # Committed before anybody is told: the extension is the thing that matters, and a failed
+    # notification must not roll it back.
+    await session.commit()
+
+    try:
+        await query.bot.send_message(
+            int(target_id),
+            texts.GIFT_RECEIVED.format(club=texts.CLUB_NAME, months=texts.months_phrase(months)),
+        )
+    except TelegramForbiddenError:
+        log.warning("Gifted %s but they are unreachable", target_id)
+
+    # The gift copy says «долучайся за посиланням», so the link has to follow it or the message
+    # promises something that never arrives. Sent after the gift message, so it reads in order.
+    if settings.channel_id:
+        delivered, link = await subs.send_manual_invite(
+            session,
+            query.bot,
+            user_id=int(target_id),
+            actor_id=query.from_user.id,
+            channel_id=settings.channel_id,
+            now=utcnow(),
+            manual=True,
+        )
+        await session.commit()
+        if link is None:
+            await query.message.answer(texts.ADMIN_INVITE_NO_LINK)
+        elif not delivered:
+            await query.message.answer(
+                texts.ADMIN_INVITE_UNREACHABLE.format(handle=handle, link=link)
+            )
+
+    await query.message.answer(
+        texts.ADMIN_GIFT_DONE.format(
+            handle=handle, months=texts.months_phrase(months), new_until=texts.day(new_until)
+        )
+    )
+
+
 def register(router: Router) -> None:
     """Attach to the gated admin router, so ``IsAdmin`` covers all of this too."""
     router.callback_query.register(start_invite, F.data == "admin:send_invite")
@@ -317,3 +510,22 @@ def register(router: Router) -> None:
         confirm_message, F.data == "msg:send", StateFilter(MessageUser.waiting_for_confirmation)
     )
     router.callback_query.register(cancel_from_button, F.data == "msg:cancel")
+
+    router.callback_query.register(start_gift, F.data == "admin:gift_months")
+    for state in (
+        GiftMonths.waiting_for_target,
+        GiftMonths.waiting_for_months,
+        GiftMonths.waiting_for_confirmation,
+    ):
+        router.message.register(cancel_invite, Command("cancel"), StateFilter(state))
+    router.message.register(receive_gift_target, StateFilter(GiftMonths.waiting_for_target))
+    router.callback_query.register(
+        choose_gift_months,
+        F.data.startswith("gift:months:"),
+        StateFilter(GiftMonths.waiting_for_months),
+    )
+    router.message.register(receive_gift_months, StateFilter(GiftMonths.waiting_for_months))
+    router.callback_query.register(
+        confirm_gift, F.data == "gift:send", StateFilter(GiftMonths.waiting_for_confirmation)
+    )
+    router.callback_query.register(cancel_from_button, F.data == "gift:cancel")

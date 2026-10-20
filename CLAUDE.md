@@ -30,7 +30,7 @@ into the payment phase.
 ## Current status
 
 Last updated 2026-10-06. **Working and pushed** (`Serebrianskyi/Chat-bot`, branch `main`),
-deployed on Railway. 43 tests, 9 migrations.
+deployed on Railway. 51 tests, 9 migrations.
 
 ### Built
 
@@ -38,21 +38,24 @@ deployed on Railway. 43 tests, 9 migrations.
 | --- | --- |
 | Onboarding | `/start` registers a member, resolves their price, writes a due date, and invoices on the spot. Two messages: the club pitch, then the tariff carrying the **Стати учасником** pay button |
 | Pricing | 10 EUR base. Three tiers: discounted (list or admin grant), already-in-the-channel, new joiner |
+| Gifted months | 🎁 Подарувати місяць: name the member → months (1/2/3/6/12 by button, any number by typing) → confirmation quoting the date **before and after** → the member is told it is a gift. Extends with the same `extend()` a payment uses, so a gift is **added** to a paid date and never overwrites it; `free_period_granted` is untouched, since the onboarding free period is a different thing. The member gets the owner's own `SPEC` wording, then the channel invite — the copy says «долучайся за посиланням», so the link has to follow or it promises something that never arrives. Writes `subscription.extended` with `gift: true` and the admin as actor, plus `invite.sent`. Requires an existing subscription — somebody who has never run `/start` has no row to extend |
 | Free period | Ends on `FREE_PERIOD_UNTIL` — one shared date, not 30 days per person. Set to 2026-11-01 Kyiv. After it, nobody gets one. The 17 free-basis members are on it: status **Пробна підписка**, first payment due 01.11.2026, each keeping their own 8/10 EUR tariff. Migration `e8c5a1f3d209` moved the ones who had been onboarded as ordinary joiners |
 | Founding members | 17 usernames seeded by migration with their 8/10 EUR price and a free first period. Idempotent across deploys |
 | Discounts | Percent or fixed price, optional expiry, soft revocation. The charged amount is computed **per invoice**, so a time-limited discount actually ends |
 | WayForPay | `CREATE_INVOICE`, then `CHECK_STATUS` polled every 2 min. Signature verified both ways, amount checked against the invoice, idempotent on a repeated `Approved` |
 | Channel invite | Single-use, 3-day link on a confirmed payment. Every failure path tells the member something true and alerts an admin. An admin can also send one by hand from the panel, for a member the automatic path missed |
-| Due dates | Daily job at 09:00 Kyiv invoices whoever has come due, then alerts an admin if still unpaid |
+| Renewal reminder | Daily at 09:30 Kyiv, one day before a period ends. A member with a stored card is told to check their balance («Завтра відбудеться автоматичне списання»); one without is told they must pay and gets a live link, which today is everybody. Fires once per period via `last_reminder_at` (G3.7) |
+| Declined charges | Two attempts, a day apart. First decline: «🚫 Платіж відхилено … Наступна спроба: <tomorrow>». Second: «🚫 Підписка скасована … Дата закінчення: <today>» — `expires_at` becomes now, status `cancelled`, and the stored card is forgotten so nothing can be charged again. Replaces charging a failing card every morning for ever |
+| Renewals | **Inert today — no token can be obtained; see `docs/telegram-bot-payments-design.md` §1a.** Daily at 09:00 Kyiv: a member with a stored `recToken` is **charged** (`CHARGE`, synchronous, signature-verified, amount computed per charge from their own price); one without gets a payment link as before. This is what finally makes `PAYMENT_FIRST_CONFIRMED`'s «оплата автоматична» true. A declined card is told `CHARGE_FAILED` and not retried for `RETRY_AFTER_HOURS`, so the copy's «через 24 години» is the behaviour. A renewal sends no invite — they are already in the channel. The `payments` row is written **before** the charge, so a charge that takes money and loses the connection is still reconcilable |
 | Recovery report | After the daily sweep, admins get **one** message: who had a payment recovered, who was sent a link, and who still needs a person — each with a tap-to-copy id and the reason. Built from `audit_log`, so it reports what was recorded, not what was attempted. A failed step is named. Nothing to report means no message |
 | Invite recovery | Daily at **11:00 Warsaw** (12:00 Kyiv), as part of the recovery sweep: finds paid members who are not in the channel and sends one retry. If that does not get them in, an admin is told directly — handle, id, name, reason — and the member is not touched again. Scope is everyone holding paid access, **plus** anyone with a confirmed payment who has never been sent a link at all, even if their period has lapsed — otherwise a payer whose invite failed drops out of scope when their month runs out. A free trial is **not** a payment: TRIAL subscriptions are never messaged by it |
 | Reconciliation | Re-asks WayForPay about orders this bot wrote off and credits the ones really paid, with their invites. Runs daily at 11:00 Warsaw inside `recover_access`, and by hand as `run_jobs reconcile` (a dry run until `--apply`) or `run_jobs recover` (the whole sweep, forced past the daily guard). Only members who currently have **no** access are in scope, so a hand-written credit cannot be doubled, and one member is credited at most once per sweep |
-| Admin panel | 🎟 Знижки · 🎁 Надати знижку · 👥 Учасники · 🔗 Надіслати запрошення · ✍️ Написати учаснику (admin dictates, the bot delivers — the only way to reach a member with no username) · 📣 Розсилка · 📢 Написати в канал. The other four answer "later". 👥 Учасники opens on counts with a button per group — 🔄 автопродовження · ⏹ скасували автопродовження · 🎁 пробний період · ⏳ очікують оплати · ♾ безстрокові · ❓ без підписки — so it stays one message as the club grows; tapping a group lists only that group, naming people without a username by their first name |
+| Admin panel | 🎟 Знижки · 🎁 Надати знижку · 👥 Учасники · 🔗 Надіслати запрошення · ✍️ Написати учаснику (admin dictates, the bot delivers — the only way to reach a member with no username) · 🎁 Подарувати місяць · 📣 Розсилка · 📢 Написати в канал. The other four answer "later". 👥 Учасники opens on counts with a button per group — 🔄 автопродовження · ⏹ скасували автопродовження · 🎁 пробний період · ⏳ очікують оплати · ♾ безстрокові · ❓ без підписки — so it stays one message as the club grows; tapping a group lists only that group, naming people without a username by their first name |
 | Member area | `/subscription` with status, next amount and date; **Скасувати автопродовження** keeps the paid period |
 | Copy | All Ukrainian, all in `texts.py`. Owner-supplied strings marked `SPEC` |
-| Broadcast | 📣 Розсилка: pick a group (the same groups 👥 Учасники uses) → write the text → choose the price the link will charge (💰 звичайна, or 🎟 спеціальна: a sum like `8` or a percentage like `20%`, lasting 1/2/3/6/12 months by button, any number of months up to 60 by typing it, or without limit — months, because the club bills monthly, converted to `months × period_days` so a price always covers whole billing periods) → **see it rendered exactly as it will arrive — including the pay message as its own second message, button in place** → confirm. A special price is applied by granting each recipient a real `Discount`, so it flows through `effective_price` like every other price, shows up in 🎟 Знижки and is revocable — and because the rule is one active discount per person, the preview says how many existing discounts it would replace. For ⏳ Очікують оплати each recipient also gets a second message with its own **Долучитися до Клубу** button and their own live invoice — worded differently from the `/start` button on purpose, since the text alone gives them no way to act. Held to 20 messages/second, honours `RetryAfter` without skipping or duplicating anybody (rule 10). One `audit_log` row per broadcast, carrying the audience, the text and the photo `file_id`. A post is **composed from as many messages as the admin sends** — text, photo, photo with caption, in any order — ended with «✅ Готово» and delivered in that order. Several messages because a long post with a picture cannot be one Telegram message: attaching a photo drops the ceiling from 4096 characters to 1024. Each part is checked against its own ceiling and refused with the numbers and by how much to cut, since a Premium account can type a caption longer than a bot may send and gets no warning of its own; the send path still splits picture-then-words as a last resort. The pay button goes on the **last** part; collecting several messages into one broadcast is **parked** (see below). ♾ Безстрокові takes the identical flow — price step, real invoice, real button — because that group is the owner's own account and is therefore how a campaign gets rehearsed before members see it |
+| Broadcast | 📣 Розсилка: pick a group (the same groups 👥 Учасники uses) → write the text → choose the price the link will charge (💰 звичайна, or 🎟 спеціальна: a sum like `8` or a percentage like `20%`, lasting 1/2/3/6/12 months by button, any number of months up to 60 by typing it, or without limit — months, because the club bills monthly, converted to `months × period_days` so a price always covers whole billing periods) → **see it rendered exactly as it will arrive — including the pay message as its own second message, button in place** → confirm. A special price is applied by granting each recipient a real `Discount`, so it flows through `effective_price` like every other price, shows up in 🎟 Знижки and is revocable — and because the rule is one active discount per person, the preview says how many existing discounts it would replace. For ⏳ Очікують оплати each recipient also gets a second message with its own **Долучитися до Клубу** button and their own live invoice — worded differently from the `/start` button on purpose, since the text alone gives them no way to act. Held to 20 messages/second, honours `RetryAfter` without skipping or duplicating anybody (rule 10). One `audit_log` row per broadcast, carrying the audience, the text and the photo `file_id`. A post is **composed from as many messages as the admin sends** — text, photo, photo with caption, in any order — ended with «✅ Готово» and delivered in that order — nothing but Готово ends the collecting step, so the order the parts are sent in is the only thing that matters. Every one of these screens clears its FSM state on entry: an abandoned draft used to be inherited by the next broadcast and could be re-sent to a different audience. Several messages because a long post with a picture cannot be one Telegram message: attaching a photo drops the ceiling from 4096 characters to 1024. Each part is checked against its own ceiling and refused with the numbers and by how much to cut, since a Premium account can type a caption longer than a bot may send and gets no warning of its own; the send path still splits picture-then-words as a last resort. The pay button goes on the **last** part; collecting several messages into one broadcast is **parked** (see below). ♾ Безстрокові takes the identical flow — price step, real invoice, real button — because that group is the owner's own account and is therefore how a campaign gets rehearsed before members see it |
 | Channel posts | 📢 Написати в канал: the bot publishes an admin's text in the private channel, with the same preview-then-confirm step, so the club can speak there as well as read |
-| Operator tools | `scripts/discounts.py`, `scripts/run_jobs.py` (`status` is read-only), `scripts/diagnose.py` (read-only: `access` tells a bot failure from a member who never used their link, `reasons` groups what WayForPay actually said), `scripts/start.sh` |
+| Operator tools | `scripts/discounts.py`, `scripts/run_jobs.py` (`status` is read-only), `scripts/diagnose.py` (read-only: `access` tells a bot failure from a member who never used their link, `invites` the link history, `reasons` groups what WayForPay said, `order <ref>` dumps one stored body with the signature withheld, `fields` lists every field received and whether the code reads it), `scripts/start.sh` |
 
 ### Live configuration
 
@@ -66,17 +69,14 @@ is a comparison against `expires_at`.
 
 ### Not built — in the order I would do it
 
-1. **Automatic renewals** (`CHARGE` with the stored `recToken`). **This is the most important gap,
-   because the copy already promises it**: `PAYMENT_FIRST_CONFIRMED` tells a paying member
-   «оплата автоматична». Today a renewal requires them to tap a link again, so the bot is saying
-   something that is not yet true. The token is captured; the charging is not written.
-2. **Removal of non-payers.** Five `TODO(removal)` markers mark the exact spot. Deliberately
+The working order lives in [docs/plan-2026-10-20.md](docs/plan-2026-10-20.md); this is the summary.
+
+1. **Removal of non-payers.** Five `TODO(removal)` markers mark the exact spot. Deliberately
    deferred until the payment path has been exercised with real money; an admin is alerted instead.
-3. **Renewal reminder**, one day before the charge. Copy exists (`RENEWAL_REMINDER`), no job.
-4. **Knowledge base** (plan Phase 2) — 10 TODOs; category names already in `texts.py`.
-5. **Networking catalogue** (plan Phase 6) — 6 TODOs; card layout already in `texts.py`.
-6. **Statistics** (plan Phase 7). Broadcasts are built — see the table above; statistics are not.
-7. **Webhooks, Sentry, uptime monitoring, backups** (plan Phase 4) — 7 TODOs. Polling is in use;
+2. **Knowledge base** (plan Phase 2) — 10 TODOs; category names already in `texts.py`.
+3. **Networking catalogue** (plan Phase 6) — 6 TODOs; card layout already in `texts.py`.
+4. **Statistics** (plan Phase 7). Broadcasts are built — see the table above; statistics are not.
+5. **Webhooks, Sentry, uptime monitoring, backups** (plan Phase 4) — 7 TODOs. Polling is in use;
    a webhook needs a public HTTPS endpoint.
 
 ### Real money: one payment taken, confirmation never delivered
@@ -157,16 +157,21 @@ These are the standing gate plus the invariants the plan's risk table depends on
    the expiry or renewal job twice must change nothing the second time.
 6. **Store raw payment responses.** Every `CHECK_STATUS` / `CHARGE` response body is persisted
    and searchable by `order_reference`, before any business logic runs.
-7. **Only `complete` grants access.** `InProcessing` neither grants nor fails — keep polling.
+7. **A `recToken` is captured from any gateway body that carries one**, before every other
+   decision in `apply_payment_result` — including a body whose amount is refused, and a repeat
+   answer about an already-settled order. A token is not access: storing one grants nothing, so
+   nothing gates it. It used to be written only on the transition to `complete`, which discarded
+   tokens arriving any other way, and the whole renewal feature hangs on noticing that field.
+8. **Only `complete` grants access.** `InProcessing` neither grants nor fails — keep polling.
    `refunded` and `reversed` revoke. Verify `amount` and `currency` against *that user's* price,
    since pricing is per user. See `docs/telegram-bot-payments-design.md`.
-8. **Migrations accompany schema changes.** Any change to `db/models.py` ships with an Alembic
+9. **Migrations accompany schema changes.** Any change to `db/models.py` ships with an Alembic
    migration that upgrades from the previous head (S7).
-9. **No silent failures.** A global error handler gives the user a friendly message; the
+10. **No silent failures.** A global error handler gives the user a friendly message; the
    exception goes to Sentry. Silence is a gate failure (S8).
-10. **Respect Telegram rate limits.** Broadcasts stay at or under 20 messages/second and honour
+11. **Respect Telegram rate limits.** Broadcasts stay at or under 20 messages/second and honour
    `RetryAfter` without skipping or duplicating recipients.
-11. **Tests are deliberately few.** One file, `tests/test_core.py`, capped at about **30
+12. **Tests are deliberately few.** One file, `tests/test_core.py`, capped at about **30
     tests**. Owner's decision on 2026-10-02: unit testing was costing more than it caught.
     - Add a test only for a path where a bug costs **money, access or trust**: signature
       construction, idempotent payment handling, the admin gate, discount arithmetic and
@@ -177,9 +182,9 @@ These are the standing gate plus the invariants the plan's risk table depends on
       new family of tests around it.
     - Never let the suite touch the network. The WayForPay client is injected, so tests get a
       fake; a real one built from test credentials once made the suite call the live gateway.
-12. **README and `.env.example` updated** whenever run instructions, env vars or commands
+13. **README and `.env.example` updated** whenever run instructions, env vars or commands
     change (S10).
-13. **The bot speaks Ukrainian, and every string lives in `texts.py`.** Never write member-facing
+14. **The bot speaks Ukrainian, and every string lives in `texts.py`.** Never write member-facing
     copy inline in a handler or service. Strings marked `SPEC` are the client's own wording —
     quote them exactly and do not "improve" them; raise a copy question instead. Sums are
     rendered by `texts.money` («300 грн»), dates by `texts.day` («31.12.2026»).

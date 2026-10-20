@@ -184,9 +184,29 @@ PAYMENT_FIRST_CONFIRMED = (
 
 #: SPEC — reminder one day before the automatic charge.
 RENEWAL_REMINDER = (
-    "Завтра відбудеться автоматичне продовження вашої підписки на {club}. "
-    "Сума <b>{amount}</b> буде списана з вашої картки. "
-    "Переконайтеся, що на картці достатньо коштів!"
+    "Вітаю! Завтра відбудеться автоматичне списання за продовження вашої підписки у Клубі. "
+    "Перевірте, щоб платіжна картка мала достатньо коштів для автоплатежу"
+)
+
+#: Mine, not the owner's — flagged so it gets replaced. Sent the day before expiry to a member
+#: with **no** stored card, where nothing will be charged automatically and they have to pay by
+#: hand. Today that is everybody, because no token can be obtained
+#: (docs/telegram-bot-payments-design.md §1a), so this is the reminder that actually goes out.
+RENEWAL_MANUAL_DUE = (
+    "Вітаю! Завтра завершується ваша підписка у {club}.\n"
+    "Вартість продовження: {amount} за {period} днів.\n\n"
+    "Оплатити можна кнопкою нижче — автоматичне списання поки не підключене."
+)
+
+#: SPEC — the first failed charge. Owner's wording, 2026-10-20. One more attempt follows, the
+#: day after, and the date is spelled out so nobody has to guess.
+CHARGE_DECLINED_FIRST = (
+    "🚫 <b>Платіж відхилено</b>\n\n{club}\nВартість: {amount}/міс\nНаступна спроба: {retry_on}"
+)
+
+#: SPEC — the second failed charge. Two attempts is the limit; the subscription ends today.
+CHARGE_DECLINED_FINAL = (
+    "🚫 <b>Підписка скасована</b>\n\n{club}\nВартість: {amount}/міс\nДата закінчення: {until}"
 )
 
 #: SPEC — the second reminder, after a failed automatic charge.
@@ -311,6 +331,7 @@ ADMIN_MENU_GRANT_DISCOUNT = "🎁 Надати знижку"
 ADMIN_MENU_SEND_INVITE = "🔗 Надіслати запрошення"
 ADMIN_MENU_MESSAGE_USER = "✍️ Написати учаснику"
 ADMIN_MENU_CHANNEL_POST = "📢 Написати в канал"
+ADMIN_MENU_GIFT_MONTHS = "🎁 Подарувати місяць"
 
 # --- the participants list ---
 #
@@ -547,6 +568,58 @@ ADMIN_MESSAGE_EMPTY = "Повідомлення порожнє. Напишіть
 #: How an admin's message arrives for the member. Marked as coming from a person, not the bot:
 #: a bare forwarded string reads like an automated notice and gets ignored.
 MESSAGE_FROM_ADMIN = "Повідомлення від адміністратора {club}:\n\n{text}"
+
+# --- 🎁 Подарувати місяць (admin extends a member's access for free) ------------------------
+#
+# `FREE_PERIOD_UNTIL` closes on 2026-11-01, after which `/start` grants nobody a free period and
+# every gift would otherwise be hand-written SQL against production: no audit row, and a real
+# chance of overwriting a date the member has already paid for.
+
+ADMIN_GIFT_ASK_WHO = (
+    "Кому подарувати безкоштовний період?\n\n"
+    "Надішліть @username або числовий id.\n"
+    "Щоб скасувати — /cancel"
+)
+
+ADMIN_GIFT_ASK_MONTHS = (
+    "Скільки місяців подарувати {handle}?\n\n"
+    "Оберіть кнопкою або надішліть число.\n"
+    "Один місяць — це один розрахунковий період ({period} днів)."
+)
+
+ADMIN_GIFT_CONFIRM = (
+    "Подарувати {handle} {months}?\n\n"
+    "Підписка: {status}\n"
+    "Зараз діє до: {until}\n"
+    "Після подарунка: <b>{new_until}</b>\n\n"
+    "Оплати не потрібно — доступ просто продовжиться."
+)
+
+#: The member has no access at all right now, so the gift starts today rather than extending
+#: something. Said out loud because the resulting date surprises otherwise.
+ADMIN_GIFT_CONFIRM_LAPSED = "\n⚠️ Підписка не активна, тому подарунок рахується від сьогодні."
+
+ADMIN_GIFT_CONFIRM_YES = "🎁 Подарувати"
+ADMIN_GIFT_DONE = (
+    "✅ Подаровано {months}: {handle} — доступ до {new_until}\n"
+    "Посилання на канал надіслано разом з подарунком."
+)
+ADMIN_GIFT_NO_SUBSCRIPTION = (
+    "У цього учасника немає підписки. Попросіть його відкрити бота — "
+    "після /start підписка з’явиться, і тоді можна дарувати."
+)
+
+#: SPEC — the owner's own wording, first person and informal. Do not "improve" it.
+#:
+#: It says «долучайся за посиланням», so the gift **must** be followed by the channel invite or
+#: the message promises something that never arrives. ``handlers.invites.confirm_gift`` sends it.
+#:
+#: ``{months}`` is agreed by ``months_phrase`` — the owner wrote "1 місяць", but a gift can be
+#: any length, and «на 2 місяць» would read as broken software.
+GIFT_RECEIVED = (
+    "Привіт! Це твій невеличкий подарунок від мене — доступ у {club} на {months}. "
+    "Буду дуже рада тебе бачити, долучайся за посиланням🥹"
+)
 
 # --- 📣 Розсилка (admin writes to a group of members) ----------------------------------------
 #

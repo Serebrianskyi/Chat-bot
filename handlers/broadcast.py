@@ -149,7 +149,11 @@ async def _members_of(session: AsyncSession, key: str) -> list[int]:
 # --- 📣 Розсилка -----------------------------------------------------------------------------
 
 
-async def start_broadcast(query: CallbackQuery, session: AsyncSession) -> None:
+async def start_broadcast(query: CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    # Cleared first, always. An admin who starts composing and walks away leaves their parts in
+    # the FSM; without this the next broadcast would silently inherit them and could re-send the
+    # abandoned post to a different audience.
+    await state.clear()
     rows = (
         await session.execute(
             select(User, Subscription).outerjoin(
@@ -476,6 +480,7 @@ async def confirm_broadcast(
 
 
 async def start_channel_post(query: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()  # never inherit an abandoned post — see start_broadcast
     await state.set_state(ChannelPost.waiting_for_text)
     await query.answer()
     if query.message:

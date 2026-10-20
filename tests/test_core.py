@@ -30,6 +30,7 @@ from db.models import (
 )
 from db.session import create_engine
 from services import discounts as discount_service
+from services import subscriptions as subs
 from services.billing import BillingConfig, poll_open_payments, process_due_subscriptions
 from services.pricing import decide_price, extend, first_expiry
 from services.wayforpay import (
@@ -386,6 +387,77 @@ def test_the_request_signature_matches_the_documented_field_order():
     assert sign("secret", fields) == expected
 
 
+async def test_the_charge_request_is_signed_the_documented_way_and_carries_the_token():
+    """CHARGE moves money with no human present, so its request is the one to get right.
+
+    The signature is computed here from the documented field list (payments design §2) rather
+    than from the code's own ordering, which would pass even if that ordering were wrong. Note
+    `recToken` is **not** part of it — it travels in the payload only.
+    """
+    import hashlib
+    import hmac
+    import json
+
+    import httpx
+
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        body = {
+            "merchantAccount": "acct",
+            "orderReference": "o-renew",
+            "amount": "300.00",
+            "currency": "UAH",
+            "authCode": "7",
+            "cardPan": "44**",
+            "transactionStatus": "Approved",
+            "reasonCode": "1100",
+            "recToken": "tok-next",
+        }
+        body["merchantSignature"] = hmac.new(
+            b"secret",
+            ";".join(str(body.get(f, "")) for f in RESPONSE_SIGNATURE_FIELDS).encode(),
+            hashlib.md5,
+        ).hexdigest()
+        return httpx.Response(200, json=body)
+
+    client = WayForPayClient(
+        merchant_account="acct",
+        merchant_domain="example.com",
+        secret_key="secret",  # noqa: S106
+        transport=httpx.MockTransport(handler),
+    )
+
+    result = await client.charge(
+        order_reference="o-renew",
+        order_date=100,
+        amount=Decimal("300"),
+        currency="UAH",
+        product_name="Sub",
+        rec_token="tok-abc",  # noqa: S106
+    )
+
+    assert captured["transactionType"] == "CHARGE"
+    assert captured["recToken"] == "tok-abc"  # in the payload...
+    # Mandatory for CHARGE and not for CREATE_INVOICE; the request is rejected without them.
+    assert captured["merchantTransactionType"] == "SALE"
+    # Nobody is present at a renewal, so a 3-D Secure challenge could never be answered.
+    assert captured["merchantTransactionSecureType"] == "NON3DS"
+    expected = hmac.new(
+        b"secret",
+        ";".join(
+            ["acct", "example.com", "o-renew", "100", "300.00", "UAH", "Sub", "1", "300.00"]
+        ).encode(),
+        hashlib.md5,
+    ).hexdigest()
+    assert captured["merchantSignature"] == expected  # ...and not in the signature
+    # The answer is synchronous: no polling, and a fresh token for the period after this one.
+    assert result.status is PaymentStatus.COMPLETE
+    assert result.amount == Decimal("300.00")
+    assert result.rec_token == "tok-next"
+
+
 def test_a_tampered_response_is_refused():
     """The amount is the one field an attacker would change."""
     import hashlib
@@ -434,6 +506,8 @@ class FakeGateway:
         self.invoice_calls = []
         self.status_calls = []
         self.status_result = None
+        self.charge_calls = []
+        self.charge_result = None
 
     async def create_invoice(self, **kw):
         from services.wayforpay import Invoice
@@ -449,6 +523,12 @@ class FakeGateway:
         self.status_calls.append(order_reference)
         return self.status_result
 
+    async def charge(self, **kw):
+        self.charge_calls.append(kw)
+        if self.charge_result is None:
+            raise AssertionError("charge() called but no charge_result was set")
+        return self.charge_result
+
 
 def approved(order_ref, amount=REGULAR_PRICE, currency=CURRENCY):
     from services.wayforpay import TransactionStatus
@@ -462,6 +542,22 @@ def approved(order_ref, amount=REGULAR_PRICE, currency=CURRENCY):
         reason_code="1100",
         rec_token="tok",  # noqa: S106
         raw={"transactionStatus": "Approved"},
+    )
+
+
+def declined(order_ref, amount=REGULAR_PRICE, currency=CURRENCY):
+    """A card that was really refused: it comes back with the amount and a masked card."""
+    from services.wayforpay import TransactionStatus
+
+    return TransactionStatus(
+        order_reference=order_ref,
+        status=PaymentStatus.DENIED,
+        gateway_status="Declined",
+        amount=amount,
+        currency=currency,
+        reason_code="1104",
+        rec_token=None,
+        raw={"transactionStatus": "Declined", "amount": str(amount), "cardPan": "44**"},
     )
 
 
@@ -507,6 +603,53 @@ async def test_a_confirmed_payment_extends_access_exactly_once(session_factory, 
     assert sub.expires_at == first
     assert sub.status is SubscriptionStatus.ACTIVE
     assert sub.wayforpay_rec_token == "tok"
+
+
+async def test_a_rectoken_is_captured_from_any_body_that_carries_one(session_factory, bot, config):
+    """The whole renewal feature hangs on noticing this one field.
+
+    It used to be stored only on the transition to COMPLETE, so a token arriving in a later
+    CHECK_STATUS of a settled order — or alongside an amount we refused — was read and thrown
+    away. A token is not access: storing one grants nothing, so nothing should gate it.
+    """
+    await seed_due(session_factory)
+    gw = FakeGateway()
+    await process_due_subscriptions(
+        session_factory, gw, bot, admin_ids=frozenset({ADMIN_ID}), config=config, now=NOW
+    )
+    ref = (await one_payment(session_factory)).order_reference
+
+    # First: a refused amount. Access is correctly withheld — but the token still lands.
+    gw.status_result = approved(ref, amount=Decimal("1.00"))
+    gw.status_result.rec_token = "tok-from-a-refused-body"  # noqa: S105 - fake
+    await poll_open_payments(session_factory, gw, bot, config=config, now=NOW)
+
+    sub = await load_sub(session_factory)
+    assert sub.expires_at == NOW  # not extended: the amount was wrong
+    assert sub.wayforpay_rec_token == "tok-from-a-refused-body"  # ...and yet captured
+
+    # Then a settled order asked about again, carrying a fresh token for the next period. Driven
+    # directly, because a `complete` row is deliberately outside the poll query — which is
+    # exactly the case where the token used to be discarded.
+    async with session_factory() as session:
+        payment = await session.scalar(select(Payment))
+        payment.status = PaymentStatus.COMPLETE
+        extended = await subs.apply_payment_result(
+            session,
+            payment=payment,
+            status=PaymentStatus.COMPLETE,
+            gateway_status="Approved",
+            amount=REGULAR_PRICE,
+            currency=CURRENCY,
+            reason_code="1100",
+            rec_token="tok-renewed",  # noqa: S106 - fake
+            raw={"transactionStatus": "Approved"},
+            now=NOW,
+        )
+        await session.commit()
+
+    assert extended is False  # idempotency intact: a settled order grants nothing twice
+    assert (await load_sub(session_factory)).wayforpay_rec_token == "tok-renewed"
 
 
 async def test_a_wrong_amount_is_refused(session_factory, bot, config):
@@ -985,6 +1128,228 @@ async def test_the_daily_sweep_reports_once_and_will_not_repeat_on_the_next_depl
         now=NOW + RECOVERY_MIN_INTERVAL + timedelta(minutes=1),
     )
     assert "skipped" not in tomorrow
+
+
+async def test_a_stored_card_is_charged_instead_of_being_asked_to_pay(
+    session_factory, bot, config, recording_session
+):
+    """Automatic renewals — the promise `PAYMENT_FIRST_CONFIRMED` has been making all along.
+
+    «оплата автоматична» was untrue until this existed: a member with a card on file was sent a
+    payment link every morning like everybody else. With a `recToken` the money is now taken.
+    """
+    await seed_due(session_factory, overdue_days=1)
+    async with session_factory() as session:
+        sub = await session.scalar(select(Subscription))
+        sub.wayforpay_rec_token = "tok-abc"  # noqa: S105 - a fake token in a test
+        await session.commit()
+
+    gw = FakeGateway()
+    gw.charge_result = approved("will-be-overwritten")
+
+    counts = await process_due_subscriptions(
+        session_factory, gw, bot, admin_ids=frozenset({ADMIN_ID}), config=config, now=NOW
+    )
+
+    # Charged, not invoiced: no payment link was created or sent.
+    assert counts["renewed"] == 1
+    assert counts["invoiced"] == 0
+    assert gw.invoice_calls == []
+    assert len(gw.charge_calls) == 1
+    assert gw.charge_calls[0]["rec_token"] == "tok-abc"
+    assert gw.charge_calls[0]["amount"] == REGULAR_PRICE  # this member's own price
+
+    sub = await load_sub(session_factory)
+    assert sub.expires_at == NOW + timedelta(days=PERIOD_DAYS)
+    assert sub.status is SubscriptionStatus.ACTIVE
+    # A renewal is not a first payment: they are already in the channel, so no invite is made.
+    assert recording_session.of_type("CreateChatInviteLink") == []
+    to_member = [c for c in recording_session.of_type("SendMessage") if c.chat_id == USER_ID]
+    assert any("продовжено" in c.text for c in to_member)
+
+    # Running the job again the same day changes nothing: expires_at is in the future now.
+    again = await process_due_subscriptions(
+        session_factory, gw, bot, admin_ids=frozenset({ADMIN_ID}), config=config, now=NOW
+    )
+    assert again["renewed"] == 0
+    assert len(gw.charge_calls) == 1
+
+
+async def test_a_declined_card_is_not_charged_again_the_same_day(
+    session_factory, bot, config, recording_session
+):
+    """`CHARGE_FAILED` promises «спробуємо ще раз через 24 години».
+
+    Without the guard the daily job would charge a failing card every morning — and worse, a
+    manual run would charge it again minutes later. The copy and the behaviour have to agree.
+    """
+    from services.billing import CHARGE_RETRY_AFTER
+
+    await seed_due(session_factory, overdue_days=1)
+    async with session_factory() as session:
+        sub = await session.scalar(select(Subscription))
+        sub.wayforpay_rec_token = "tok-abc"  # noqa: S105 - a fake token in a test
+        await session.commit()
+
+    gw = FakeGateway()
+    gw.charge_result = declined("will-be-overwritten")
+
+    first = await process_due_subscriptions(
+        session_factory, gw, bot, admin_ids=frozenset({ADMIN_ID}), config=config, now=NOW
+    )
+    assert first["charge_failed"] == 1
+    assert len(gw.charge_calls) == 1
+    # Told what happened and when the retry is, not left guessing.
+    to_member = [c for c in recording_session.of_type("SendMessage") if c.chat_id == USER_ID]
+    assert any("Платіж відхилено" in c.text for c in to_member)
+    assert any("Наступна спроба" in c.text for c in to_member)
+    # Access is not revoked on the spot — grace runs first.
+    sub = await load_sub(session_factory)
+    assert sub.status is SubscriptionStatus.PAST_DUE
+    assert sub.grace_until is not None
+
+    # An hour later: no second attempt.
+    await process_due_subscriptions(
+        session_factory,
+        gw,
+        bot,
+        admin_ids=frozenset({ADMIN_ID}),
+        config=config,
+        now=NOW + timedelta(hours=1),
+    )
+    assert len(gw.charge_calls) == 1
+
+    # After the promised wait: tried again.
+    gw.charge_result = approved("will-be-overwritten")
+    await process_due_subscriptions(
+        session_factory,
+        gw,
+        bot,
+        admin_ids=frozenset({ADMIN_ID}),
+        config=config,
+        now=NOW + CHARGE_RETRY_AFTER + timedelta(minutes=1),
+    )
+    assert len(gw.charge_calls) == 2
+
+
+async def test_two_declines_cancel_the_subscription_and_say_so(
+    session_factory, bot, config, recording_session
+):
+    """Owner's policy, 2026-10-20: declined once says «Наступна спроба», twice says «скасована».
+
+    What this replaces is worse than it sounds — the previous behaviour charged a failing card
+    every morning for ever, telling the member each time that it would try again.
+    """
+    from services.billing import CHARGE_RETRY_AFTER, MAX_CHARGE_ATTEMPTS
+
+    assert MAX_CHARGE_ATTEMPTS == 2
+
+    await seed_due(session_factory, overdue_days=1)
+    async with session_factory() as session:
+        sub = await session.scalar(select(Subscription))
+        sub.wayforpay_rec_token = "tok-abc"  # noqa: S105 - a fake token in a test
+        await session.commit()
+
+    gw = FakeGateway()
+    gw.charge_result = declined("ignored")
+
+    # Strike one: told the date of the next attempt, access untouched.
+    await process_due_subscriptions(
+        session_factory, gw, bot, admin_ids=frozenset({ADMIN_ID}), config=config, now=NOW
+    )
+    first = [c.text for c in recording_session.of_type("SendMessage") if c.chat_id == USER_ID]
+    assert any("Платіж відхилено" in t for t in first)
+    assert any(texts.day(NOW + CHARGE_RETRY_AFTER) in t for t in first)
+    sub = await load_sub(session_factory)
+    assert sub.status is SubscriptionStatus.PAST_DUE
+    assert sub.wayforpay_rec_token == "tok-abc"  # still on file for the retry
+
+    # Strike two, a day later: cancelled, access ends today, card forgotten.
+    recording_session.calls.clear()
+    tomorrow = NOW + CHARGE_RETRY_AFTER + timedelta(minutes=1)
+    await process_due_subscriptions(
+        session_factory, gw, bot, admin_ids=frozenset({ADMIN_ID}), config=config, now=tomorrow
+    )
+    second = [c.text for c in recording_session.of_type("SendMessage") if c.chat_id == USER_ID]
+    assert any("Підписка скасована" in t for t in second)
+    assert any(texts.day(tomorrow) in t for t in second)
+
+    sub = await load_sub(session_factory)
+    assert sub.status is SubscriptionStatus.CANCELLED
+    assert sub.expires_at == tomorrow  # access ends today, as the message says
+    # The card is forgotten, so nothing can be charged again by accident.
+    assert sub.wayforpay_rec_token is None
+
+    async with session_factory() as session:
+        entry = await session.scalar(
+            select(AuditLog).where(AuditLog.action == "subscription.cancelled")
+        )
+    assert entry.details["reason"] == "card declined"
+
+    # And it stops there: no third attempt, because there is no token left to charge.
+    recording_session.calls.clear()
+    charges = len(gw.charge_calls)
+    await process_due_subscriptions(
+        session_factory,
+        gw,
+        bot,
+        admin_ids=frozenset({ADMIN_ID}),
+        config=config,
+        now=tomorrow + CHARGE_RETRY_AFTER + timedelta(minutes=1),
+    )
+    assert len(gw.charge_calls) == charges
+
+
+async def test_the_day_before_reminder_differs_by_whether_a_card_is_on_file(
+    session_factory, bot, config, recording_session
+):
+    """Two different things are about to happen, so two different warnings.
+
+    With a card: money will be taken on its own. Without: nothing will be, and the member has to
+    pay by hand — which today is everybody, so the reminder has to carry a link or it is useless.
+    """
+    from services.billing import send_renewal_reminders
+
+    other_id = USER_ID + 51
+    await seed_due(session_factory, overdue_days=-1)  # expires tomorrow
+    async with session_factory() as session:
+        sub = await session.scalar(select(Subscription))
+        sub.status = SubscriptionStatus.ACTIVE
+        sub.wayforpay_rec_token = "tok-abc"  # noqa: S105 - a fake token in a test
+        session.add(User(telegram_id=other_id, username="nocard"))
+        session.add(
+            Subscription(
+                user_id=other_id,
+                status=SubscriptionStatus.ACTIVE,
+                price=REGULAR_PRICE,
+                currency=CURRENCY,
+                price_tier=PriceTier.REGULAR,
+                period_days=PERIOD_DAYS,
+                started_at=NOW - timedelta(days=PERIOD_DAYS),
+                expires_at=NOW + timedelta(hours=12),
+            )
+        )
+        await session.commit()
+
+    gw = FakeGateway()
+    counts = await send_renewal_reminders(session_factory, gw, bot, config=config, now=NOW)
+
+    assert (counts["automatic"], counts["manual"]) == (1, 1)
+    with_card = [c for c in recording_session.of_type("SendMessage") if c.chat_id == USER_ID]
+    no_card = [c for c in recording_session.of_type("SendMessage") if c.chat_id == other_id]
+    assert "автоматичне списання" in with_card[0].text
+    assert with_card[0].reply_markup is None  # nothing to tap: it happens by itself
+    # The one who must pay by hand gets a usable link, not a description of one.
+    assert no_card[0].reply_markup.inline_keyboard[0][0].url
+    assert len(gw.invoice_calls) == 1
+
+    # Runs daily, so it must not warn the same member every morning (G3.7).
+    recording_session.calls.clear()
+    again = await send_renewal_reminders(
+        session_factory, gw, bot, config=config, now=NOW + timedelta(hours=2)
+    )
+    assert again["skipped"] == 2
+    assert recording_session.of_type("SendMessage") == []
 
 
 async def test_a_discount_changes_the_invoiced_sum(session_factory, bot, config):
@@ -1564,6 +1929,42 @@ async def test_a_long_post_with_a_picture_is_composed_from_separate_messages(
     assert to_member_text[0].reply_markup.inline_keyboard[0][0].text == texts.JOIN_CLUB_BUTTON
 
 
+async def test_an_abandoned_draft_is_never_inherited_by_the_next_broadcast(
+    dispatcher, bot, recording_session
+):
+    """Found while walking the flow, 2026-10-10.
+
+    An admin composed a post, wandered off without confirming, then opened 📣 Розсилка again.
+    The parts were still in the FSM, so «Готово» sailed past the "you have sent nothing" guard
+    and offered to send the abandoned post — to whatever audience was picked the second time.
+    """
+    from handlers.admin import AdminMenu
+
+    admin = make_user(ADMIN_ID, username="boss")
+    await dispatcher.feed_update(bot, make_message(make_user(USER_ID, username="owes"), "/start"))
+
+    # First attempt: compose something, then abandon it.
+    await dispatcher.feed_update(
+        bot, make_callback(admin, AdminMenu(action="broadcast").pack(), update_id=2)
+    )
+    await dispatcher.feed_update(bot, make_callback(admin, "bcast:unpaid", update_id=3))
+    await dispatcher.feed_update(bot, make_message(admin, "Чернетка, яку покинули", update_id=4))
+
+    # Second attempt: start over and finish immediately, having sent nothing.
+    await dispatcher.feed_update(
+        bot, make_callback(admin, AdminMenu(action="broadcast").pack(), update_id=5)
+    )
+    await dispatcher.feed_update(bot, make_callback(admin, "bcast:unpaid", update_id=6))
+    recording_session.calls.clear()
+    await dispatcher.feed_update(bot, make_callback(admin, "compose:done", update_id=7))
+
+    told = recording_session.sent_texts()
+    assert texts.ADMIN_COMPOSE_NOTHING in told
+    # And certainly not the abandoned draft, nor the price step that leads to sending it.
+    assert not any("Чернетка" in t for t in told)
+    assert texts.ADMIN_BROADCAST_ASK_PRICE not in told
+
+
 async def test_an_admin_can_post_into_the_channel_only_after_confirming(
     dispatcher, bot, recording_session, settings
 ):
@@ -1585,6 +1986,75 @@ async def test_an_admin_can_post_into_the_channel_only_after_confirming(
     to_channel = [c for c in recording_session.of_type("SendMessage") if c.chat_id == CHANNEL_ID]
     assert len(to_channel) == 1
     assert to_channel[0].text == "Зустріч у четвер о 19:00"
+
+
+async def test_gifting_a_month_adds_to_a_paid_date_and_never_overwrites_it(
+    dispatcher, bot, session_factory, recording_session
+):
+    """🎁 Подарувати місяць, the replacement for hand-written SQL once FREE_PERIOD_UNTIL closes.
+
+    The failure worth guarding is quiet: setting an absolute date instead of extending takes
+    away weeks a member has already paid for. A gift uses the same `extend()` a payment uses.
+    """
+    from db.models import utcnow
+    from handlers.admin import AdminMenu
+
+    paid_until = utcnow() + timedelta(days=40)  # paid well into the future
+    async with session_factory() as session:
+        session.add(User(telegram_id=USER_ID, username="paidup"))
+        session.add(
+            Subscription(
+                user_id=USER_ID,
+                status=SubscriptionStatus.ACTIVE,
+                price=REGULAR_PRICE,
+                currency=CURRENCY,
+                price_tier=PriceTier.REGULAR,
+                period_days=PERIOD_DAYS,
+                started_at=utcnow(),
+                expires_at=paid_until,
+            )
+        )
+        await session.commit()
+
+    admin = make_user(ADMIN_ID, username="boss")
+    await dispatcher.feed_update(bot, make_callback(admin, AdminMenu(action="gift_months").pack()))
+    await dispatcher.feed_update(bot, make_message(admin, "@paidup", update_id=2))
+    recording_session.calls.clear()
+    await dispatcher.feed_update(bot, make_callback(admin, "gift:months:1", update_id=3))
+
+    # The confirmation quotes both dates, so a wrong number is visible before it is applied.
+    asked = recording_session.of_type("SendMessage")[-1].text
+    assert texts.day(paid_until) in asked
+    assert texts.day(paid_until + timedelta(days=PERIOD_DAYS)) in asked
+
+    recording_session.calls.clear()
+    await dispatcher.feed_update(bot, make_callback(admin, "gift:send", update_id=4))
+
+    sub = await load_sub(session_factory)
+    # Added to what they held, not replaced with "a month from today".
+    assert sub.expires_at == paid_until + timedelta(days=PERIOD_DAYS)
+    assert sub.status is SubscriptionStatus.ACTIVE
+    # The free first period is a different thing and must not be consumed by a gift.
+    assert sub.free_period_granted is False
+
+    # The member gets the owner's own wording, then the link it promises them: the copy says
+    # «долучайся за посиланням», so a gift without a link would promise something that never
+    # arrives.
+    to_member = [c for c in recording_session.of_type("SendMessage") if c.chat_id == USER_ID]
+    assert len(to_member) == 2
+    assert "невеличкий подарунок від мене" in to_member[0].text
+    assert texts.months_phrase(1) in to_member[0].text
+    assert "https://t.me/+" in to_member[1].text
+    assert recording_session.of_type("CreateChatInviteLink")
+
+    async with session_factory() as session:
+        entry = await session.scalar(
+            select(AuditLog).where(AuditLog.action == "subscription.extended")
+        )
+    assert entry.actor_id == ADMIN_ID  # who gave it away is on the record
+    assert entry.target_user_id == USER_ID
+    assert entry.details["gift"] is True
+    assert entry.details["months"] == 1
 
 
 async def test_cancelling_a_subscription_keeps_the_paid_period(dispatcher, bot, session_factory):
@@ -1650,9 +2120,11 @@ def test_every_member_facing_message_is_ukrainian_and_formats_cleanly():
         "club": texts.CLUB_NAME,
         "until": "31.12.2026",
         "next_until": "30.01.2027",
+        "new_until": "19.11.2026",
         "amount": "10 €",
         "period": 30,
         "retry_in": "24 години",
+        "retry_on": "21.10.2026",
         "since": "01.12.2026",
         "handle": "@m",
         "user_id": 1,
