@@ -231,13 +231,109 @@ async def test_start_registers_once_and_invoices_a_paying_joiner(
     # The first /start sends two messages, not three: the club pitch, then the tariff carrying
     # the pay button. The button used to arrive in a message of its own headed "time to renew",
     # which made no sense for somebody who had just joined. The second /start adds one more
-    # message, the "already registered" reply.
+    # message: the tariff again, with a live button, because they still owe money. It used to
+    # be a bare "already registered" greeting with no price and no way to pay.
     sent = recording_session.of_type("SendMessage")
     assert len(sent) == 3
     buttons = [b for row in sent[1].reply_markup.inline_keyboard for b in row]
     assert buttons[0].text == texts.PAY_BUTTON.format(club=texts.CLUB_NAME)
     assert "secure.wayforpay.com" in buttons[0].url
     assert texts.MENU_MY_SUBSCRIPTION in [b.text for b in buttons]
+
+
+async def test_a_hundred_percent_discount_grants_the_period_and_the_channel_link(
+    dispatcher, bot, session_factory, fake_wayforpay, recording_session
+):
+    """Reported 2026-10-20: a member given a 100% discount ended up with an expired
+    subscription, no pay button and no link — unable to pay and unable to see why they need not.
+
+    A 100% discount computes to 0.00, and a zero-amount CREATE_INVOICE is not a payment request.
+    Nothing had guarded that, so the member was invoiced for nothing and left with nothing.
+    """
+    from db.models import utcnow
+
+    async with session_factory() as session:
+        session.add(User(telegram_id=ADMIN_ID, username="boss"))
+        await discount_service.grant(
+            session,
+            actor_id=ADMIN_ID,
+            username="freebie",  # granted before they ever opened the bot
+            kind=DiscountKind.PERCENT,
+            percent_off=100,
+            currency=CURRENCY,
+            days=None,
+            now=utcnow(),
+        )
+        await session.commit()
+
+    await dispatcher.feed_update(
+        bot, make_message(make_user(USER_ID, username="freebie"), "/start")
+    )
+
+    # Nothing to pay, so nothing was invoiced and no pay button was offered.
+    assert fake_wayforpay.invoice_calls == []
+    sent = recording_session.of_type("SendMessage")
+    assert not any(
+        b.url
+        for c in sent
+        if c.reply_markup
+        for row in c.reply_markup.inline_keyboard
+        for b in row
+        if b.url and "wayforpay" in b.url
+    )
+
+    # The period is granted and runs forward from today, not left in the past.
+    sub = await load_sub(session_factory)
+    assert sub.status is SubscriptionStatus.ACTIVE
+    assert sub.expires_at > utcnow()
+
+    # Told it is free, and given the channel link — the two things the report was missing.
+    body = "\n".join(c.text for c in sent)
+    assert "безкоштовна" in body
+    assert recording_session.of_type("CreateChatInviteLink")
+    assert "https://t.me/+" in body
+
+    async with session_factory() as session:
+        entry = await session.scalar(
+            select(AuditLog).where(AuditLog.action == "subscription.extended")
+        )
+    assert entry.details["reason"] == "price is zero after discount"
+
+
+async def test_the_welcome_quotes_the_discounted_price_not_the_list_price(
+    dispatcher, bot, session_factory, recording_session
+):
+    """Reported 2026-10-21: a founding member on 8 € was told «Вартість: 10 €» in the welcome.
+
+    `subscription.price` is the club's list price and is deliberately never reduced — the
+    reduction is applied per invoice so a time-limited discount can expire. Quoting it to the
+    member therefore advertises a figure they will not be charged.
+    """
+    # Seeded the way the founding-member migration seeds it: a fixed price *and* a free first
+    # period, which is what puts the member on the WELCOME_FREE greeting where the bug was.
+    async with session_factory() as session:
+        session.add(
+            Discount(
+                username="founder",
+                kind=DiscountKind.FIXED_PRICE,
+                fixed_price=Decimal("8.00"),
+                currency=CURRENCY,
+                free_first_period=True,
+            )
+        )
+        await session.commit()
+
+    await dispatcher.feed_update(
+        bot, make_message(make_user(USER_ID, username="founder"), "/start")
+    )
+
+    body = "\n".join(c.text for c in recording_session.of_type("SendMessage"))
+    assert "перший період — у подарунок" in body  # the greeting that carried the wrong figure
+    assert texts.money(Decimal("8.00"), CURRENCY) in body
+    # The list price must not appear as what they will pay.
+    assert texts.money(REGULAR_PRICE, CURRENCY) not in body
+    # The base price is still recorded untouched, so the discount can expire later.
+    assert (await load_sub(session_factory)).price == REGULAR_PRICE
 
 
 async def test_a_founding_member_is_matched_pinned_and_given_a_free_month(
@@ -1352,6 +1448,152 @@ async def test_the_day_before_reminder_differs_by_whether_a_card_is_on_file(
     assert recording_session.of_type("SendMessage") == []
 
 
+async def test_removal_is_off_by_default_and_reports_instead(
+    session_factory, bot, config, recording_session
+):
+    """The default has to be "change nothing", because the mistake is unrecoverable.
+
+    Removing somebody who has in fact paid is the most expensive thing this bot can do, and the
+    `Declined`-with-no-detail bug showed payment detection can be wrong in exactly that way. So
+    the sweep ships off: it names who would go and touches nobody (G3.8).
+    """
+    from services.billing import remove_lapsed_members
+
+    await seed_due(session_factory, overdue_days=10)  # lapsed well past grace
+
+    counts = await remove_lapsed_members(
+        session_factory,
+        bot,
+        channel_id=CHANNEL_ID,
+        admin_ids=frozenset({ADMIN_ID}),
+        config=config,
+        now=NOW,
+    )
+
+    assert counts["would_remove"] == 1
+    assert counts["removed"] == 0
+    assert recording_session.of_type("BanChatMember") == []
+    assert recording_session.of_type("SendMessage") == []
+    # Still in the channel as far as the database is concerned.
+    assert (await load_sub(session_factory)).status is not SubscriptionStatus.EXPIRED
+
+
+async def test_enabled_removal_bans_then_unbans_tells_them_and_spares_admins(
+    session_factory, bot, config, recording_session
+):
+    """G3.6: ban **then unban**, so paying again lets them back in.
+
+    A bare ban leaves them on the banned list, where a future invite would not work and somebody
+    would have to unban them by hand. There is no "kick" method for a channel.
+    """
+    from services.billing import remove_lapsed_members
+
+    await seed_due(session_factory, overdue_days=10)
+    # An admin whose access has also lapsed: never removed, whatever the subscription says.
+    async with session_factory() as session:
+        session.add(
+            Subscription(
+                user_id=ADMIN_ID,
+                status=SubscriptionStatus.PAST_DUE,
+                price=REGULAR_PRICE,
+                currency=CURRENCY,
+                price_tier=PriceTier.REGULAR,
+                period_days=PERIOD_DAYS,
+                started_at=NOW - timedelta(days=90),
+                expires_at=NOW - timedelta(days=60),
+            )
+        )
+        await session.commit()
+
+    counts = await remove_lapsed_members(
+        session_factory,
+        bot,
+        channel_id=CHANNEL_ID,
+        admin_ids=frozenset({ADMIN_ID}),
+        config=config,
+        now=NOW,
+        enabled=True,
+    )
+
+    assert counts["removed"] == 1
+    assert counts["skipped_admin"] == 1  # the owner is not thrown out of their own channel
+
+    # Ban then unban, in that order, for the member and nobody else.
+    banned = recording_session.of_type("BanChatMember")
+    unbanned = recording_session.of_type("UnbanChatMember")
+    assert [c.user_id for c in banned] == [USER_ID]
+    assert [c.user_id for c in unbanned] == [USER_ID]
+    order = [t for t in recording_session.method_names() if "ChatMember" in t]
+    assert order == ["BanChatMember", "UnbanChatMember"]
+
+    # Told why, and told they can come back.
+    to_member = [c for c in recording_session.of_type("SendMessage") if c.chat_id == USER_ID]
+    assert len(to_member) == 1
+    assert "/start" in to_member[0].text
+
+    sub = await load_sub(session_factory)
+    assert sub.status is SubscriptionStatus.EXPIRED
+    async with session_factory() as session:
+        entry = await session.scalar(
+            select(AuditLog).where(AuditLog.action == "subscription.expired")
+        )
+    assert entry.target_user_id == USER_ID
+
+    # Idempotent: EXPIRED is the mark of "already out", so a second run removes nobody again.
+    recording_session.calls.clear()
+    again = await remove_lapsed_members(
+        session_factory,
+        bot,
+        channel_id=CHANNEL_ID,
+        admin_ids=frozenset({ADMIN_ID}),
+        config=config,
+        now=NOW + timedelta(days=1),
+        enabled=True,
+    )
+    assert again["removed"] == 0
+    assert recording_session.of_type("BanChatMember") == []
+
+
+async def test_a_fully_discounted_renewal_is_granted_not_invoiced(
+    session_factory, bot, config, recording_session
+):
+    """The same zero-price trap on the renewal route rather than at /start.
+
+    A member on a 100% discount comes due every period like anybody else. Invoicing them for
+    0.00 would fail at the gateway and leave them with no access and no explanation.
+    """
+    from db.models import utcnow
+
+    await seed_due(session_factory, overdue_days=1)  # seeds the admin user too
+    async with session_factory() as session:
+        await discount_service.grant(
+            session,
+            actor_id=ADMIN_ID,
+            telegram_id=USER_ID,
+            kind=DiscountKind.PERCENT,
+            percent_off=100,
+            currency=CURRENCY,
+            days=None,
+            now=utcnow(),
+        )
+        await session.commit()
+
+    gw = FakeGateway()
+    counts = await process_due_subscriptions(
+        session_factory, gw, bot, admin_ids=frozenset({ADMIN_ID}), config=config, now=NOW
+    )
+
+    assert counts["free"] == 1
+    assert counts["invoiced"] == 0
+    assert gw.invoice_calls == []  # nothing to pay, so nothing asked for
+
+    sub = await load_sub(session_factory)
+    assert sub.status is SubscriptionStatus.ACTIVE
+    assert sub.expires_at == NOW + timedelta(days=PERIOD_DAYS)
+    # And the link, because a free member still has to get into the channel.
+    assert recording_session.of_type("CreateChatInviteLink")
+
+
 async def test_a_discount_changes_the_invoiced_sum(session_factory, bot, config):
     await seed_due(session_factory, price=Decimal("10.00"))
     async with session_factory() as session:
@@ -2109,6 +2351,44 @@ async def test_a_handler_crash_still_answers_the_user(
     texts_sent = [c.text for c in recording_session.of_type("SendMessage")]
     assert texts.GENERIC_ERROR in texts_sent
     assert not any("database is on fire" in t for t in texts_sent)
+
+
+def test_every_migration_parses_and_the_chain_has_one_head():
+    """A broken migration blocks every deploy, and `ruff` does not look at them.
+
+    `pyproject.toml` excludes `alembic/versions` from linting, so a syntax error there passes
+    `ruff check .` and only shows up when alembic refuses to run — which on this project means a
+    failed deploy. One caught exactly that way on 2026-10-22.
+
+    The single-head check is the other way the chain breaks: two migrations claiming the same
+    `down_revision` make `upgrade head` ambiguous and alembic stops.
+    """
+    import ast
+    import pathlib
+
+    versions = sorted(pathlib.Path("alembic/versions").glob("*.py"))
+    assert versions, "no migrations found — wrong working directory?"
+
+    revisions: dict[str, str] = {}
+    parents: dict[str, list[str]] = {}
+    for path in versions:
+        tree = ast.parse(path.read_text())  # raises SyntaxError, which is the point
+        found = {}
+        for node in tree.body:
+            if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                if node.target.id in ("revision", "down_revision") and node.value is not None:
+                    found[node.target.id] = ast.literal_eval(node.value)
+        assert "revision" in found, f"{path.name} declares no revision id"
+        revisions[found["revision"]] = path.name
+        parents.setdefault(found.get("down_revision"), []).append(found["revision"])
+
+    # Exactly one revision nobody else revises: the head.
+    heads = [rev for rev in revisions if rev not in parents]
+    assert len(heads) == 1, f"expected one head, found {[revisions[h] for h in heads]}"
+
+    # And nobody shares a parent, which is the other way a chain forks.
+    forked = {parent: kids for parent, kids in parents.items() if len(kids) > 1}
+    assert not forked, f"two migrations share a parent: {forked}"
 
 
 def test_every_member_facing_message_is_ukrainian_and_formats_cleanly():

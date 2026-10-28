@@ -609,6 +609,14 @@ ADMIN_GIFT_NO_SUBSCRIPTION = (
     "після /start підписка з’явиться, і тоді можна дарувати."
 )
 
+#: A 100% discount means there is nothing to pay, so no invoice is created and no pay button is
+#: shown — the period is simply granted and the channel link follows. Mine, not the owner's.
+FREE_BY_DISCOUNT = (
+    "Вітаю! Для вас участь у {club} безкоштовна — платити нічого не потрібно.\n"
+    "Доступ діє до <b>{until}</b>.\n\n"
+    "Посилання на закритий канал — нижче 👇"
+)
+
 #: SPEC — the owner's own wording, first person and informal. Do not "improve" it.
 #:
 #: It says «долучайся за посиланням», so the gift **must** be followed by the channel invite or

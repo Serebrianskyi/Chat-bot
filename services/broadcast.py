@@ -29,7 +29,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 import texts
-from db.models import DiscountKind, Payment, PaymentStatus, Subscription, utcnow
+from db.models import DiscountKind, PaymentStatus, utcnow
 from services import billing
 from services import discounts as discount_service
 from services import subscriptions as subs
@@ -174,42 +174,6 @@ async def send_parts(bot: Bot, chat_id: int, parts: list[dict], *, reply_markup=
     return outcome
 
 
-async def _invoice(
-    session,
-    client: WayForPayClient,
-    *,
-    subscription: Subscription,
-    config: billing.BillingConfig,
-    now: datetime,
-    reuse_open: bool = True,
-) -> Payment | None:
-    """A usable invoice for one member: the open one if it is still fresh, else a new one.
-
-    An open invoice older than the gateway's ``orderTimeout`` is dead at WayForPay even though
-    our row still looks open, so reusing it would hand the member a link that fails. Anything
-    younger is reused, which keeps a broadcast from creating a second order for every member who
-    already had one. ``reuse_open=False`` when a new price is being applied: the open invoice
-    carries the old amount, so reusing it would advertise the offer and charge the old price.
-
-    The row is returned rather than just its URL, so the sum quoted in the message is the sum on
-    the invoice. Recomputing the price separately is how a message ends up advertising one amount
-    and charging another.
-    """
-    if reuse_open:
-        existing = await subs.open_payment(session, subscription.id)
-        if existing is not None and existing.invoice_url:
-            if now - existing.created_at < config.invoice_timeout:
-                return existing
-
-    try:
-        return await billing.issue_invoice(
-            session, client, subscription=subscription, config=config, now=now
-        )
-    except Exception:
-        log.exception("Broadcast: could not invoice %s", subscription.user_id)
-        return None
-
-
 async def _prepare_link(
     session,
     client: WayForPayClient,
@@ -260,12 +224,13 @@ async def _prepare_link(
         except Exception:
             log.exception("Broadcast: could not reprice %s", user_id)
 
-    payment = await _invoice(
+    payment = await billing.ensure_invoice(
         session,
         client,
         subscription=subscription,
         config=config,
         now=now,
+        # A new price makes the open invoice stale: it quotes the old amount.
         reuse_open=offer is None,
     )
     if payment is None or not payment.invoice_url:

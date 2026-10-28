@@ -3,8 +3,8 @@
 What this slice does: create a subscription at ``/start`` with the right price and due date,
 issue invoices, apply confirmed payments, and **notify an admin** when a payment is missing.
 
-What it deliberately does not do: remove anyone from the community. See the ``TODO(removal)``
-markers — that is a separate change gated by the plan's G3.6 and G3.8.
+Removal from the community lives here too (``remove_from_community``), but it only runs when
+``REMOVAL_ENABLED`` is set — see config.py for why it ships off.
 
 Date arithmetic lives in ``services.pricing``; this module owns the database transitions.
 Every function takes ``now`` rather than reading the clock, so the jobs are testable.
@@ -275,7 +275,8 @@ async def revoke_for_refund(
             "amount": str(payment.amount),
         },
     )
-    # TODO(removal): once removal is enabled, this is where the member leaves the community.
+    # Removal is not done here: a refund revokes the period, and `billing.remove_lapsed_members`
+    # takes anyone whose access has ended out of the channel on its own schedule.
 
 
 async def mark_overdue(
@@ -497,6 +498,45 @@ async def gift_months(
     return expiry
 
 
+async def remove_from_community(bot, *, chat_id: str, user_id: int) -> bool:
+    """Take a member out of the channel. True when it worked.
+
+    **Ban then immediately unban** (G3.6). A bare ``ban_chat_member`` keeps them on the banned
+    list, so paying again would not let them back in and somebody would have to unban them by
+    hand. Banning removes them; unbanning restores their ability to use a future invite. It is
+    the documented way to "kick" from a channel — there is no kick method.
+
+    Returns False rather than raising: one member who cannot be removed — already gone, or the
+    bot lacking the right — must not stop the sweep, and the caller records what happened.
+    """
+    try:
+        await bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
+    except Exception:
+        log.exception(
+            "Could not remove %s from %s. Check the bot is an administrator there with "
+            "'Ban users'.",
+            user_id,
+            chat_id,
+        )
+        return False
+
+    try:
+        await bot.unban_chat_member(chat_id=chat_id, user_id=user_id, only_if_banned=True)
+    except Exception:
+        # Removed but still on the banned list: they cannot rejoin without a human. Loud,
+        # because it is a worse state than either outcome and it is invisible otherwise.
+        log.exception(
+            "Removed %s from %s but could not unban them — they cannot rejoin until somebody "
+            "unbans them by hand.",
+            user_id,
+            chat_id,
+        )
+        return True
+
+    log.info("Removed %s from %s (banned then unbanned, so they can rejoin)", user_id, chat_id)
+    return True
+
+
 async def cancel_autorenew(
     session: AsyncSession, *, subscription: Subscription, actor_id: int, now: datetime
 ) -> None:
@@ -538,9 +578,9 @@ async def resume_autorenew(
     )
 
 
-# TODO(removal): remove_from_community(bot, chat_id, user_id) -- ban_chat_member then
-#                unban_chat_member, so a returning payer can rejoin. Deferred until the payment
-#                path has been exercised against real money; gate it with G3.6 and G3.8.
+# Removal is implemented: `remove_from_community` above, driven by `billing.remove_lapsed_members`.
+# It is **off** unless `REMOVAL_ENABLED` is true — see config.py for why, and G3.8 for what has to
+# pass before it is turned on.
 # TODO(phase-3): grant / extend / revoke by hand from the admin panel, each writing audit_log.
 # TODO(phase-3): single-use invite links (create_chat_invite_link, member_limit=1).
 # TODO(renewals): request a recToken on CREATE_INVOICE. `billing.attempt_charge` is written and

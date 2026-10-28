@@ -26,6 +26,7 @@ from config import Settings
 from db.models import utcnow
 from handlers import admin, subscription
 from services import billing
+from services import discounts as discount_service
 from services.billing import BillingConfig
 from services.subscriptions import ensure_subscription
 from services.users import upsert_user
@@ -173,34 +174,64 @@ async def handle_start(
     # Read everything needed for the replies *now*, as plain values. A rollback further down
     # expires the ORM objects, and touching an attribute afterwards would trigger a reload on a
     # dead transaction — surfacing to the member as the generic error instead of a greeting.
-    amount = texts.money(subscription.price, subscription.currency)
+    # What they will actually be charged, discount included — not the base tariff. A founding
+    # member on 8 EUR was being told «Вартість: 10 €» in the welcome, because this quoted
+    # `subscription.price`, which is the club's list price and deliberately never reduced
+    # (the reduction is applied per invoice so it can expire). Reported 2026-10-21.
+    owed, owed_currency, _ = await discount_service.effective_price(
+        session,
+        subscription=subscription,
+        username=message.from_user.username,
+        now=now,
+    )
+    amount = texts.money(owed, owed_currency)
     until = texts.day(subscription.expires_at)
     period_days = subscription.period_days
     free_period = subscription.free_period_granted
 
     is_admin = telegram_id in admin_ids
 
-    if not created:
+    # A returning member who is paid up just gets the greeting. One whose access has run out
+    # falls through to the paying path below, because the greeting alone left them with no price
+    # and no button — reported 2026-10-20 by a member who had been given a 100% discount and
+    # could neither pay nor see why they did not need to.
+    if not created and subscription.expires_at > now:
         await message.answer(
             texts.WELCOME_BACK.format(until=until), reply_markup=member_keyboard(is_admin)
         )
         return
 
-    # The club pitch first, then the tariff as its own message. One combined wall of text would
-    # bury the price and the pay button at the bottom of a long read.
-    await message.answer(texts.WELCOME_INTRO)
+    if created:
+        # The club pitch first, then the tariff as its own message. One combined wall of text
+        # would bury the price and the pay button at the bottom of a long read.
+        await message.answer(texts.WELCOME_INTRO)
 
-    if free_period:
-        await message.answer(
-            texts.WELCOME_FREE.format(
-                club=texts.CLUB_NAME,
-                until=until,
-                amount=amount,
-                period=period_days,
-            ),
-            reply_markup=member_keyboard(is_admin),
+        if free_period:
+            await message.answer(
+                texts.WELCOME_FREE.format(
+                    club=texts.CLUB_NAME,
+                    until=until,
+                    amount=amount,
+                    period=period_days,
+                ),
+                reply_markup=member_keyboard(is_admin),
+            )
+            log.info("Onboarded %s with a free first period", telegram_id)
+            return
+
+    # `owed` may be nothing at all — a 100% discount lands here.
+    if owed <= 0:
+        # A 100% discount: no invoice, no pay button, just the period and the channel link.
+        await billing.settle_without_payment(
+            session,
+            bot,
+            subscription=subscription,
+            admin_ids=admin_ids,
+            config=billing_config or BillingConfig(period_days=period_days),
+            now=now,
         )
-        log.info("Onboarded %s with a free first period", telegram_id)
+        await session.commit()
+        log.info("Onboarded %s with a fully discounted period", telegram_id)
         return
 
     # They owe payment now, so invoice them here rather than leaving it to the daily job. The
@@ -209,7 +240,9 @@ async def handle_start(
     payment = None
     if wayforpay is not None:
         try:
-            payment = await billing.issue_invoice(
+            # Reuse-or-issue: a member who owes money and taps /start again gets the link they
+            # already have rather than a second live invoice.
+            payment = await billing.ensure_invoice(
                 session,
                 wayforpay,
                 subscription=subscription,

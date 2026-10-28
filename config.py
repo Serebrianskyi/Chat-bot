@@ -54,6 +54,18 @@ class Settings(BaseSettings):
         default=None, description="Private channel id the bot administrates. Needed from Phase 3."
     )
 
+    # --- Removal of non-payers: off until it has been proven with a real payment ---
+    #
+    # The most expensive mistake this bot can make is removing somebody who *has* paid, and the
+    # `Declined`-with-no-detail bug of 2026-10-09 showed that payment detection can be wrong in
+    # exactly the way that would cause it: 77 orders were written off minutes after being issued.
+    # So removal ships switched off. With it off the job reports who *would* be removed and
+    # changes nothing, which is how you check the list before trusting it (G3.8).
+    removal_enabled: bool = Field(
+        default=False,
+        description="Remove members whose access has ended. Leave false until G3.8 passes.",
+    )
+
     # --- Database: SQLite locally, PostgreSQL from Phase 4 ---
     database_url: str = "sqlite+aiosqlite:///./chatbot.db"
 

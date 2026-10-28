@@ -25,6 +25,7 @@ from services.billing import (
     poll_open_payments,
     process_due_subscriptions,
     recover_access,
+    remove_lapsed_members,
     send_renewal_reminders,
 )
 from services.wayforpay import WayForPayClient
@@ -108,6 +109,18 @@ def start_scheduler(
         )
         return None
 
+    if settings.free_period_until is None:
+        # Not a crash — after the offer closes, unset is the correct value. But while it is
+        # supposed to be open, unset silently reinstates the behaviour the design rejected:
+        # `first_expiry` falls back to "one period from today", so each member gets their own
+        # end date instead of the one shared date. A founding member who joined on 7 October was
+        # given 6 November instead of 1 November exactly this way (2026-10-21).
+        log.warning(
+            "FREE_PERIOD_UNTIL is not set. Free first periods will run 30 days from each "
+            "member's own /start rather than ending on one shared date. If the offer is still "
+            "open, set it — see docs/plan-2026-10-20.md."
+        )
+
     config = build_billing_config(settings)
     admin_ids = settings.admin_id_set
     scheduler = AsyncIOScheduler(timezone=settings.display_timezone)
@@ -161,6 +174,25 @@ def start_scheduler(
         max_instances=1,
     )
     scheduler.add_job(
+        remove_lapsed_members,
+        "cron",
+        hour=DUE_JOB_HOUR,
+        minute=45,
+        id="remove_lapsed_members",
+        kwargs={
+            "session_factory": session_factory,
+            "bot": bot,
+            "channel_id": config.channel_id,
+            "admin_ids": admin_ids,
+            "config": config,
+            # Off unless the environment says otherwise. With it off the job reports and
+            # changes nothing, which is how the list gets checked (G3.8).
+            "enabled": settings.removal_enabled,
+        },
+        coalesce=True,
+        max_instances=1,
+    )
+    scheduler.add_job(
         recover_access,
         "cron",
         hour=RECOVERY_HOUR,
@@ -181,11 +213,12 @@ def start_scheduler(
     scheduler.start()
     log.info(
         "Billing jobs started: payments polled every %s min, due dates checked daily at "
-        "%s:00 %s, access recovered daily at %s:00 %s",
+        "%s:00 %s, access recovered daily at %s:00 %s, removal enabled=%s",
         POLL_INTERVAL_MINUTES,
         DUE_JOB_HOUR,
         settings.display_timezone,
         RECOVERY_HOUR,
         RECOVERY_TIMEZONE,
+        settings.removal_enabled,
     )
     return scheduler

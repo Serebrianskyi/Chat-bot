@@ -390,9 +390,7 @@ async def cmd_order(order_reference: str) -> int:
                 print("   automatic renewal needs the serviceUrl callback (Phase 4 webhook).")
                 print("   See docs/telegram-bot-payments-design.md §1a.")
                 if stored:
-                    print(
-                        f"\n   (the subscription holds a token from elsewhere: {stored[:8]}…)"
-                    )
+                    print(f"\n   (the subscription holds a token from elsewhere: {stored[:8]}…)")
     finally:
         await engine.dispose()
     return 0

@@ -10,7 +10,8 @@ Two jobs, both idempotent (A.20):
 * ``process_due_subscriptions`` — daily. Invoices whoever has come due, and notifies an admin
   about anyone who has not paid by the end of grace.
 
-Neither job removes a member from the community. That is deferred; see ``TODO(removal)``.
+``remove_lapsed_members`` takes anyone whose access has ended out of the channel — but only when
+``REMOVAL_ENABLED`` is set, which it is not by default. See config.py for why.
 """
 
 import asyncio
@@ -37,6 +38,7 @@ from db.models import (
 from services import discounts as discount_service
 from services import subscriptions as subs
 from services.audit import Action, record_action
+from services.pricing import extend
 from services.wayforpay import WayForPayClient, WayForPayError
 
 log = logging.getLogger(__name__)
@@ -164,6 +166,104 @@ async def issue_invoice(
     payment.invoice_url = invoice.invoice_url
     payment.raw_response = invoice.raw
     return payment
+
+
+async def ensure_invoice(
+    session: AsyncSession,
+    client: WayForPayClient,
+    *,
+    subscription: Subscription,
+    config: BillingConfig,
+    now: datetime,
+    reuse_open: bool = True,
+) -> Payment | None:
+    """The member's current payable invoice: the open one if still live, otherwise a new one.
+
+    An invoice older than the gateway's ``orderTimeout`` is dead at WayForPay even though our row
+    still looks open, so handing that link back would give the member a button that fails.
+    Anything younger is reused — otherwise every ``/start`` from somebody who owes money would
+    mint another order, and a member tapping /start three times would leave three live invoices.
+
+    ``reuse_open=False`` when the price has just changed: the open invoice quotes the old amount,
+    so reusing it would advertise one figure and charge another.
+
+    None when the gateway could not be reached; the caller tells the member something true.
+    """
+    if reuse_open:
+        existing = await subs.open_payment(session, subscription.id)
+        if existing is not None and existing.invoice_url:
+            if now - existing.created_at < config.invoice_timeout:
+                return existing
+
+    try:
+        return await issue_invoice(
+            session, client, subscription=subscription, config=config, now=now
+        )
+    except Exception:
+        log.exception("Could not invoice %s", subscription.user_id)
+        return None
+
+
+async def settle_without_payment(
+    session: AsyncSession,
+    bot: Bot,
+    *,
+    subscription: Subscription,
+    admin_ids: frozenset[int],
+    config: BillingConfig,
+    now: datetime,
+) -> bool:
+    """Grant the period when the price works out to nothing. Returns True when it was granted.
+
+    A 100% discount computes to 0.00, and a zero-amount ``CREATE_INVOICE`` is not a payment
+    request — WayForPay will not take it, and the member would be left looking at a price of
+    nothing with no button and no access. Reported 2026-10-20 by exactly that route.
+
+    So the period is granted outright, the channel link follows, and no ``payments`` row is
+    written: nothing was ever owed, and inventing a settled payment for 0.00 would put a fiction
+    into the table the gateway is reconciled against.
+    """
+    subscription.expires_at = extend(
+        subscription.expires_at, now=now, period_days=subscription.period_days
+    )
+    subscription.status = SubscriptionStatus.ACTIVE
+    subscription.grace_until = None
+    subscription.last_reminder_at = None
+    subscription.admin_notified_at = None
+
+    await record_action(
+        session,
+        actor_id=subscription.user_id,
+        action=Action.SUBSCRIPTION_EXTENDED,
+        target_user_id=subscription.user_id,
+        details={
+            "reason": "price is zero after discount",
+            "expires_at": subscription.expires_at.isoformat(),
+        },
+        now=now,
+    )
+
+    await _tell(
+        bot,
+        subscription.user_id,
+        texts.FREE_BY_DISCOUNT.format(
+            club=texts.CLUB_NAME, until=texts.day(subscription.expires_at)
+        ),
+    )
+    await deliver_invite(
+        session,
+        bot,
+        subscription=subscription,
+        channel_id=config.channel_id,
+        admin_ids=admin_ids,
+        now=now,
+    )
+    log.info(
+        "Granted %s a free period (price is zero after discount), now expires %s",
+        subscription.user_id,
+        subscription.expires_at,
+    )
+    return True
 
 
 async def send_payment_link(
@@ -727,7 +827,14 @@ async def process_due_subscriptions(
     ``admin_notified_at`` stops the same overdue member being recorded twice.
     """
     now = now or utcnow()
-    counts = {"invoiced": 0, "renewed": 0, "charge_failed": 0, "unreachable": 0, "overdue": 0}
+    counts = {
+        "invoiced": 0,
+        "renewed": 0,
+        "charge_failed": 0,
+        "free": 0,
+        "unreachable": 0,
+        "overdue": 0,
+    }
 
     async with session_factory() as session:
         due = (
@@ -777,6 +884,26 @@ async def process_due_subscriptions(
                 # but no invoice is sent — a member with a card on file is not asked to pay by
                 # hand until the retries have run out.
             else:
+                # Nothing to pay? Then nothing to invoice. A 100% discount lands here.
+                member = await session.get(User, subscription.user_id)
+                owed, _currency, _discount = await discount_service.effective_price(
+                    session,
+                    subscription=subscription,
+                    username=member.username if member else None,
+                    now=now,
+                )
+                if owed <= 0:
+                    await settle_without_payment(
+                        session,
+                        bot,
+                        subscription=subscription,
+                        admin_ids=admin_ids,
+                        config=config,
+                        now=now,
+                    )
+                    counts["free"] += 1
+                    continue
+
                 existing = await subs.open_payment(session, subscription.id)
                 if existing is None:
                     try:
@@ -814,12 +941,114 @@ async def process_due_subscriptions(
                     now=now,
                 )
                 counts["overdue"] += 1
-                # TODO(removal): once enabled and tested, remove the member here instead of
-                #                only recording it. Gate it with the plan's G3.6 and G3.8.
+                # Removal is not done here: `remove_lapsed_members` owns it, because access
+                # ending is one condition however it ended and this sweep only sees the statuses
+                # it might invoice.
 
         await session.commit()
 
     log.info("process_due_subscriptions: %s", counts)
+    return counts
+
+
+# --- job 5: take lapsed members out of the channel ------------------------------------------
+
+
+async def remove_lapsed_members(
+    session_factory: async_sessionmaker,
+    bot: Bot,
+    *,
+    channel_id: str | None,
+    admin_ids: frozenset[int],
+    config: BillingConfig,
+    now: datetime | None = None,
+    enabled: bool = False,
+) -> dict[str, int]:
+    """Remove members whose access ended and whose grace ran out. Daily.
+
+    Its own job rather than a branch of the due-date sweep, which is a deliberate deviation from
+    the design doc's Job 1 table. The reason: that sweep only looks at statuses it might invoice
+    (TRIAL / ACTIVE / PAST_DUE / EXPIRED), so a member who **cancelled** would never have been
+    removed — they would keep channel access for ever. Access ending is one condition whatever
+    led to it, so it is one query.
+
+    ``enabled=False`` reports and changes nothing. That is the default, and it is how the list
+    gets checked before anybody is trusted to it (G3.8): removing somebody who has in fact paid
+    is the most expensive mistake available, and payment detection has been wrong before.
+
+    **Admins are never removed.** A bug that throws the owner out of their own channel is both
+    likely and mortifying, and no subscription state should be able to cause it.
+    """
+    now = now or utcnow()
+    counts = {"lapsed": 0, "removed": 0, "failed": 0, "skipped_admin": 0, "would_remove": 0}
+
+    if not channel_id:
+        log.error("remove_lapsed_members: CHANNEL_ID is not set; nobody can be removed.")
+        return counts
+
+    async with session_factory() as session:
+        lapsed = (
+            (
+                await session.execute(
+                    select(Subscription).where(
+                        # Access ended, and the grace period after it has run out too. Written as
+                        # `expires_at <= now - grace` rather than `expires_at + grace <= now`:
+                        # adding an interval to a column is dialect-specific SQL, and binding a
+                        # timedelta through UtcDateTime fails outright.
+                        Subscription.expires_at <= now - config.grace,
+                        # EXPIRED is the mark of "already taken out", so the sweep is idempotent.
+                        Subscription.status != SubscriptionStatus.EXPIRED,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+        for subscription in lapsed:
+            if subscription.user_id in admin_ids:
+                counts["skipped_admin"] += 1
+                continue
+
+            counts["lapsed"] += 1
+            if not enabled:
+                counts["would_remove"] += 1
+                log.info(
+                    "Would remove %s (access ended %s) — REMOVAL_ENABLED is off",
+                    subscription.user_id,
+                    subscription.expires_at.isoformat(),
+                )
+                continue
+
+            removed = await subs.remove_from_community(
+                bot, chat_id=channel_id, user_id=subscription.user_id
+            )
+            if not removed:
+                counts["failed"] += 1
+                continue
+
+            # Marked expired only once they are actually out, so a failed removal is retried
+            # tomorrow rather than being recorded as done.
+            subscription.status = SubscriptionStatus.EXPIRED
+            await record_action(
+                session,
+                actor_id=min(admin_ids) if admin_ids else subscription.user_id,
+                action=Action.SUBSCRIPTION_EXPIRED,
+                target_user_id=subscription.user_id,
+                details={
+                    "reason": "access ended and grace exhausted",
+                    "expired_at": subscription.expires_at.isoformat(),
+                },
+                now=now,
+            )
+            counts["removed"] += 1
+
+            # Told why, and told they can come back — the message is not a punishment.
+            await _tell(bot, subscription.user_id, texts.ACCESS_SUSPENDED)
+
+        await session.commit()
+
+    log.info("remove_lapsed_members(enabled=%s): %s", enabled, counts)
     return counts
 
 
