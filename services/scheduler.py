@@ -32,8 +32,18 @@ from services.wayforpay import WayForPayClient
 
 log = logging.getLogger(__name__)
 
-#: How often to ask WayForPay about invoices that have not settled.
-POLL_INTERVAL_MINUTES = 2
+#: How often to ask WayForPay about invoices that have not settled, in seconds.
+#:
+#: 60s rather than the original 120s, owner's decision 2026-10-28: it halves the worst-case wait
+#: between a member paying and getting their channel link. It is a fallback now, not the primary
+#: path — the `serviceUrl` callback confirms a payment in about a second — but it still covers
+#: every invoice issued before webhook mode (those carry no callback URL) and any callback that
+#: is lost.
+#:
+#: The cost is one extra CHECK_STATUS per open invoice per minute. Invoices expire after two
+#: hours, so the query is small; going much below this would be paying real request volume to
+#: shave a path that should rarely be the one used.
+POLL_INTERVAL_SECONDS = 60
 
 #: Daily sweep. 9am local is deliberate: a payment request should not arrive at 3am, and an
 #: admin alert is more likely to be acted on during the day.
@@ -143,7 +153,7 @@ def start_scheduler(
     scheduler.add_job(
         poll_open_payments,
         "interval",
-        minutes=POLL_INTERVAL_MINUTES,
+        seconds=POLL_INTERVAL_SECONDS,
         id="poll_open_payments",
         kwargs={
             "session_factory": session_factory,
@@ -227,9 +237,9 @@ def start_scheduler(
 
     scheduler.start()
     log.info(
-        "Billing jobs started: payments polled every %s min, due dates checked daily at "
+        "Billing jobs started: payments polled every %ss, due dates checked daily at "
         "%s:00 %s, access recovered daily at %s:00 %s, removal enabled=%s",
-        POLL_INTERVAL_MINUTES,
+        POLL_INTERVAL_SECONDS,
         DUE_JOB_HOUR,
         settings.display_timezone,
         RECOVERY_HOUR,
