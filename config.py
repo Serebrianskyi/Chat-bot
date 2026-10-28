@@ -75,6 +75,11 @@ class Settings(BaseSettings):
     webhook_secret: str | None = None
     jobs_secret: str | None = None
 
+    # The port to listen on in webhook mode. Supplied by the platform — Railway sets PORT — so
+    # the default is only for a local run. Binding anything else makes the service unreachable
+    # with no error anywhere: the platform's health check simply never connects.
+    port: int = 8000
+
     # --- Phase 4: monitoring ---
     sentry_dsn: str | None = None
     log_level: str = "INFO"

@@ -31,6 +31,7 @@ from services.scheduler import (
     start_scheduler,
 )
 from services.wayforpay import WayForPayClient
+from web.routes import PAYMENTS_CALLBACK_PATH, TELEGRAM_WEBHOOK_PATH, create_app
 
 log = logging.getLogger(__name__)
 
@@ -143,11 +144,102 @@ async def run_polling(settings: Settings, engine: AsyncEngine) -> None:
         await bot.session.close()
 
 
+async def run_webhook(settings: Settings, engine: AsyncEngine) -> None:
+    """Production mode: Telegram and WayForPay both POST to us.
+
+    Two things this gains over polling, and the second is the reason it exists:
+
+    * confirmation is immediate and exactly once, instead of a two-minute poll that can miss an
+      order the moment it leaves the query — which is how 77 orders were written off;
+    * **WayForPay delivers a ``recToken`` to ``serviceUrl`` and nowhere else**, so automatic
+      renewal is impossible without this endpoint (payments design §1a).
+
+    The scheduler still runs in-process: the daily jobs are date comparisons, not timers, so
+    nothing is missed across restarts and no public job endpoint is needed.
+    """
+    import uvicorn
+
+    if not settings.base_url:
+        raise ConfigError(
+            "MODE=webhook needs BASE_URL — the public HTTPS address of this service, e.g.\n"
+            "    BASE_URL=https://your-service.up.railway.app\n"
+            "Telegram and WayForPay both post to it, and WayForPay's callback is the only place\n"
+            "a payment token is ever delivered."
+        )
+    if not settings.webhook_secret:
+        raise ConfigError(
+            "MODE=webhook needs WEBHOOK_SECRET. Without it the webhook endpoint would accept a\n"
+            "forged update from anyone who knows the URL, including one impersonating an admin.\n"
+            "Any long random string will do."
+        )
+
+    bot = build_bot(settings)
+    session_factory = create_session_factory(engine)
+    try:
+        wayforpay = build_client(settings)
+        billing_config = build_billing_config(settings)
+        dispatcher = build_dispatcher(
+            settings, session_factory, wayforpay=wayforpay, billing_config=billing_config
+        )
+
+        await register_commands(bot, settings.admin_id_set)
+
+        webhook_url = settings.base_url.rstrip("/") + TELEGRAM_WEBHOOK_PATH
+        # drop_pending_updates: anything queued while the bot was down is stale by now, and
+        # replaying it would re-run handlers against a database that has moved on.
+        await bot.set_webhook(
+            url=webhook_url,
+            secret_token=settings.webhook_secret,
+            drop_pending_updates=True,
+        )
+        me = await bot.get_me()
+        log.info(
+            "Webhook mode as @%s: updates at %s, payments at %s",
+            me.username,
+            webhook_url,
+            settings.base_url.rstrip("/") + PAYMENTS_CALLBACK_PATH,
+        )
+
+        app = create_app(
+            settings=settings,
+            dispatcher=dispatcher,
+            bot=bot,
+            engine=engine,
+            session_factory=session_factory,
+            wayforpay=wayforpay,
+            billing_config=billing_config,
+        )
+        scheduler = start_scheduler(settings=settings, session_factory=session_factory, bot=bot)
+        try:
+            # The platform supplies PORT; 8000 is only a local default.
+            server = uvicorn.Server(
+                uvicorn.Config(
+                    app,
+                    host="0.0.0.0",  # noqa: S104 - a container must listen on all interfaces
+                    port=settings.port,
+                    log_level=settings.log_level.lower(),
+                )
+            )
+            await server.serve()
+        finally:
+            if scheduler is not None:
+                scheduler.shutdown(wait=False)
+    except TelegramUnauthorizedError:
+        raise ConfigError(
+            "Telegram rejected BOT_TOKEN. Check it is copied whole from @BotFather."
+        ) from None
+    finally:
+        await bot.session.close()
+
+
 async def _run(settings: Settings) -> None:
     """Own the engine for the lifetime of the process, and dispose it on the way out."""
     engine = create_engine(settings.database_url)
     try:
-        await run_polling(settings, engine)
+        if settings.mode == "webhook":
+            await run_webhook(settings, engine)
+        else:
+            await run_polling(settings, engine)
     finally:
         await engine.dispose()
 
@@ -168,11 +260,6 @@ def main() -> int:
         level=settings.log_level,
         format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
     )
-
-    if settings.mode == "webhook":
-        # TODO(phase-4): serve web.app with uvicorn; register the webhook with
-        # secret_token=settings.webhook_secret on startup.
-        raise NotImplementedError("Phase 4: run the FastAPI app in webhook mode.")
 
     try:
         asyncio.run(_run(settings))

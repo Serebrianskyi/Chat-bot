@@ -24,7 +24,7 @@ when asked.
 
 ---
 
-## 1a. Correction, 2026-10-20 — how a `recToken` is actually obtained
+## 1a. Correction, 2026-10-20, resolved 2026-10-28 — how a `recToken` is actually obtained
 
 WayForPay support, asked directly:
 
@@ -41,12 +41,22 @@ Checked against their documentation the same day:
   paymentSystems, clientFirstName, clientLastName, clientEmail, clientPhone`. No `regularMode`,
   `regularAmount`, `dateNext` or `dateEnd`.
   ([create invoice](https://wiki.wayforpay.com/en/view/608996852))
-- **A `recToken` is issued by `Purchase` (full card details entered) or `Card Verify`** — not by
-  paying an invoice link.
-  ([tokenization](https://wiki.wayforpay.com/display/WADE/Tokenization))
+- **A `recToken` is issued by `Purchase` (full card details entered) or `Card Verify`**
+  ([tokenization](https://wiki.wayforpay.com/en/view/852175)). Paying an invoice link *is* a
+  Purchase underneath, so an invoice payment does generate one — see the next point.
 - **For an invoice, `recToken` arrives in the `serviceUrl` notification**, not in the
-  `CREATE_INVOICE` response. Whether `CHECK_STATUS` also returns it is **unverified**; the code
-  reads it if present (`services/wayforpay.py`), and nothing has ever come back.
+  `CREATE_INVOICE` response. The CREATE_INVOICE page documents its own `serviceUrl` callback and
+  lists `recToken` among the fields it carries
+  ([create invoice](https://wiki.wayforpay.com/en/view/608996852)).
+- **`CHECK_STATUS` does not return it.** Settled by evidence on 2026-10-28: order
+  `sub-478719815-1793107379`, a real `Approved` 10 EUR payment, came back with
+  `merchantAccount, reason, reasonCode, orderReference, amount, currency, authCode, createdDate,
+  processingDate, cardPan, cardType, issuerBankCountry, issuerBankName, transactionStatus,
+  refundAmount, settlementDate, settlementAmount, fee, merchantSignature, baseAmount,
+  baseCurrency` — and **no `recToken`**. So polling can never obtain a token, however long it
+  runs. (That body also had an **empty `cardPan` on an Approved payment**, which is worth
+  remembering: `refine_status` treats a `Declined` with neither `amount` nor `cardPan` as
+  untouched, and this shows `cardPan` alone would be an unsafe signal.)
 - A payment already taken without regularity parameters **cannot be made regular afterwards**, so
   there is no retroactive fix for the periods already sold.
 
@@ -56,16 +66,24 @@ Checked against their documentation the same day:
 `CHARGE` is implemented and tested (`billing.attempt_charge`). But §1 assumed the token would
 simply arrive with the first payment. It will not, on the current `CREATE_INVOICE` integration.
 
-Either route to automatic renewal needs something this deployment does not have:
+**Automatic renewal is blocked on one thing only: the `serviceUrl` callback**, which needs a
+public HTTPS endpoint — the Phase 4 webhook. `serviceUrl` is an optional `CREATE_INVOICE`
+parameter and `web/routes.py` already reserves `POST /payments/wayforpay` for it.
 
-| Route | Needs |
-|---|---|
-| `recToken` + our own `CHARGE` | a token, which arrives at `serviceUrl` → **a public HTTPS endpoint** (Phase 4), or confirmation that `CHECK_STATUS` returns one |
-| WayForPay-side regularity | the `Purchase` flow instead of `CREATE_INVOICE`, plus either `serviceUrl` or polling the regular-payments `STATUS` API |
+**Members do not have to pay differently.** `CREATE_INVOICE` stays; it gains `serviceUrl`. The
+earlier worry — that tokenization would force the `Purchase` flow and change the member's
+experience — is contradicted by the CREATE_INVOICE page documenting `recToken` on its own
+callback.
 
-So automatic renewal is blocked on the **Phase 4 webhook**, not on a payload tweak. `serviceUrl`
-is an optional `CREATE_INVOICE` parameter and `web/routes.py` already reserves
-`POST /payments/wayforpay` for it.
+Two details of the callback, both easy to get wrong:
+
+- **It must be answered**, or WayForPay retries. The reply is
+  `{orderReference, status: "accept", time, signature}` with
+  `signature = HMAC_MD5("orderReference;status;time", secret)` — a **different** field list from
+  the response signature verified elsewhere in this document.
+- **The incoming signature covers** `merchantAccount;orderReference;amount;currency;authCode;
+  cardPan;transactionStatus;reasonCode`, which is exactly `RESPONSE_SIGNATURE_FIELDS` already in
+  `services/wayforpay.py`, so `verify_response` works on it unchanged.
 
 `CHARGE` also requires `merchantTransactionType` and `merchantTransactionSecureType`, both
 mandatory and both absent from the first implementation — corrected the same day, `SALE` and

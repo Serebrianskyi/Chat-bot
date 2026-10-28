@@ -147,6 +147,46 @@ def refine_status(
     return PaymentStatus.PENDING_PAYMENT
 
 
+#: What the reply must say for WayForPay to stop retrying.
+CALLBACK_ACCEPT = "accept"
+
+#: **The documentation contradicts itself here**, and this is the one line that decides whether
+#: WayForPay accepts our acknowledgement or retries the callback for ever:
+#:
+#: * ``/en/view/608996852`` (create invoice — our flow) says the signed string is
+#:   ``orderReference;status;time``
+#: * ``/en/view/852194`` (charge) says it is ``orderReference;status;merchantSecretKey``
+#:
+#: ``time`` is chosen. It is the create-invoice page, which is the flow we use; ``time`` is a
+#: field of the reply while ``merchantSecretKey`` is already the HMAC key, so signing it as a
+#: *field* as well would be redundant; and 852194 reads like a copy-paste of the request
+#: signature's wording.
+#:
+#: **If callbacks arrive repeatedly in production, this is the first thing to flip.** Both forms
+#: are implemented below so swapping is a one-word change, not a rewrite.
+CALLBACK_SIGNATURE_USES_TIME = True
+
+
+def callback_reply(secret_key: str, *, order_reference: str, now: int) -> dict[str, Any]:
+    """The body to answer a ``serviceUrl`` notification with.
+
+    WayForPay repeats a callback until it is acknowledged, so this is not optional: an
+    unacknowledged payment arrives again and again. ``status`` is always ``accept`` — it
+    acknowledges *receipt*, not agreement, and there is nothing to decline.
+
+    Source: wiki.wayforpay.com/en/view/608996852 (the serviceUrl section), read 2026-10-28.
+    See ``CALLBACK_SIGNATURE_USES_TIME`` — the documented field list is not consistent between
+    pages, and that constant is where the choice lives.
+    """
+    third = str(now) if CALLBACK_SIGNATURE_USES_TIME else secret_key
+    return {
+        "orderReference": order_reference,
+        "status": CALLBACK_ACCEPT,
+        "time": now,
+        "signature": sign(secret_key, [order_reference, CALLBACK_ACCEPT, third]),
+    }
+
+
 def map_status(transaction_status: str | None) -> PaymentStatus:
     """Translate a gateway status, defaulting to ERROR for anything unrecognised.
 
@@ -192,6 +232,7 @@ class WayForPayClient:
         secret_key: str,
         api_url: str = API_URL,
         timeout: float = 30.0,
+        service_url: str | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._merchant_account = merchant_account
@@ -199,6 +240,9 @@ class WayForPayClient:
         self._secret_key = secret_key
         self._api_url = api_url
         self._timeout = timeout
+        # None while the bot polls: without a public HTTPS endpoint there is nowhere to post to,
+        # and sending an unreachable serviceUrl would have WayForPay retrying into the void.
+        self._service_url = service_url
         # A seam for tests: httpx.MockTransport lets the request-building and response-parsing
         # paths be exercised without a network, which is worth having on the money paths.
         self._transport = transport
@@ -298,6 +342,11 @@ class WayForPayClient:
             payload["orderTimeout"] = order_timeout
         if client_email:
             payload["clientEmail"] = client_email
+        if self._service_url:
+            # Where WayForPay posts the result — and the **only** place a `recToken` is ever
+            # delivered for an invoice payment, which is what makes automatic renewal possible
+            # at all. Not part of the signature.
+            payload["serviceUrl"] = self._service_url
 
         data = await self._post(payload)
 
@@ -417,6 +466,21 @@ class WayForPayClient:
             rec_token=data.get("recToken"),
             raw=data,
         )
+
+    def read_callback(self, payload: dict[str, Any]) -> TransactionStatus:
+        """Verify a ``serviceUrl`` notification and read it. Raises if it cannot be trusted.
+
+        The notification's own signature covers the same fields as any other response
+        (``RESPONSE_SIGNATURE_FIELDS``), so ``verify_response`` works on it unchanged — which is
+        why this is three lines rather than a parallel implementation.
+
+        **This is where a `recToken` finally arrives.** `CHECK_STATUS` does not carry one for an
+        invoice payment (proven in production, 2026-10-28); the callback does. See the payments
+        design doc §1a.
+        """
+        self.verify_response(payload)
+        order_reference = str(payload.get("orderReference") or "")
+        return self._read_transaction(order_reference, payload)
 
     async def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
         """One request.

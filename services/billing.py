@@ -379,6 +379,59 @@ async def _invite_fallback(
     )
 
 
+async def announce_confirmed_payment(
+    session: AsyncSession,
+    bot: Bot,
+    *,
+    payment: Payment,
+    admin_ids: frozenset[int],
+    config: BillingConfig,
+    now: datetime,
+) -> None:
+    """Tell a member their payment landed, and get them into the channel.
+
+    Shared by the poller and the ``serviceUrl`` callback, which both answer the same question and
+    must do the same thing about it. Two copies would drift, and what they would drift on is
+    whether a paying member gets their invite.
+
+    Telling the member is separate from having granted them the period. A failure here is logged
+    and dropped, and must never write back to ``payment.status``: downgrading a COMPLETE row
+    would put it back in the poll query, and ``apply_payment_result``'s idempotency guard only
+    holds while it reads COMPLETE, so the next Approved would extend the subscription a second
+    time (A.11).
+    """
+    try:
+        subscription = await session.get(Subscription, payment.subscription_id)
+        if subscription is None:
+            return
+
+        # A first payment and a renewal read differently to the member: one is a welcome, the
+        # other a receipt. free_period_granted tells them apart.
+        template = (
+            texts.PAYMENT_RENEWED
+            if subscription.free_period_granted
+            else texts.PAYMENT_FIRST_CONFIRMED
+        )
+        try:
+            await bot.send_message(
+                subscription.user_id,
+                template.format(club=texts.CLUB_NAME, until=texts.day(subscription.expires_at)),
+            )
+        except TelegramForbiddenError:
+            log.warning("Paid but unreachable: %s", subscription.user_id)
+
+        await deliver_invite(
+            session,
+            bot,
+            subscription=subscription,
+            channel_id=config.channel_id,
+            admin_ids=admin_ids,
+            now=now,
+        )
+    except Exception:
+        log.exception("Paid and extended, but announcing it failed for %s", payment.order_reference)
+
+
 async def poll_open_payments(
     session_factory: async_sessionmaker,
     client: WayForPayClient,
@@ -457,45 +510,14 @@ async def poll_open_payments(
 
             if extended:
                 counts["completed"] += 1
-                # Telling the member is separate from having granted them the period. A failure
-                # here is logged and dropped, and must never write back to ``payment.status``:
-                # downgrading a COMPLETE row would put it back in the poll query, and
-                # ``apply_payment_result``'s idempotency guard only holds while it reads COMPLETE,
-                # so the next Approved would extend the subscription a second time (A.11).
-                try:
-                    subscription = await session.get(Subscription, payment.subscription_id)
-                    if subscription is not None:
-                        # A first payment and a renewal read differently to the member: one is a
-                        # welcome, the other a receipt. free_period_granted tells them apart.
-                        template = (
-                            texts.PAYMENT_RENEWED
-                            if subscription.free_period_granted
-                            else texts.PAYMENT_FIRST_CONFIRMED
-                        )
-                        try:
-                            await bot.send_message(
-                                subscription.user_id,
-                                template.format(
-                                    club=texts.CLUB_NAME,
-                                    until=texts.day(subscription.expires_at),
-                                ),
-                            )
-                        except TelegramForbiddenError:
-                            log.warning("Paid but unreachable: %s", subscription.user_id)
-
-                        await deliver_invite(
-                            session,
-                            bot,
-                            subscription=subscription,
-                            channel_id=config.channel_id,
-                            admin_ids=admin_ids,
-                            now=now,
-                        )
-                except Exception:
-                    log.exception(
-                        "Paid and extended, but announcing it failed for %s",
-                        payment.order_reference,
-                    )
+                await announce_confirmed_payment(
+                    session,
+                    bot,
+                    payment=payment,
+                    admin_ids=admin_ids,
+                    config=config,
+                    now=now,
+                )
             elif payment.status is PaymentStatus.DENIED:
                 counts["failed"] += 1
 
@@ -1686,3 +1708,85 @@ async def recover_access(
 
     log.info("Access recovery finished: %s", results)
     return results
+
+
+# --- the serviceUrl callback: confirmation without polling ----------------------------------
+
+
+async def process_callback(
+    session_factory: async_sessionmaker,
+    bot: Bot,
+    *,
+    client: WayForPayClient,
+    payload: dict,
+    admin_ids: frozenset[int],
+    config: BillingConfig,
+    now: datetime | None = None,
+) -> bool:
+    """Apply a ``serviceUrl`` notification. True when it granted a period.
+
+    This is what makes automatic renewal possible: the callback is the **only** place WayForPay
+    delivers a ``recToken`` for an invoice payment — `CHECK_STATUS` does not carry one, proven in
+    production on 2026-10-28. See the payments design doc §1a.
+
+    It is also a better confirmation path than polling in its own right. The poller learns about
+    a payment up to two minutes late and only while the order is still in its query; the whole
+    77-order write-off of 2026-10-09 happened in that gap. A callback arrives once, immediately,
+    and carries the gateway's own signature.
+
+    Everything after the signature check is shared with the poller — `apply_payment_result` for
+    the money and `announce_confirmed_payment` for the member — so the two routes cannot drift
+    on idempotency, the amount check, or whether a payer gets their invite.
+
+    Raises `SignatureMismatch` if the body cannot be trusted: the caller must not acknowledge a
+    forged notification.
+    """
+    now = now or utcnow()
+    result = client.read_callback(payload)  # verifies the signature first
+
+    async with session_factory() as session:
+        payment = await session.scalar(
+            select(Payment).where(Payment.order_reference == result.order_reference)
+        )
+        if payment is None:
+            # An order this bot never created. Logged rather than raised: the notification is
+            # genuine (it passed the signature), so it is acknowledged and dropped — retrying it
+            # would not make the row appear.
+            log.error(
+                "Callback for an unknown order %s (%s); nothing to apply",
+                result.order_reference,
+                result.gateway_status,
+            )
+            return False
+
+        extended = await subs.apply_payment_result(
+            session,
+            payment=payment,
+            status=result.status,
+            gateway_status=result.gateway_status,
+            amount=result.amount,
+            currency=result.currency,
+            rec_token=result.rec_token,
+            reason_code=result.reason_code,
+            raw=result.raw,
+            now=now,
+        )
+        if extended:
+            await announce_confirmed_payment(
+                session,
+                bot,
+                payment=payment,
+                admin_ids=admin_ids,
+                config=config,
+                now=now,
+            )
+        await session.commit()
+
+    log.info(
+        "Callback %s: %s -> extended=%s, token=%s",
+        result.order_reference,
+        result.gateway_status,
+        extended,
+        "yes" if result.rec_token else "no",
+    )
+    return extended

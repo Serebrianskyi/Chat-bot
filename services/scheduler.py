@@ -55,6 +55,19 @@ RECOVERY_HOUR = 11
 RECOVERY_TIMEZONE = "Europe/Warsaw"
 
 
+def service_url(settings: Settings) -> str | None:
+    """Where WayForPay should post payment results, or None while the bot polls.
+
+    Only meaningful with a public HTTPS base URL. Sending a `serviceUrl` the gateway cannot reach
+    would have it retrying into the void, so it is omitted entirely in polling mode.
+    """
+    if settings.mode != "webhook" or not settings.base_url:
+        return None
+    from web.routes import PAYMENTS_CALLBACK_PATH
+
+    return settings.base_url.rstrip("/") + PAYMENTS_CALLBACK_PATH
+
+
 def build_client(settings: Settings) -> WayForPayClient | None:
     """The WayForPay client, or None when it is not configured.
 
@@ -68,6 +81,8 @@ def build_client(settings: Settings) -> WayForPayClient | None:
         merchant_domain=str(settings.wayforpay_merchant_domain),
         # Unwrapped here, at the single point of use, and never stored anywhere else.
         secret_key=settings.wayforpay_secret_key.get_secret_value(),  # type: ignore[union-attr]
+        # Where payment results are posted. None while polling — see `service_url`.
+        service_url=service_url(settings),
     )
 
 

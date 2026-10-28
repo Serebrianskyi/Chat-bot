@@ -2332,6 +2332,227 @@ async def test_cancelling_a_subscription_keeps_the_paid_period(dispatcher, bot, 
 
 
 # ======================================================================================
+# The webhook: a public endpoint that moves money
+# ======================================================================================
+
+
+#: The same key `tests.conftest.settings` gives the app. The callback is verified with the
+#: client's key and the reply is signed from settings; in production they are one value, so a
+#: test that used two would prove nothing about either.
+CALLBACK_SECRET = "test_secret"  # noqa: S105 - matches the test fixture
+
+
+def signed_callback(
+    order_ref,
+    *,
+    amount=REGULAR_PRICE,
+    rec_token="tok-from-callback",  # noqa: S107 - a fake token in a test
+):
+    """A serviceUrl notification signed the way WayForPay signs one."""
+    import hashlib
+    import hmac
+
+    body = {
+        "merchantAccount": "acct",
+        "orderReference": order_ref,
+        "amount": str(amount),
+        "currency": CURRENCY,
+        "authCode": "740620",
+        "cardPan": "41****8217",
+        "transactionStatus": "Approved",
+        "reasonCode": "1100",
+        "recToken": rec_token,
+        "fee": 10.29,
+    }
+    body["merchantSignature"] = hmac.new(
+        CALLBACK_SECRET.encode(),
+        ";".join(str(body.get(f, "") or "") for f in RESPONSE_SIGNATURE_FIELDS).encode(),
+        hashlib.md5,
+    ).hexdigest()
+    return body
+
+
+@pytest.fixture
+def web_app(settings, session_factory, engine, bot, fake_wayforpay):
+    """The production app, with the gateway client faked."""
+    from main import build_dispatcher
+    from services.wayforpay import WayForPayClient
+    from web.routes import create_app
+
+    client = WayForPayClient(
+        merchant_account="acct",
+        merchant_domain="example.com",
+        secret_key=CALLBACK_SECRET,
+    )
+    return create_app(
+        settings=settings,
+        dispatcher=build_dispatcher(settings, session_factory, wayforpay=fake_wayforpay),
+        bot=bot,
+        engine=engine,
+        session_factory=session_factory,
+        wayforpay=client,
+        billing_config=BillingConfig(period_days=PERIOD_DAYS, channel_id=CHANNEL_ID),
+    )
+
+
+async def test_a_forged_payment_callback_is_refused(web_app, session_factory, bot, config):
+    """The endpoint is public, so the signature is the only thing standing between a stranger
+    and a free subscription.
+
+    A refused body must also go **unacknowledged**: replying `accept` would tell WayForPay a
+    real notification had been handled.
+    """
+    import httpx
+
+    await seed_due(session_factory)
+    gw = FakeGateway()
+    await process_due_subscriptions(
+        session_factory, gw, bot, admin_ids=frozenset({ADMIN_ID}), config=config, now=NOW
+    )
+    ref = (await one_payment(session_factory)).order_reference
+
+    forged = signed_callback(ref)
+    forged["amount"] = "1.00"  # tampered after signing
+
+    transport = httpx.ASGITransport(app=web_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
+        response = await http.post("/payments/wayforpay", json=forged)
+
+    assert response.status_code == 403
+    assert "accept" not in response.text
+    # No period granted, and no token taken from an untrustworthy body.
+    sub = await load_sub(session_factory)
+    assert sub.expires_at == NOW
+    assert sub.wayforpay_rec_token is None
+
+
+async def test_a_genuine_callback_grants_access_captures_the_token_and_is_acknowledged(
+    web_app, session_factory, bot, config, recording_session
+):
+    """The whole point of the webhook: this is the only place a `recToken` arrives.
+
+    `CHECK_STATUS` does not carry one for an invoice payment — proven in production on
+    2026-10-28 — so without this endpoint `attempt_charge` can never fire and «оплата
+    автоматична» stays untrue.
+    """
+    import hashlib
+    import hmac
+
+    import httpx
+
+    from db.models import utcnow
+
+    await seed_due(session_factory)
+    gw = FakeGateway()
+    await process_due_subscriptions(
+        session_factory, gw, bot, admin_ids=frozenset({ADMIN_ID}), config=config, now=NOW
+    )
+    ref = (await one_payment(session_factory)).order_reference
+
+    transport = httpx.ASGITransport(app=web_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
+        response = await http.post("/payments/wayforpay", json=signed_callback(ref))
+
+    assert response.status_code == 200
+    reply = response.json()
+    # WayForPay repeats a callback until it is acknowledged with a signed `accept`.
+    assert reply["status"] == "accept"
+    assert reply["orderReference"] == ref
+    # Signed over orderReference;status;time — a DIFFERENT field list from the one WayForPay
+    # signs its own notification with, and one the documentation gives inconsistently. Computed
+    # here from the create-invoice page's wording rather than from the code's own helper, so a
+    # change to that helper cannot quietly satisfy this assertion.
+    expected = hmac.new(
+        CALLBACK_SECRET.encode(), f"{ref};accept;{reply['time']}".encode(), hashlib.md5
+    ).hexdigest()
+    assert reply["signature"] == expected
+
+    sub = await load_sub(session_factory)
+    # The endpoint runs on the real clock, not the suite's NOW, so the period is asserted as a
+    # span rather than an instant: a month from whenever the callback landed.
+    granted = sub.expires_at
+    assert granted > utcnow() + timedelta(days=PERIOD_DAYS - 1)
+    assert sub.status is SubscriptionStatus.ACTIVE
+    # The token, which is why any of this exists. Renewals can charge from here on.
+    assert sub.wayforpay_rec_token == "tok-from-callback"
+    # And the member is told and invited, exactly as the poller would have done.
+    assert recording_session.of_type("CreateChatInviteLink")
+
+    # Repeating the callback — which WayForPay does if an acknowledgement is lost — must not
+    # grant a second period (A.11).
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
+        again = await http.post("/payments/wayforpay", json=signed_callback(ref))
+    assert again.status_code == 200
+    assert (await load_sub(session_factory)).expires_at == granted
+
+
+async def test_the_telegram_webhook_rejects_a_wrong_or_missing_secret(web_app):
+    """G4.3. Anyone can POST to a public URL; without the header check they could forge any
+    update, including one impersonating an admin."""
+    import httpx
+
+    update = {
+        "update_id": 1,
+        "message": {
+            "message_id": 1,
+            "date": 0,
+            "chat": {"id": ADMIN_ID, "type": "private"},
+            "from": {"id": ADMIN_ID, "is_bot": False, "first_name": "X"},
+            "text": "/admin",
+        },
+    }
+    transport = httpx.ASGITransport(app=web_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
+        missing = await http.post("/telegram/webhook", json=update)
+        wrong = await http.post(
+            "/telegram/webhook",
+            json=update,
+            headers={"X-Telegram-Bot-Api-Secret-Token": "not-the-secret"},
+        )
+
+    assert missing.status_code == 403
+    assert wrong.status_code == 403
+
+
+async def test_health_is_200_only_while_the_database_answers(
+    settings, session_factory, engine, bot, fake_wayforpay
+):
+    """G4.5. A health check that passes while the database is unreachable is worse than none:
+    the platform keeps routing to a bot that cannot do anything.
+
+    Checked against a second app whose engine points at an unreachable database, rather than by
+    breaking the working one: SQLite happily recreates a deleted file, so "delete it and retry"
+    proves nothing.
+    """
+    import httpx
+
+    from main import build_dispatcher
+    from web.routes import create_app
+
+    def app_with(db_engine):
+        return create_app(
+            settings=settings,
+            dispatcher=build_dispatcher(settings, session_factory, wayforpay=fake_wayforpay),
+            bot=bot,
+            engine=db_engine,
+            session_factory=session_factory,
+            wayforpay=None,
+            billing_config=BillingConfig(period_days=PERIOD_DAYS),
+        )
+
+    transport = httpx.ASGITransport(app=app_with(engine))
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
+        assert (await http.get("/health")).status_code == 200
+
+    # A directory that does not exist, so SQLite cannot create a file there either.
+    broken = create_engine("sqlite+aiosqlite:////nonexistent-dir/nope.db")
+    transport = httpx.ASGITransport(app=app_with(broken))
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
+        assert (await http.get("/health")).status_code == 503
+    await broken.dispose()
+
+
+# ======================================================================================
 # Safety nets
 # ======================================================================================
 

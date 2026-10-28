@@ -30,7 +30,7 @@ into the payment phase.
 ## Current status
 
 Last updated 2026-10-06. **Working and pushed** (`Serebrianskyi/Chat-bot`, branch `main`),
-deployed on Railway. 57 tests, 10 migrations.
+deployed on Railway. 61 tests, 10 migrations.
 
 ### Built
 
@@ -46,7 +46,8 @@ deployed on Railway. 57 tests, 10 migrations.
 | Channel invite | Single-use, 3-day link on a confirmed payment. Every failure path tells the member something true and alerts an admin. An admin can also send one by hand from the panel, for a member the automatic path missed |
 | Renewal reminder | Daily at 09:30 Kyiv, one day before a period ends. A member with a stored card is told to check their balance («Завтра відбудеться автоматичне списання»); one without is told they must pay and gets a live link, which today is everybody. Fires once per period via `last_reminder_at` (G3.7) |
 | Declined charges | Two attempts, a day apart. First decline: «🚫 Платіж відхилено … Наступна спроба: <tomorrow>». Second: «🚫 Підписка скасована … Дата закінчення: <today>» — `expires_at` becomes now, status `cancelled`, and the stored card is forgotten so nothing can be charged again. Replaces charging a failing card every morning for ever |
-| Renewals | **Inert today — no token can be obtained; see `docs/telegram-bot-payments-design.md` §1a.** Daily at 09:00 Kyiv: a member with a stored `recToken` is **charged** (`CHARGE`, synchronous, signature-verified, amount computed per charge from their own price); one without gets a payment link as before. This is what finally makes `PAYMENT_FIRST_CONFIRMED`'s «оплата автоматична» true. A declined card is told `CHARGE_FAILED` and not retried for `RETRY_AFTER_HOURS`, so the copy's «через 24 години» is the behaviour. A renewal sends no invite — they are already in the channel. The `payments` row is written **before** the charge, so a charge that takes money and loses the connection is still reconcilable |
+| Webhook | `MODE=webhook` serves FastAPI: `/telegram/webhook` (secret-token header, G4.3), `/payments/wayforpay` and `/health` (503 unless the database answers, G4.5). **The callback is the only place WayForPay delivers a `recToken`** — `CHECK_STATUS` does not carry one, proven in production 2026-10-28 — so automatic renewal is impossible without it. It also makes confirmation immediate instead of a 2-minute poll, closing the gap that wrote off 77 orders. `serviceUrl` is sent on `CREATE_INVOICE` only in webhook mode. The callback is acknowledged with a signed `accept` or WayForPay retries for ever; that reply's signature uses a **different** field list from the one it signs its own body with, and the docs give it inconsistently — see `CALLBACK_SIGNATURE_USES_TIME`. `/jobs/*` deliberately not built |
+| Renewals | **Inert until a token arrives — which needs `MODE=webhook`; see `docs/telegram-bot-payments-design.md` §1a.** Daily at 09:00 Kyiv: a member with a stored `recToken` is **charged** (`CHARGE`, synchronous, signature-verified, amount computed per charge from their own price); one without gets a payment link as before. This is what finally makes `PAYMENT_FIRST_CONFIRMED`'s «оплата автоматична» true. A declined card is told `CHARGE_FAILED` and not retried for `RETRY_AFTER_HOURS`, so the copy's «через 24 години» is the behaviour. A renewal sends no invite — they are already in the channel. The `payments` row is written **before** the charge, so a charge that takes money and loses the connection is still reconcilable |
 | Recovery report | After the daily sweep, admins get **one** message: who had a payment recovered, who was sent a link, and who still needs a person — each with a tap-to-copy id and the reason. Built from `audit_log`, so it reports what was recorded, not what was attempted. A failed step is named. Nothing to report means no message |
 | Invite recovery | Daily at **11:00 Warsaw** (12:00 Kyiv), as part of the recovery sweep: finds paid members who are not in the channel and sends one retry. If that does not get them in, an admin is told directly — handle, id, name, reason — and the member is not touched again. Scope is everyone holding paid access, **plus** anyone with a confirmed payment who has never been sent a link at all, even if their period has lapsed — otherwise a payer whose invite failed drops out of scope when their month runs out. A free trial is **not** a payment: TRIAL subscriptions are never messaged by it |
 | Reconciliation | Re-asks WayForPay about orders this bot wrote off and credits the ones really paid, with their invites. Runs daily at 11:00 Warsaw inside `recover_access`, and by hand as `run_jobs reconcile` (a dry run until `--apply`) or `run_jobs recover` (the whole sweep, forced past the daily guard). Only members who currently have **no** access are in scope, so a hand-written credit cannot be doubled, and one member is credited at most once per sweep |
@@ -263,8 +264,8 @@ through `db.models.utcnow()`.
 - **Python 3.14** instead of 3.12 — see Environment above.
 - **No deployment: this laptop is the test server.** The owner decided on 2026-09-28 to run
   the bot locally from PyCharm rather than deploy to Railway/Render. Consequences to respect:
-  - **Polling, not webhooks.** There is no public HTTPS URL. `MODE=webhook` and `web/routes.py`
-    stay Phase 4 work; do not wire them up as a workaround.
+  - **Polling locally, webhook in production.** `MODE=webhook` is built (`web/routes.py`) and is
+    required for automatic renewals; a local run has no public HTTPS URL, so it stays on polling.
   - **SQLite is the working database** (`chatbot.db`, gitignored). Nothing creates tables at
     startup, so `alembic upgrade head` must be run after any schema change — the
     **1 Migrate** run configuration exists for this. PostgreSQL is exercised only by CI.
