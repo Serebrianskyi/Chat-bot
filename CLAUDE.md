@@ -71,8 +71,6 @@ is a comparison against `expires_at`.
 
 ### Not built — in the order I would do it
 
-The working order lives in [docs/plan-2026-10-20.md](docs/plan-2026-10-20.md); this is the summary.
-
    deferred until the payment path has been exercised with real money; an admin is alerted instead.
 1. **Knowledge base** (plan Phase 2) — 10 TODOs; category names already in `texts.py`.
 2. **Networking catalogue** (plan Phase 6) — 6 TODOs; card layout already in `texts.py`.

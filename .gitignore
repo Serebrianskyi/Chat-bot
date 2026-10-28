@@ -236,3 +236,10 @@ __marimo__/
 # The template leaves this commented out; PyCharm state is local, and
 # .idea/runConfigurations carries machine-specific paths.
 .idea/
+
+# Working notes, not project documentation. The plan and the SQL recipes are scratch: they go
+# stale the moment the code moves, and `CLAUDE.md` plus docs/ are the authoritative record.
+# Kept on disk because they are useful while working; out of the repo so nobody treats them as
+# current. Owner's decision, 2026-10-28.
+docs/plan-*.md
+docs/sql-recipes.md
