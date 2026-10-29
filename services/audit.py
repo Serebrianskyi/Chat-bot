@@ -44,6 +44,10 @@ class Action:
     BROADCAST_SENT = "broadcast.sent"
     #: One row per post the bot published in the channel.
     CHANNEL_POST = "channel.post"
+    #: Promo codes. REDEEMED is written with the member as actor, because they did it themselves.
+    PROMO_CREATED = "promo.created"
+    PROMO_REVOKED = "promo.revoked"
+    PROMO_REDEEMED = "promo.redeemed"
     #: One row per daily access-recovery sweep, which is also how the job knows it has already
     #: run today and must not run again on the next deploy.
     ACCESS_RECOVERED = "access.recovered"

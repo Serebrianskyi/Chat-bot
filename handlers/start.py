@@ -89,6 +89,8 @@ def member_keyboard(is_admin: bool, *, pay_url: str | None = None) -> InlineKeyb
     rows.append(
         [InlineKeyboardButton(text=texts.MENU_MY_SUBSCRIPTION, callback_data="menu:subscription")]
     )
+    # Offered beside the price, which is the only moment somebody remembers they have a code.
+    rows.append([InlineKeyboardButton(text=texts.MENU_PROMO, callback_data="menu:promo")])
     if is_admin:
         rows.append([InlineKeyboardButton(text=texts.ADMIN_MENU_TITLE, callback_data="menu:admin")])
     return InlineKeyboardMarkup(inline_keyboard=rows)

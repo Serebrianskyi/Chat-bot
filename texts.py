@@ -274,6 +274,7 @@ CMD_ADMIN = "Адмін-панель"
 MENU_KNOWLEDGE_BASE = "📚 База знань"  # SPEC
 MENU_NETWORKING = "🤝 Нетворкінг / Каталог"  # SPEC
 MENU_MY_SUBSCRIPTION = "💳 Моя підписка"
+MENU_PROMO = "🎟 У мене є промокод"
 MENU_MY_PROFILE = "👤 Мій профіль"
 
 #: The member's own subscription card. Two variants, because one line cannot honestly cover
@@ -332,6 +333,8 @@ ADMIN_MENU_SEND_INVITE = "🔗 Надіслати запрошення"
 ADMIN_MENU_MESSAGE_USER = "✍️ Написати учаснику"
 ADMIN_MENU_CHANNEL_POST = "📢 Написати в канал"
 ADMIN_MENU_GIFT_MONTHS = "🎁 Подарувати місяць"
+ADMIN_MENU_PROMOS = "🎟 Промокоди"
+ADMIN_MENU_CREATE_PROMO = "➕ Створити промокод"
 
 # --- the participants list ---
 #
@@ -568,6 +571,100 @@ ADMIN_MESSAGE_EMPTY = "Повідомлення порожнє. Напишіть
 #: How an admin's message arrives for the member. Marked as coming from a person, not the bot:
 #: a bare forwarded string reads like an automated notice and gets ignored.
 MESSAGE_FROM_ADMIN = "Повідомлення від адміністратора {club}:\n\n{text}"
+
+# --- 🎟 Промокоди ------------------------------------------------------------------------------
+#
+# A promo code is an offer anyone may type; a discount is one person's price. They layer: a
+# founding member on 8 EUR who redeems a 20% code pays 6.40 while it lasts and then returns to 8.
+
+PROMO_ASK_CODE = "Введіть промокод\n\nЩоб скасувати — /cancel"
+
+#: The discounted periods start from the member's **next** payment, not from today, so the
+#: message says when it will apply rather than implying it is already active.
+PROMO_REDEEMED = (
+    "✅ Промокод прийнято!\n\n"
+    "Ваша ціна: <b>{amount}</b> замість {was} — на {months}.\n"
+    "Діє з наступної оплати ({until})."
+)
+
+#: Redeemed by somebody who owes money right now: the discount applies to the payment they are
+#: about to make, so there is no future date to quote.
+PROMO_REDEEMED_NOW = (
+    "✅ Промокод прийнято!\n\n"
+    "Ваша ціна: <b>{amount}</b> замість {was} — на {months}.\n"
+    "Натисніть кнопку нижче, щоб оплатити за новою ціною."
+)
+
+PROMO_UNKNOWN = "Такого промокоду не існує. Перевірте написання або /cancel"
+PROMO_EXPIRED = "Термін дії цього промокоду вже закінчився."
+PROMO_USED = "Ви вже використали цей промокод."
+PROMO_ANOTHER_RUNNING = "У вас вже діє інший промокод. Він спрацює на наступній оплаті."
+PROMO_EXHAUSTED = "Цей промокод вже використали максимальну кількість разів."
+PROMO_NEW_ONLY = "Цей промокод лише для нових учасників."
+PROMO_NO_SUBSCRIPTION = (
+    "Спочатку відкрийте бота командою /start — промокод застосовується до підписки."
+)
+
+# --- admin: creating and listing codes -------------------------------------------------------
+
+ADMIN_PROMO_ASK_CODE = (
+    "<b>Новий промокод</b>\n\n"
+    "Надішліть сам код — наприклад <code>halloween</code>.\n"
+    "Літери, цифри, дефіс. Регістр не має значення.\n"
+    "Щоб скасувати — /cancel"
+)
+
+ADMIN_PROMO_ASK_PRICE = (
+    "Яка ціна за промокодом для <code>{code}</code>?\n\n"
+    "Оберіть відсоток кнопкою, або надішліть:\n"
+    "• суму — наприклад <code>8</code>\n"
+    "• відсоток — наприклад <code>15%</code>\n\n"
+    "Відсоток рахується від <b>ціни учасника</b>: 20% для того, хто платить 8 €, це 6,40 €."
+)
+ADMIN_PROMO_BAD_PRICE = (
+    "Не зрозумів. Надішліть суму (<code>8</code>) або відсоток (<code>15%</code>), або /cancel"
+)
+
+ADMIN_PROMO_ASK_WINDOW = (
+    "<b>Скільки часу діє сам промокод?</b>\n\n"
+    "Тобто як довго його можна вводити. Це не те саме, що тривалість знижки."
+)
+ADMIN_PROMO_ASK_MONTHS = (
+    "<b>На скільки місяців знижка?</b>\n\n"
+    "Промокод можна вводити {window}, а знижка діє стільки, скільки виберете тут."
+)
+ADMIN_PROMO_ASK_AUDIENCE = "<b>Хто може скористатися?</b>"
+ADMIN_PROMO_AUDIENCE_NEW = "🆕 Лише нові учасники"
+ADMIN_PROMO_AUDIENCE_ALL = "👥 Усі"
+
+ADMIN_PROMO_CONFIRM = (
+    "Створити промокод?\n\n"
+    "Код: <code>{code}</code>\n"
+    "Ціна: <b>{price}</b>\n"
+    "Діє (можна вводити): {window}\n"
+    "Знижка: {months}\n"
+    "Для кого: {audience}\n\n"
+    "Один учасник може скористатися кодом лише один раз."
+)
+ADMIN_PROMO_CONFIRM_YES = "✅ Створити"
+ADMIN_PROMO_CREATED = "✅ Промокод <code>{code}</code> створено. Діє до {until}."
+ADMIN_PROMO_EXISTS = "Такий промокод вже існує. Надішліть інший або /cancel"
+ADMIN_PROMO_BAD_CODE = (
+    "Код має містити 3-32 символи: літери, цифри, дефіс. Спробуйте ще раз або /cancel"
+)
+
+ADMIN_PROMOS_EMPTY = "Активних промокодів немає."
+ADMIN_PROMOS_HEADER = "<b>Активні промокоди</b> — {count}\n"
+#: One line per code. `used` is the redemption count, `months` the discount length.
+ADMIN_PROMO_LINE = (
+    "• <code>{code}</code> — {price}, знижка на {months}, до {until}, використали: {used}{cap}"
+)
+ADMIN_PROMO_CAP = " з {max}"
+ADMIN_PROMO_NEW_ONLY_MARK = " · лише нові"
+ADMIN_PROMO_REVOKE_BUTTON = "⏹ Зупинити {code}"
+ADMIN_PROMO_REVOKED = (
+    "Промокод <code>{code}</code> зупинено. Ті, хто вже скористався, знижку зберігають."
+)
 
 # --- 🎁 Подарувати місяць (admin extends a member's access for free) ------------------------
 #

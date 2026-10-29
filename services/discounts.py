@@ -94,13 +94,33 @@ async def effective_price(
     Called at invoicing time, which is what makes ``valid_until`` meaningful: the same member is
     charged the discounted amount while the discount lives and the base amount afterwards, with no
     job needed to "expire" anything.
+
+    **Three layers, in this order:** a live promo code wins; otherwise their standing discount;
+    otherwise the club's tariff. The layers are separate on purpose — a founding member on 8 EUR
+    who redeems a promo pays the promo price while it lasts and then returns to 8, not to 10. See
+    ``services.promos``.
+
+    The returned ``Discount`` is the **standing** one, or None; a promo is not a discount row and
+    callers that need to name it should use ``services.promos.promo_price``. Returning it here
+    would have the admin screens reporting a temporary offer as somebody's tariff.
     """
+    from services import promos
+
     discount = await find_active(
         session, telegram_id=subscription.user_id, username=username, now=now
     )
     if discount is None:
-        return subscription.price, subscription.currency, None
-    amount, currency = apply_to(subscription.price, subscription.currency, discount)
+        standing, currency = subscription.price, subscription.currency
+    else:
+        standing, currency = apply_to(subscription.price, subscription.currency, discount)
+
+    amount, currency, _promo = await promos.promo_price(
+        session,
+        subscription=subscription,
+        standing_amount=standing,
+        standing_currency=currency,
+        now=now,
+    )
     return amount, currency, discount
 
 

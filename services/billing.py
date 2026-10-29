@@ -36,6 +36,7 @@ from db.models import (
     utcnow,
 )
 from services import discounts as discount_service
+from services import promos
 from services import subscriptions as subs
 from services.audit import Action, record_action
 from services.pricing import extend
@@ -143,6 +144,11 @@ async def issue_invoice(
         created_at=now,
     )
     session.add(payment)
+
+    # A promo period is spent where the price is **charged**, not where the code was redeemed:
+    # a member who redeems today and pays in three weeks should get a full period from the day
+    # they pay. Inside this transaction, so an invoice and its period cannot diverge.
+    await promos.consume_period(session, user_id=subscription.user_id, now=now)
     await session.flush()
 
     try:
@@ -599,6 +605,10 @@ async def attempt_charge(
         created_at=now,
     )
     session.add(payment)
+
+    # Renewals spend a promo period too. Without this an automatic charge would keep using the
+    # promo price for ever, because nothing else counts it down.
+    await promos.consume_period(session, user_id=subscription.user_id, now=now)
     await session.flush()
 
     try:

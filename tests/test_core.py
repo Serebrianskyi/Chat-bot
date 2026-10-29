@@ -24,6 +24,7 @@ from db.models import (
     Payment,
     PaymentStatus,
     PriceTier,
+    PromoRedemption,
     Subscription,
     SubscriptionStatus,
     User,
@@ -2332,6 +2333,417 @@ async def test_cancelling_a_subscription_keeps_the_paid_period(dispatcher, bot, 
 
 
 # ======================================================================================
+# Promo codes
+# ======================================================================================
+
+
+async def make_promo(session_factory, **kw):
+    """A live campaign, with sensible defaults for whatever a test does not care about."""
+    from db.models import utcnow
+    from services import promos
+
+    defaults = {
+        "kind": DiscountKind.PERCENT,
+        "percent_off": 20,
+        "currency": CURRENCY,
+        "discount_months": 1,
+        "window_months": 3,
+        "new_members_only": False,
+    }
+    async with session_factory() as session:
+        promo = await promos.create(
+            session,
+            actor_id=ADMIN_ID,
+            code=kw.pop("code", "halloween"),
+            now=kw.pop("now", utcnow()),
+            **{**defaults, **kw},
+        )
+        await session.commit()
+        return promo.id
+
+
+async def seed_member(session_factory, *, standing: Decimal | None = None, days_left: int = 10):
+    """A member with a subscription, optionally on a price of their own."""
+    from db.models import utcnow
+
+    async with session_factory() as session:
+        session.add(User(telegram_id=USER_ID, username="member"))
+        session.add(User(telegram_id=ADMIN_ID, username="boss"))
+        if standing is not None:
+            session.add(
+                Discount(
+                    user_id=USER_ID,
+                    kind=DiscountKind.FIXED_PRICE,
+                    fixed_price=standing,
+                    currency=CURRENCY,
+                )
+            )
+        session.add(
+            Subscription(
+                user_id=USER_ID,
+                status=SubscriptionStatus.ACTIVE,
+                price=REGULAR_PRICE,
+                currency=CURRENCY,
+                price_tier=PriceTier.REGULAR,
+                period_days=PERIOD_DAYS,
+                started_at=utcnow(),
+                expires_at=utcnow() + timedelta(days=days_left),
+            )
+        )
+        await session.commit()
+
+
+async def quoted_price(session_factory):
+    """What the member would be charged for their next period."""
+    from db.models import utcnow
+
+    async with session_factory() as session:
+        sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
+        amount, currency, _ = await discount_service.effective_price(
+            session, subscription=sub, username="member", now=utcnow()
+        )
+        return amount
+
+
+async def test_a_promo_layers_over_a_standing_discount_and_hands_it_back(session_factory):
+    """P3, P4 — the rule the owner was explicit about.
+
+    A promo is **separate data**, not a replacement. A founding member on 8 EUR who redeems a
+    20% code pays 6.40 while it lasts and then returns to **8**, not to the club's 10. Taking
+    the percentage off the base tariff would have given them nothing at all, since they already
+    pay 8 — which is exactly the group most likely to type a code.
+    """
+    from db.models import PromoCode, utcnow
+    from services import promos
+
+    await seed_member(session_factory, standing=Decimal("8.00"))
+    promo_id = await make_promo(session_factory, discount_months=2)
+
+    assert await quoted_price(session_factory) == Decimal("8.00")  # their own price
+
+    async with session_factory() as session:
+        promo = await session.get(PromoCode, promo_id)
+        await promos.redeem(session, promo=promo, user_id=USER_ID, now=utcnow())
+        await session.commit()
+
+    assert await quoted_price(session_factory) == Decimal("6.40")  # 20% off THEIR price
+
+    # Two invoices spend it.
+    for expected in (Decimal("6.40"), Decimal("8.00")):
+        async with session_factory() as session:
+            await promos.consume_period(session, user_id=USER_ID, now=utcnow())
+            await session.commit()
+        if expected == Decimal("6.40"):
+            assert await quoted_price(session_factory) == expected
+    # Spent: back to their standing 8, never the base 10.
+    assert await quoted_price(session_factory) == Decimal("8.00")
+
+    async with session_factory() as session:
+        standing = await session.scalar(select(Discount).where(Discount.user_id == USER_ID))
+    assert standing.revoked_at is None  # their own discount was never touched
+
+
+async def test_a_promo_is_counted_in_periods_not_days(session_factory, bot, config):
+    """P2, P5 — the requirement that shaped the whole design.
+
+    A member who redeems while paid up to the 11th must get a **full** discounted period
+    starting when they next pay, not a part-period because they redeemed early. So periods are
+    spent by invoices and charges, never by the clock.
+    """
+    from db.models import PromoCode, utcnow
+    from services import promos
+
+    await seed_member(session_factory, days_left=0)  # due now
+    promo_id = await make_promo(
+        session_factory,
+        kind=DiscountKind.FIXED_PRICE,
+        fixed_price=Decimal("8.00"),
+        percent_off=None,
+    )
+    async with session_factory() as session:
+        promo = await session.get(PromoCode, promo_id)
+        await promos.redeem(session, promo=promo, user_id=USER_ID, now=utcnow())
+        await session.commit()
+
+    # An invoice spends the period, and is issued at the promo price.
+    gw = FakeGateway()
+    await process_due_subscriptions(
+        session_factory, gw, bot, admin_ids=frozenset({ADMIN_ID}), config=config
+    )
+    assert gw.invoice_calls[0]["amount"] == Decimal("8.00")
+    async with session_factory() as session:
+        spent = await session.scalar(
+            select(PromoRedemption).where(PromoRedemption.user_id == USER_ID)
+        )
+    assert spent.periods_remaining == 0
+    assert spent.exhausted_at is not None
+
+    # P5: a renewal charge must spend a period too, or a stored card would use the promo for ever.
+    await seed_promo_for_charge(session_factory)
+    async with session_factory() as session:
+        left = await session.scalar(
+            select(PromoRedemption.periods_remaining).where(PromoRedemption.user_id == USER_ID + 1)
+        )
+    assert left == 1  # one of two spent by the charge
+
+
+async def seed_promo_for_charge(session_factory):
+    """A second member with a stored card and a 2-period promo, charged once."""
+    from db.models import PromoCode, utcnow
+    from services import billing as billing_service
+    from services import promos
+
+    other = USER_ID + 1
+    async with session_factory() as session:
+        session.add(User(telegram_id=other, username="cardholder"))
+        session.add(
+            Subscription(
+                user_id=other,
+                status=SubscriptionStatus.PAST_DUE,
+                price=REGULAR_PRICE,
+                currency=CURRENCY,
+                price_tier=PriceTier.REGULAR,
+                period_days=PERIOD_DAYS,
+                started_at=utcnow() - timedelta(days=PERIOD_DAYS),
+                expires_at=utcnow(),
+                wayforpay_rec_token="tok",  # noqa: S106
+            )
+        )
+        await session.commit()
+
+    promo_id = await make_promo(session_factory, code="charge-promo", discount_months=2)
+    async with session_factory() as session:
+        promo = await session.get(PromoCode, promo_id)
+        await promos.redeem(session, promo=promo, user_id=other, now=utcnow())
+        await session.commit()
+
+    gw = FakeGateway()
+    gw.charge_result = approved("ignored")
+    async with session_factory() as session:
+        sub = await session.scalar(select(Subscription).where(Subscription.user_id == other))
+        await billing_service.attempt_charge(
+            session,
+            gw,
+            DummyBot(),
+            subscription=sub,
+            config=BillingConfig(period_days=PERIOD_DAYS),
+            now=utcnow(),
+        )
+        await session.commit()
+
+
+class DummyBot:
+    """Swallows messages; these tests assert on the database, not on what was said."""
+
+    async def send_message(self, *a, **k):
+        return None
+
+
+async def test_a_code_cannot_be_redeemed_twice_even_after_it_is_spent(session_factory):
+    """P6 — the owner's exact scenario: at the end of a three-month promo, redeem it again for
+    more cheap months. The redemption row survives exhaustion precisely so this fails."""
+    from db.models import PromoCode, utcnow
+    from services import promos
+
+    await seed_member(session_factory)
+    promo_id = await make_promo(session_factory)
+
+    async with session_factory() as session:
+        promo = await session.get(PromoCode, promo_id)
+        await promos.redeem(session, promo=promo, user_id=USER_ID, now=utcnow())
+        await promos.consume_period(session, user_id=USER_ID, now=utcnow())  # spend it
+        await session.commit()
+
+    async with session_factory() as session:
+        promo = await session.get(PromoCode, promo_id)
+        with pytest.raises(promos.PromoError, match="already redeemed"):
+            await promos.redeem(session, promo=promo, user_id=USER_ID, now=utcnow())
+
+
+async def test_the_window_and_the_discount_length_are_independent(session_factory):
+    """P7, P13 — the two month counts an admin configures separately.
+
+    A code may be redeemable for three months while granting two months of discount, and the
+    window closing does not shorten a discount already redeemed.
+    """
+    from db.models import PromoCode, utcnow
+    from services import promos
+
+    await seed_member(session_factory)
+    now = utcnow()
+    promo_id = await make_promo(session_factory, window_months=3, discount_months=2, now=now)
+
+    async with session_factory() as session:
+        promo = await session.get(PromoCode, promo_id)
+        # Window is three months out; the discount is two periods. Different numbers.
+        assert promo.redeemable_until > now + timedelta(days=85)
+        assert promo.discount_months == 2
+        await promos.redeem(session, promo=promo, user_id=USER_ID, now=now)
+        await session.commit()
+
+    # Past the window: nobody new may redeem, but the member keeps both their periods.
+    later = now + timedelta(days=100)
+    async with session_factory() as session:
+        promo = await session.get(PromoCode, promo_id)
+        assert promo.is_redeemable(later) is False
+        with pytest.raises(promos.PromoError, match="expired"):
+            await promos.redeem(session, promo=promo, user_id=USER_ID + 5, now=later)
+        live = await promos.live_redemption(session, user_id=USER_ID, now=later)
+    assert live is not None and live.periods_remaining == 2
+
+
+async def test_new_members_only_refuses_somebody_who_already_has_a_discount(session_factory):
+    """P9 — the third thing an admin configures."""
+    from db.models import PromoCode, utcnow
+    from services import promos
+
+    await seed_member(session_factory, standing=Decimal("8.00"))
+    promo_id = await make_promo(session_factory, new_members_only=True)
+
+    async with session_factory() as session:
+        promo = await session.get(PromoCode, promo_id)
+        with pytest.raises(promos.PromoError, match="already have a discount"):
+            await promos.redeem(session, promo=promo, user_id=USER_ID, now=utcnow())
+
+        # Somebody with no discount of their own may use it.
+        session.add(User(telegram_id=USER_ID + 2, username="fresh"))
+        await session.commit()
+        await promos.redeem(session, promo=promo, user_id=USER_ID + 2, now=utcnow())
+        await session.commit()
+
+
+async def test_a_cap_and_a_revocation_both_stop_further_redemptions(session_factory):
+    """P8, P10 — and a revocation is soft: whoever redeemed keeps what they were promised."""
+    from db.models import PromoCode, utcnow
+    from services import promos
+
+    await seed_member(session_factory)
+    promo_id = await make_promo(session_factory, max_redemptions=1)
+
+    async with session_factory() as session:
+        promo = await session.get(PromoCode, promo_id)
+        await promos.redeem(session, promo=promo, user_id=USER_ID, now=utcnow())
+        await session.commit()
+
+        session.add(User(telegram_id=USER_ID + 3, username="late"))
+        await session.commit()
+        with pytest.raises(promos.PromoError, match="exhausted"):
+            await promos.redeem(session, promo=promo, user_id=USER_ID + 3, now=utcnow())
+
+        # Revoking stops new redemptions; the one already made still prices their invoice.
+        await promos.revoke(session, promo=promo, actor_id=ADMIN_ID, now=utcnow())
+        await session.commit()
+    # Derived from the fixture's base price rather than hardcoded, so the assertion says
+    # "20% off" rather than a number that only matches one fixture.
+    expected = (REGULAR_PRICE * Decimal("0.8")).quantize(Decimal("0.01"))
+    assert await quoted_price(session_factory) == expected
+
+
+async def test_a_code_matches_whatever_casing_the_member_types(session_factory):
+    """P12 — people type `Halloween`; a code that only works lowercase is a support ticket."""
+    from services import promos
+
+    await seed_member(session_factory)
+    await make_promo(session_factory, code="HalloWeen")
+
+    async with session_factory() as session:
+        for typed in ("halloween", "HALLOWEEN", " Halloween ", "#halloween"):
+            found = await promos.by_code(session, typed)
+            assert found is not None, typed
+        assert await promos.by_code(session, "nosuchcode") is None
+
+
+async def test_redeeming_from_the_bot_tells_the_member_what_changed(
+    dispatcher, bot, session_factory, recording_session
+):
+    """P1, P11, P15 — the member-facing walk, and that it is not an admin screen.
+
+    Redemption is not payment: it must not move `expires_at`, change the status, or send a
+    channel link.
+    """
+    from handlers.admin import AdminMenu
+
+    await seed_member(session_factory, standing=Decimal("8.00"), days_left=10)
+    await make_promo(session_factory, code="halloween", discount_months=2)
+
+    member = make_user(USER_ID, username="member")
+    before = await load_sub(session_factory)
+
+    # An unknown code says so and reveals nothing about what exists.
+    await dispatcher.feed_update(bot, make_message(member, "/promo"))
+    recording_session.calls.clear()
+    await dispatcher.feed_update(bot, make_message(member, "nosuchthing", update_id=2))
+    assert texts.PROMO_UNKNOWN in recording_session.sent_texts()
+
+    recording_session.calls.clear()
+    await dispatcher.feed_update(bot, make_message(member, "HALLOWEEN", update_id=3))
+    told = "\n".join(recording_session.sent_texts())
+    assert texts.money(Decimal("6.40"), CURRENCY) in told  # the new price
+    assert texts.money(Decimal("8.00"), CURRENCY) in told  # and what it replaced
+    assert texts.months_phrase(2) in told
+
+    after = await load_sub(session_factory)
+    assert after.expires_at == before.expires_at  # redemption is not payment
+    assert after.status is before.status
+    assert recording_session.of_type("CreateChatInviteLink") == []
+
+    # A non-admin cannot reach the admin screens (G1.5).
+    recording_session.calls.clear()
+    await dispatcher.feed_update(
+        bot, make_callback(member, AdminMenu(action="create_promo").pack(), update_id=4)
+    )
+    assert texts.ADMIN_ACCESS_DENIED in recording_session.sent_texts()
+
+
+async def test_an_admin_creates_a_code_through_the_panel(
+    dispatcher, bot, session_factory, recording_session
+):
+    """P14 — the three choices, and the audit row that records them."""
+    from handlers.admin import AdminMenu
+
+    async with session_factory() as session:
+        session.add(User(telegram_id=ADMIN_ID, username="boss"))
+        await session.commit()
+
+    admin = make_user(ADMIN_ID, username="boss")
+    await dispatcher.feed_update(bot, make_callback(admin, AdminMenu(action="create_promo").pack()))
+    await dispatcher.feed_update(bot, make_message(admin, "BlackFriday", update_id=2))
+    await dispatcher.feed_update(bot, make_callback(admin, "promo:pc:33", update_id=3))
+    await dispatcher.feed_update(bot, make_callback(admin, "promo:win:3", update_id=4))
+    await dispatcher.feed_update(bot, make_callback(admin, "promo:mon:2", update_id=5))
+    recording_session.calls.clear()
+    await dispatcher.feed_update(bot, make_callback(admin, "promo:aud:all", update_id=6))
+
+    # The confirmation quotes all three choices back, so a wrong tap is visible.
+    asked = recording_session.of_type("SendMessage")[-1].text
+    assert "blackfriday" in asked
+    assert "33%" in asked
+    assert texts.months_phrase(3) in asked  # the window
+    assert texts.months_phrase(2) in asked  # the discount
+
+    await dispatcher.feed_update(bot, make_callback(admin, "promo:create", update_id=7))
+
+    async with session_factory() as session:
+        from db.models import PromoCode
+
+        promo = await session.scalar(select(PromoCode).where(PromoCode.code == "blackfriday"))
+        entry = await session.scalar(select(AuditLog).where(AuditLog.action == "promo.created"))
+    assert promo.percent_off == 33
+    assert promo.discount_months == 2  # two months of discount...
+    assert promo.redeemable_until > utcnow_for_test() + timedelta(days=85)  # ...three-month window
+    assert promo.new_members_only is False
+    assert entry.actor_id == ADMIN_ID
+    assert entry.details["discount_months"] == 2
+    assert entry.details["window_months"] == 3
+
+
+def utcnow_for_test():
+    from db.models import utcnow
+
+    return utcnow()
+
+
+# ======================================================================================
 # The webhook: a public endpoint that moves money
 # ======================================================================================
 
@@ -2662,6 +3074,13 @@ def test_every_member_facing_message_is_ukrainian_and_formats_cleanly():
         "error": "TelegramBadRequest",
         "text": "Привіт!",
         "step": "перевірка оплат",
+        "window": "3 місяці",
+        "audience": "👥 Усі",
+        "was": "8 €",
+        "code": "halloween",
+        "used": 3,
+        "cap": " з 50",
+        "max": 50,
         "extra": " — не доставлено",
         "button": "Долучитися до Клубу",
         "price": "8 €",

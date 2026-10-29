@@ -28,6 +28,7 @@ from sqlalchemy import (
     Numeric,
     String,
     TypeDecorator,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -377,6 +378,119 @@ def normalise_username(username: str | None) -> str | None:
         return None
     cleaned = username.strip().lstrip("@").lower()
     return cleaned or None
+
+
+class PromoCode(Base):
+    """A campaign: one code many people may redeem, each getting the same offer.
+
+    Separate from ``Discount`` on purpose. A discount is "this person's price"; a promo code is
+    "this offer, for whoever types it" — and the two must coexist, because a member with their own
+    8 EUR tariff who redeems a promo has to keep the 8 for afterwards. See
+    ``PromoRedemption`` and ``services.promos``.
+
+    Two independent month counts, which is the part that is easy to conflate:
+
+    * ``redeemable_until`` — how long the **code** works. Stored as a date, because a redemption
+      window is a wall-clock thing.
+    * ``discount_months`` — how many **billing periods** a redeemer gets. Not a date: the member
+      may pay at any point, and the discount has to cover whole periods from whenever that is.
+
+    So a code may be redeemable for three months while granting two months of discount.
+    """
+
+    __tablename__ = "promo_codes"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+
+    #: Lowercased and trimmed on write. Telegram users type whatever casing they like, and a code
+    #: that works as "halloween" but not "Halloween" is a support conversation nobody needs.
+    code: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+
+    kind: Mapped[DiscountKind] = mapped_column(_enum_column(DiscountKind))
+    #: Set when kind is PERCENT. 1-100. Applied to the member's **own** price, not the base
+    #: tariff: 20% for a founding member on 8 EUR is 6.40, not 8. Owner's decision 2026-10-29 —
+    #: taking it off the base would give the already-discounted nothing at all.
+    percent_off: Mapped[int | None] = mapped_column(default=None)
+    #: Set when kind is FIXED_PRICE. Unambiguous: 8 means 8, whatever they paid before.
+    fixed_price: Mapped[Decimal | None] = mapped_column(MONEY, default=None)
+    currency: Mapped[str] = mapped_column(String(3), default="EUR")
+
+    #: How many billing periods a redeemer gets the promo price for.
+    discount_months: Mapped[int] = mapped_column(default=1)
+
+    #: After this instant the code is dead. Always set: an immortal promo code is a liability.
+    redeemable_until: Mapped[datetime] = mapped_column(UtcDateTime)
+
+    #: When true, only somebody with no standing discount and no completed payment may redeem.
+    new_members_only: Mapped[bool] = mapped_column(default=False)
+
+    #: None means unlimited. ``redemptions`` is maintained alongside the redemption rows so the
+    #: cap can be checked without counting them.
+    max_redemptions: Mapped[int | None] = mapped_column(default=None)
+    redemptions: Mapped[int] = mapped_column(default=0)
+
+    revoked_at: Mapped[datetime | None] = mapped_column(UtcDateTime, default=None)
+
+    created_by: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
+
+    def is_redeemable(self, now: datetime) -> bool:
+        """Whether somebody may redeem this code at ``now``.
+
+        Says nothing about a particular member — ``new_members_only`` and the once-per-member rule
+        are checked against that person in ``services.promos``.
+        """
+        if self.revoked_at is not None:
+            return False
+        if self.redeemable_until <= now:
+            return False
+        return self.max_redemptions is None or self.redemptions < self.max_redemptions
+
+    def __repr__(self) -> str:
+        offer = f"{self.percent_off}%" if self.percent_off else f"{self.fixed_price}"
+        return f"<PromoCode {self.code} {offer} x{self.discount_months}>"
+
+
+class PromoRedemption(Base):
+    """One member's use of one promo code. Kept for ever, including after it is spent.
+
+    The row surviving exhaustion is what enforces "a code may be used once": a member cannot
+    come back at the end of a three-month promo and redeem the same code for more cheap months.
+    That is a UNIQUE constraint rather than a query, so it holds even against two taps racing.
+
+    ``periods_remaining`` counts **down as invoices use it**, not as time passes. A member who
+    redeems while paid up to the 11th starts their discounted period on the 12th; one who delays
+    paying until the 20th starts it then. Neither loses part of a period for redeeming early,
+    which is the whole point of counting periods instead of days.
+    """
+
+    __tablename__ = "promo_redemptions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    promo_code_id: Mapped[int] = mapped_column(ForeignKey("promo_codes.id"), index=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.telegram_id"), index=True)
+
+    #: Billing periods still to be charged at the promo price. 0 means spent, and the member
+    #: falls back to their standing discount — or the base tariff — with no job needed.
+    periods_remaining: Mapped[int] = mapped_column(default=1)
+
+    redeemed_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
+    exhausted_at: Mapped[datetime | None] = mapped_column(UtcDateTime, default=None)
+
+    __table_args__ = (
+        # The once-per-member rule, in the schema rather than in application code.
+        UniqueConstraint("promo_code_id", "user_id", name="uq_promo_redemption_once"),
+    )
+
+    def is_live(self) -> bool:
+        """Whether this redemption still has a period to give."""
+        return self.periods_remaining > 0
+
+    def __repr__(self) -> str:
+        return (
+            f"<PromoRedemption code={self.promo_code_id} "
+            f"user={self.user_id} left={self.periods_remaining}>"
+        )
 
 
 # TODO(phase-2): Category, Material  (knowledge base, deferred)

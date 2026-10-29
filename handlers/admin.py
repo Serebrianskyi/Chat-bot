@@ -26,7 +26,7 @@ from aiogram.filters.callback_data import CallbackData
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 import texts
-from handlers import broadcast, discounts, invites, participants
+from handlers import broadcast, discounts, invites, participants, promos
 
 ACCESS_DENIED = texts.ADMIN_ACCESS_DENIED
 MENU_TITLE = texts.ADMIN_MENU_TITLE
@@ -49,6 +49,8 @@ MENU_ITEMS: tuple[tuple[str, str], ...] = (
     (texts.ADMIN_MENU_SEND_INVITE, "send_invite"),  # live
     (texts.ADMIN_MENU_MESSAGE_USER, "message_user"),  # live
     (texts.ADMIN_MENU_GIFT_MONTHS, "gift_months"),  # live
+    (texts.ADMIN_MENU_PROMOS, "promos"),  # live
+    (texts.ADMIN_MENU_CREATE_PROMO, "create_promo"),  # live
     (texts.ADMIN_MENU_CHANNEL_POST, "channel_post"),  # live
     (texts.ADMIN_MENU_KNOWLEDGE_BASE, "materials"),  # TODO(phase-2)
     (texts.ADMIN_MENU_ADD_SUBSCRIBER, "add_subscriber"),  # TODO(phase-3)
@@ -130,6 +132,7 @@ def build_router() -> Router:
     participants.register(router)
     invites.register(router)
     broadcast.register(router)
+    promos.register_admin(router)
 
     router.callback_query.register(
         handle_admin_menu,
