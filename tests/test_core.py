@@ -3493,9 +3493,12 @@ async def test_a_recurring_purchase_is_signed_like_an_invoice_and_refuses_to_run
     # The recurring fields travel in the payload only — signing them would break the signature.
     assert body["regularMode"] == "monthly"
     assert body["regularOn"] == 1
-    assert body["regularBehavior"] == "preset"
     assert body["regularAmount"] == "8.00"
     assert body["dateNext"] == "01.12.2026"
+    # `regularBehavior=preset` must NEVER be sent: it removes the «Регулярне списання» switch from
+    # the page, so nothing activates the schedule and the gateway records an ordinary payment.
+    # That cost a real payment to discover on 2026-10-30 — money taken, no schedule created.
+    assert "regularBehavior" not in body
     # Without this the gateway charges the card monthly and nothing hears about it.
     assert body["serviceUrl"] == "https://example.test/payments/wayforpay"
 
@@ -3594,7 +3597,26 @@ async def test_each_scheduled_charge_extends_once_whichever_reference_it_arrives
     from services.billing import SCHEDULE_ACTIVE, process_callback
 
     class Client:
-        """Only `read_callback` is exercised here; the signature check is tested elsewhere."""
+        """Only the callback path is exercised here; the signature check is tested elsewhere."""
+
+        #: The schedule is read back from the gateway rather than assumed, so the fake has to
+        #: answer for it — a payment is not proof that a schedule exists (2026-10-30).
+        can_manage_schedules = True
+
+        async def regular_status(self, *, order_reference):
+            from services.wayforpay import RegularPayment
+
+            return RegularPayment(
+                order_reference=order_reference,
+                status="Active",
+                mode="monthly",
+                amount=REGULAR_PRICE,
+                currency=CURRENCY,
+                next_payment_date="29.11.2026",
+                last_payed_date=None,
+                last_payed_status=None,
+                reason_code="4100",
+            )
 
         def read_callback(self, payload):
             from services.wayforpay import TransactionStatus, charge_key, map_status
@@ -3879,3 +3901,115 @@ async def test_the_poller_asks_about_a_scheduled_charge_by_the_gateways_own_refe
             select(Payment).where(Payment.order_reference == "local-ref-for-month-two")
         )
     assert row.status is PaymentStatus.COMPLETE
+
+
+async def test_a_payment_is_not_proof_of_a_schedule(session_factory, bot, config, in_community):
+    """2026-10-30, with real money: the payment went through, "Регулярні платежі" stayed empty,
+    and the bot believed a schedule existed — so the daily sweep skipped the member and nobody
+    would ever have charged them again.
+
+    The member can untick «Регулярне списання» on the page, so the gateway is asked. Three
+    answers, three outcomes — and only one of them is allowed to stop the chasing.
+    """
+    from sqlalchemy import delete
+
+    from services.billing import (
+        SCHEDULE_ACTIVE,
+        SCHEDULE_REMOVED,
+        SCHEDULE_REQUESTED,
+        SCHEDULE_UNVERIFIED,
+        issue_invoice,
+        process_callback,
+        renews_automatically,
+    )
+    from services.wayforpay import RegularPayment, TransactionStatus, charge_key, map_status
+
+    class Client:
+        def __init__(self, gateway_status, *, askable=True):
+            self.gateway_status = gateway_status
+            self.can_manage_schedules = askable
+
+        async def regular_status(self, *, order_reference):
+            return RegularPayment(
+                order_reference=order_reference,
+                status=self.gateway_status,
+                mode="monthly",
+                amount=REGULAR_PRICE,
+                currency=CURRENCY,
+                next_payment_date=None,
+                last_payed_date=None,
+                last_payed_status=None,
+                reason_code="4100",
+            )
+
+        def read_callback(self, payload):
+            return TransactionStatus(
+                order_reference=payload["orderReference"],
+                status=map_status(payload["transactionStatus"]),
+                gateway_status=payload["transactionStatus"],
+                amount=Decimal(payload["amount"]),
+                currency=payload["currency"],
+                reason_code="1100",
+                rec_token=None,
+                charge_key=charge_key(payload),
+                raw=payload,
+            )
+
+    async def pay(client):
+        async with session_factory() as session:
+            await session.execute(delete(Payment))
+            sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
+            sub.regular_status = None
+            sub.regular_order_reference = None
+            sub.expires_at = NOW - timedelta(days=1)
+            sub.status = SubscriptionStatus.PAST_DUE
+            payment = await issue_invoice(
+                session, FakeGateway(), subscription=sub, config=config, now=NOW
+            )
+            reference = payment.order_reference
+            assert sub.regular_status == SCHEDULE_REQUESTED
+            await session.commit()
+
+        await process_callback(
+            session_factory,
+            bot,
+            client=client,
+            payload={
+                "orderReference": reference,
+                "transactionStatus": "Approved",
+                "amount": str(REGULAR_PRICE),
+                "currency": CURRENCY,
+                "authCode": "a1",
+            },
+            admin_ids=frozenset({ADMIN_ID}),
+            config=config,
+            now=NOW,
+        )
+        return await load_sub(session_factory)
+
+    await seed_member(session_factory)
+    in_community()
+
+    # The gateway confirms it: this is the only case that may stop the chasing.
+    sub = await pay(Client("Active"))
+    assert sub.regular_status == SCHEDULE_ACTIVE
+    assert renews_automatically(sub) is True
+
+    # The gateway says there is none — the switch was unticked, or a wallet was used.
+    sub = await pay(Client("Removed"))
+    assert sub.regular_status == SCHEDULE_REMOVED
+    assert renews_automatically(sub) is False
+
+    # It cannot be asked at all (no merchantPassword). Unknown is not the same as yes.
+    sub = await pay(Client("Active", askable=False))
+    assert sub.regular_status == SCHEDULE_UNVERIFIED
+    assert renews_automatically(sub) is False
+
+    # And while unsure, the next link is a one-off: it cannot double-charge, and it cannot leave
+    # them unpaid either.
+    gw = FakeGateway()
+    async with session_factory() as session:
+        sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
+        await issue_invoice(session, gw, subscription=sub, config=config, now=NOW)
+        await session.commit()
+    assert gw.purchase_calls[-1]["recurring"] is False

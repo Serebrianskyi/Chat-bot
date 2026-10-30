@@ -959,6 +959,28 @@ ADMIN_SCHEDULE_CHARGE_FAILED = (
     "Доступ до: {until}"
 )
 
+#: A payment went through on a schedule page, but whether a schedule exists cannot be checked —
+#: `regularApi` needs a merchantPassword this install does not have. Said out loud rather than
+#: assumed, because the bot skips chasing anybody it believes the gateway is charging.
+ADMIN_SCHEDULE_UNVERIFIED = (
+    "❓ <b>Автопродовження не підтверджено</b>\n\n"
+    "Учасник: <code>{user_id}</code>\n"
+    "Замовлення: <code>{order}</code>\n\n"
+    "Оплата пройшла, але перевірити регулярний платіж неможливо без merchantPassword. "
+    "Подивіться «Регулярні платежі» в кабінеті WayForPay. Поки що учаснику надсилаються "
+    "звичайні посилання на оплату."
+)
+
+#: The gateway was asked and said there is no live schedule. Usually the member unticked the
+#: «Регулярне списання» switch, or paid by a method that does not carry one.
+ADMIN_SCHEDULE_MISSING = (
+    "⚠️ <b>Регулярний платіж не створено</b>\n\n"
+    "Учасник: <code>{user_id}</code>\n"
+    "Замовлення: <code>{order}</code>\n"
+    "Статус у WayForPay: {status}\n\n"
+    "Оплата пройшла, автопродовження — ні. Учасник платитиме вручну."
+)
+
 ADMIN_SCHEDULE_CANCEL_FAILED = (
     "⚠️ <b>Не вдалося скасувати автопродовження</b>\n\n"
     "Учасник: <code>{user_id}</code>\n"

@@ -80,6 +80,11 @@ class BillingConfig:
 #: member is still owed a link and the daily sweep must keep chasing them.
 SCHEDULE_REQUESTED = "requested"
 SCHEDULE_ACTIVE = "active"
+#: Paid, but whether a schedule exists is unknown — the gateway could not be asked (no
+#: `merchantPassword`). Never treated as renewing: the member may have unticked the switch on the
+#: page, and a payment is not proof. They are chased by hand, with **one-off** links so no second
+#: schedule can be created while we are unsure.
+SCHEDULE_UNVERIFIED = "unverified"
 SCHEDULE_SUSPENDED = "suspended"
 SCHEDULE_REMOVED = "removed"
 
@@ -94,7 +99,10 @@ SCHEDULE_CHASE_AFTER = timedelta(days=2)
 #: **Not** the test for "give them a one-off instead" — that is `SCHEDULE_ACTIVE` alone, since
 #: only an active schedule will actually charge the card and `requested` never clears without a
 #: payment. See `issue_invoice`.
-LIVE_SCHEDULE_STATUSES = frozenset({SCHEDULE_REQUESTED, SCHEDULE_ACTIVE})
+LIVE_SCHEDULE_STATUSES = frozenset({SCHEDULE_REQUESTED, SCHEDULE_ACTIVE, SCHEDULE_UNVERIFIED})
+
+#: What `regularApi` STATUS calls a schedule that is or will be charging (wiki 852526).
+GATEWAY_SCHEDULE_LIVE = frozenset({"Active", "Created", "Confirmed"})
 
 
 def _pay_keyboard(invoice_url: str) -> InlineKeyboardMarkup:
@@ -200,7 +208,10 @@ async def issue_invoice(
     # payment, so they could never get a schedule again. That is exactly how "every link from now
     # on renews" would fail, silently, for anyone who does not pay on the first try.
     schedule = config.auto_renew if recurring is None else recurring
-    if schedule and subscription.regular_status == SCHEDULE_ACTIVE:
+    if schedule and subscription.regular_status in (SCHEDULE_ACTIVE, SCHEDULE_UNVERIFIED):
+        # ACTIVE: the gateway is charging them, a second schedule would take the money twice.
+        # UNVERIFIED: we do not know whether it is, and a one-off link is the only answer that is
+        # wrong in neither direction — it cannot double-charge and it cannot leave them unpaid.
         schedule = False
 
     # `dateNext` is when the **next** charge falls, so it is this period's end, not the expiry the
@@ -1945,7 +1956,9 @@ async def process_callback(
             now=now,
         )
         if extended:
-            await _confirm_schedule(session, bot, payment=payment, admin_ids=admin_ids, now=now)
+            await _confirm_schedule(
+                session, bot, payment=payment, admin_ids=admin_ids, now=now, client=client
+            )
             await announce_confirmed_payment(
                 session,
                 bot,
@@ -2000,6 +2013,60 @@ async def _needs_invite(
     return status not in IN_CHANNEL
 
 
+async def _schedule_state(
+    bot: Bot,
+    client: WayForPayClient | None,
+    *,
+    subscription: Subscription,
+    admin_ids: frozenset[int],
+) -> str:
+    """What the **gateway** says about this schedule: active, removed, or unknown.
+
+    `merchantPassword` is what makes this question askable, and it is a credential WayForPay
+    issues separately on request. Without it the honest answer is `unverified`, which is treated
+    as "not renewing": the member is chased by hand and given one-off links, so neither a missing
+    schedule nor a working one can hurt them.
+    """
+    reference = subscription.regular_order_reference
+    if client is None or not client.can_manage_schedules or reference is None:
+        log.warning(
+            "Cannot verify the schedule for %s: no WayForPay merchantPassword. Check "
+            "'Регулярні платежі' in the dashboard.",
+            subscription.user_id,
+        )
+        await notify_admins(
+            bot,
+            admin_ids,
+            texts.ADMIN_SCHEDULE_UNVERIFIED.format(
+                user_id=subscription.user_id, order=reference or "—"
+            ),
+        )
+        return SCHEDULE_UNVERIFIED
+
+    try:
+        live = await client.regular_status(order_reference=reference)
+    except Exception:
+        log.exception("Could not read the schedule %s back from the gateway", reference)
+        return SCHEDULE_UNVERIFIED
+
+    if live.status in GATEWAY_SCHEDULE_LIVE:
+        log.info("Schedule %s confirmed by the gateway as %s", reference, live.status)
+        return SCHEDULE_ACTIVE
+
+    # Paid, but no schedule: the member unticked the switch, or paid by a method that does not
+    # carry one. They are an ordinary manual payer, and an admin is told so somebody can offer
+    # them the choice again rather than discovering it a month later.
+    log.warning("Schedule %s is %r at the gateway, not live", reference, live.status)
+    await notify_admins(
+        bot,
+        admin_ids,
+        texts.ADMIN_SCHEDULE_MISSING.format(
+            user_id=subscription.user_id, order=reference, status=live.status or "—"
+        ),
+    )
+    return SCHEDULE_REMOVED
+
+
 async def _confirm_schedule(
     session: AsyncSession,
     bot: Bot,
@@ -2007,6 +2074,7 @@ async def _confirm_schedule(
     payment: Payment,
     admin_ids: frozenset[int],
     now: datetime,
+    client: WayForPayClient | None = None,
 ) -> None:
     """Mark the schedule live, and say so if the gateway's price has drifted from ours.
 
@@ -2031,7 +2099,18 @@ async def _confirm_schedule(
         subscription.regular_order_reference = (
             payment.gateway_order_reference or payment.order_reference
         )
-    subscription.regular_status = SCHEDULE_ACTIVE
+
+    # **Asked, not assumed.** The recurring switch on the payment page can be unticked by the
+    # member, so a successful payment is no evidence that a schedule exists — and believing it
+    # does is worse than not knowing: the daily sweep skips a member it thinks the gateway is
+    # charging. This bot held exactly that false belief on 2026-10-30, when a real payment left
+    # "Регулярні платежі" empty and nobody would ever have been charged again.
+    subscription.regular_status = await _schedule_state(
+        bot,
+        client,
+        subscription=subscription,
+        admin_ids=admin_ids,
+    )
     subscription.regular_next_at = subscription.expires_at
 
     user = await session.get(User, subscription.user_id)

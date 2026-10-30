@@ -426,10 +426,21 @@ class WayForPayClient:
         Everything the invoice call offered — ``orderTimeout``, ``clientEmail``, ``serviceUrl`` —
         Purchase takes too.
 
-        ``regularOn=1`` ties the schedule to the payment rather than offering it as a checkbox,
-        and ``regularBehavior=preset`` stops the member editing the amount or the period on the
-        page. ``dateNext`` is when the **next** charge falls, so it must be a future date — the
-        period being paid for now is covered by ``amount``.
+        ``regularOn=1`` pre-ticks the «Регулярне списання» switch the page shows; ``dateNext`` is
+        when the **next** charge falls, so it must be a future date — the period being paid for
+        now is covered by ``amount``.
+
+        **``regularBehavior=preset`` is deliberately not sent**, and this cost a real payment to
+        learn. The documentation describes it as stopping the member editing the recurring
+        parameters, which sounded strictly better. In fact it removes the recurring block from the
+        page altogether: with it, the rendered page contains no ``card[regularChecked]`` field, so
+        nothing activates the schedule and the gateway records an ordinary payment. Verified on
+        2026-10-30 by rendering four variants of the same Purchase — only the one without
+        ``regularBehavior`` shows the switch. The first real payment through this path confirmed
+        it the hard way: money taken, "Регулярні платежі" empty.
+
+        The cost of leaving it out is that the member **can** untick the switch, so a payment is
+        not proof of a schedule. That is what `regularApi` STATUS is for.
 
         **A serviceUrl is mandatory here.** A schedule whose charges nothing is listening for is
         money taken with no access granted, every month, silently. Polling cannot substitute: the
@@ -481,8 +492,10 @@ class WayForPayClient:
             payload.update(
                 {
                     "regularMode": REGULAR_MODE_MONTHLY,
+                    # Pre-ticks the «Регулярне списання» switch on the page. The member can still
+                    # untick it, which is why a schedule is never assumed to exist — it is read
+                    # back from `regularApi` (see `billing._confirm_schedule`).
                     "regularOn": 1,
-                    "regularBehavior": "preset",
                     "regularAmount": format_amount(regular_amount),  # type: ignore[arg-type]
                     "dateNext": date_next,
                 }
