@@ -1850,6 +1850,42 @@ async def test_granting_a_discount_end_to_end(dispatcher, bot, session_factory):
     assert audit is not None
 
 
+async def test_granting_a_discount_tells_the_member_their_new_price(
+    dispatcher, bot, session_factory, recording_session, fake_wayforpay
+):
+    """A price nobody is told about is indistinguishable from nothing happening.
+
+    Reported 2026-10-29 from exactly that: the admin saw "Знижку надано", the member saw nothing,
+    and both concluded the bot was broken. A member who owes money gets a live button with it,
+    because a better price is no use without a way to pay it.
+    """
+    from handlers.admin import AdminMenu
+
+    await seed_due(session_factory)  # past due, so they owe money now
+    admin = make_user(ADMIN_ID)
+    for update in (
+        make_callback(admin, AdminMenu(action="grant_discount").pack(), update_id=1),
+        make_message(admin, "@member", update_id=2),
+        make_callback(admin, "grant:kind:fixed", update_id=3),
+        make_message(admin, "8", update_id=4),
+        make_callback(admin, "grant:days:90", update_id=5),
+        make_callback(admin, "grant:note:skip", update_id=6),
+        make_callback(admin, "grant:apply", update_id=7),
+    ):
+        await dispatcher.feed_update(bot, update)
+
+    to_member = [c for c in recording_session.of_type("SendMessage") if c.chat_id == USER_ID]
+    assert to_member, "the member was never told about their own price"
+    # The sum is the discounted one, computed the way the invoice computes it.
+    assert texts.money(Decimal("8"), CURRENCY) in to_member[-1].text
+    # And a button to act on it, against an invoice quoting the NEW amount.
+    assert to_member[-1].reply_markup.inline_keyboard[0][0].url
+    assert fake_wayforpay.purchase_calls[-1]["amount"] == Decimal("8.00")
+
+    to_admin = [c.text for c in recording_session.of_type("SendMessage") if c.chat_id == ADMIN_ID]
+    assert any(texts.ADMIN_GRANT_MEMBER_TOLD.strip() in t for t in to_admin)
+
+
 async def test_the_discount_list_shows_live_rows_and_who_has_not_claimed(
     dispatcher, bot, session_factory, recording_session
 ):

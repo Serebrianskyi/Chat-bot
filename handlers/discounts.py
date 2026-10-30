@@ -15,17 +15,31 @@ Granting writes an ``audit_log`` row (S6) — ``services.discounts.grant`` does 
 import logging
 from decimal import Decimal, InvalidOperation
 
-from aiogram import F, Router
+from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramForbiddenError
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import texts
 from config import Settings
-from db.models import Discount, DiscountKind, looks_like_username, normalise_username, utcnow
+from db.models import (
+    Discount,
+    DiscountKind,
+    User,
+    looks_like_username,
+    normalise_username,
+    utcnow,
+)
+from services import billing
 from services import discounts as discount_service
+from services import subscriptions as subs
+from services.billing import BillingConfig
+from services.pricing import extend
+from services.wayforpay import WayForPayClient
 
 log = logging.getLogger(__name__)
 
@@ -323,9 +337,23 @@ async def abort_grant(query: CallbackQuery, state: FSMContext) -> None:
 
 
 async def apply_grant(
-    query: CallbackQuery, state: FSMContext, session: AsyncSession, settings: Settings
+    query: CallbackQuery,
+    state: FSMContext,
+    session: AsyncSession,
+    settings: Settings,
+    bot: Bot,
+    wayforpay: WayForPayClient | None = None,
+    billing_config: BillingConfig | None = None,
 ) -> None:
-    """Write the discount. The confirmation step is what makes this safe to do on one tap."""
+    """Write the discount, then **tell the member**.
+
+    The confirmation step is what makes this safe to do on one tap.
+
+    Telling them is not decoration: a discount is a price, and a price nobody is told about is
+    indistinguishable from nothing happening — which is how this looked from both sides when it
+    was reported on 2026-10-29. Somebody who owes money gets a live payment link with it, because
+    a better price is no use without a way to pay it.
+    """
     data = await state.get_data()
     await state.clear()
     now = utcnow()
@@ -346,6 +374,16 @@ async def apply_grant(
     )
     await session.commit()
 
+    told, reason = await _tell_member(
+        session,
+        bot,
+        discount=discount,
+        wayforpay=wayforpay,
+        config=billing_config or BillingConfig(period_days=settings.subscription_period_days),
+        now=now,
+    )
+    await session.commit()
+
     what, period, _ = _summary(data, settings)
     await query.answer()
     if query.message:
@@ -355,7 +393,97 @@ async def apply_grant(
                 what=what,
                 period="" if not data.get("days") else f", {period.lower()}",
             )
+            + (
+                texts.ADMIN_GRANT_MEMBER_TOLD
+                if told
+                else texts.ADMIN_GRANT_MEMBER_NOT_TOLD.format(reason=reason)
+            )
         )
+
+
+async def _tell_member(
+    session: AsyncSession,
+    bot: Bot,
+    *,
+    discount: Discount,
+    wayforpay: WayForPayClient | None,
+    config: BillingConfig,
+    now,
+) -> tuple[bool, str]:
+    """Send the member their new price. ``(told, why not)``.
+
+    Resolved by pinned id first, then by username: a discount may be granted to somebody who has
+    never run the bot, and there is nobody to message in that case — the price simply waits for
+    them, which is what the admin is told.
+
+    The quoted sum comes from ``effective_price``, the same function the invoice uses, so the
+    message cannot promise a figure the gateway will not charge.
+    """
+    user_id = discount.user_id
+    if user_id is None and discount.username:
+        user_id = await session.scalar(
+            select(User.telegram_id).where(
+                func.lower(func.coalesce(User.username, "")) == discount.username.lower()
+            )
+        )
+    if user_id is None:
+        return False, texts.ADMIN_GRANT_MEMBER_UNKNOWN
+
+    subscription = await subs.get_subscription(session, user_id)
+    if subscription is None:
+        return False, texts.ADMIN_GRANT_MEMBER_UNKNOWN
+
+    user = await session.get(User, user_id)
+    amount, currency, _ = await discount_service.effective_price(
+        session,
+        subscription=subscription,
+        username=user.username if user else None,
+        now=now,
+    )
+
+    payment = None
+    if subscription.expires_at <= now and amount > 0 and wayforpay is not None:
+        # They owe money now, so the price needs a button. `reuse_open=False`: any open invoice
+        # quotes the old amount, and handing that back would advertise one figure and charge
+        # another.
+        payment = await billing.ensure_invoice(
+            session,
+            wayforpay,
+            subscription=subscription,
+            config=config,
+            now=now,
+            reuse_open=False,
+        )
+
+    if payment is not None and payment.invoice_url:
+        body = texts.DISCOUNT_GRANTED_MEMBER_DUE.format(
+            amount=texts.money(amount, currency),
+            period=subscription.period_days,
+            until=texts.day(
+                extend(subscription.expires_at, now=now, period_days=subscription.period_days)
+            ),
+        )
+        markup = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text=texts.PAY_EARLY_BUTTON, url=payment.invoice_url)]
+            ]
+        )
+    else:
+        body = texts.DISCOUNT_GRANTED_MEMBER.format(
+            amount=texts.money(amount, currency),
+            period=subscription.period_days,
+            until=texts.day(subscription.expires_at),
+        )
+        markup = None
+
+    try:
+        await bot.send_message(user_id, body, reply_markup=markup)
+    except TelegramForbiddenError:
+        return False, texts.ADMIN_GRANT_MEMBER_BLOCKED
+    except Exception as exc:  # noqa: BLE001 - the admin is told what happened
+        log.exception("Could not tell %s about their discount", user_id)
+        return False, type(exc).__name__
+    return True, ""
 
 
 def register(router: Router) -> None:

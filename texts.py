@@ -452,6 +452,30 @@ ADMIN_GRANT_CONFIRM = (
 ADMIN_GRANT_CONFIRM_BUTTON = "✅ Надати"
 ADMIN_GRANT_CANCEL_BUTTON = "✖️ Скасувати"
 ADMIN_GRANT_DONE = "Знижку надано: {who} — {what}{period}."
+
+#: Whether the member was actually told. An admin tapping «Надати знижку» has no other way to
+#: know: the discount lands in the database either way, and a silent grant looks identical to a
+#: broken one from both sides (reported 2026-10-29).
+ADMIN_GRANT_MEMBER_TOLD = "\nУчасник отримав повідомлення з новою ціною."
+ADMIN_GRANT_MEMBER_NOT_TOLD = (
+    "\n⚠️ Учаснику не надіслано: {reason}. Ціна застосується автоматично до наступного платежу."
+)
+ADMIN_GRANT_MEMBER_UNKNOWN = "цей акаунт ще не запускав бота"
+ADMIN_GRANT_MEMBER_BLOCKED = "бот заблокований"
+
+#: What the member is told when an admin gives them a price of their own. The sum is the one they
+#: will actually be charged next, so it is computed from the discount rather than described.
+DISCOUNT_GRANTED_MEMBER = (
+    "🎁 Для вас діє спеціальна ціна: <b>{amount}</b> за {period} днів.\n\n"
+    "Доступ активний до <b>{until}</b> — нова ціна застосується до наступного платежу."
+)
+
+#: The same, for somebody who owes money right now: the price is no use to them without a way to
+#: pay it, which is the half of this that was missing.
+DISCOUNT_GRANTED_MEMBER_DUE = (
+    "🎁 Для вас діє спеціальна ціна: <b>{amount}</b> за {period} днів.\n\n"
+    "Оплатіть за кнопкою нижче — доступ буде діяти до {until}."
+)
 ADMIN_GRANT_CANCELLED = "Скасовано."
 # --- 🔗 Надіслати запрошення (admin sends a channel link by hand) ----------------------------
 #
