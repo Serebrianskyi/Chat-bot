@@ -44,7 +44,9 @@ log = logging.getLogger(__name__)
 #: is what actually protects it — but there is no reason to publish the obvious path either.
 TELEGRAM_WEBHOOK_PATH = "/telegram/webhook"
 
-#: Where WayForPay posts payment results. Must match the ``serviceUrl`` sent on CREATE_INVOICE.
+#: Where WayForPay posts payment results. Must match the ``serviceUrl`` sent on each Purchase —
+#: and it is also where every scheduled monthly charge is reported, so nothing listening here
+#: means a card debited with no period granted.
 PAYMENTS_CALLBACK_PATH = "/payments/wayforpay"
 
 

@@ -165,6 +165,12 @@ def settings() -> Settings:
         wayforpay_merchant_domain="example.com",
         wayforpay_secret_key="test_secret",  # noqa: S106
         free_period_until=None,
+        # Production's shape since 2026-10-29: webhook mode, so every payment link is a Purchase
+        # carrying a monthly schedule. `build_billing_config` reads `service_url` off these two,
+        # and with them unset the suite would quietly exercise one-off links that renew nothing.
+        mode="webhook",
+        base_url="https://example.test",
+        webhook_secret="hook-secret",  # noqa: S106
     )
 
 
@@ -207,20 +213,27 @@ class FakeWayForPayClient:
     requests with whatever credentials happen to be configured.
     """
 
+    #: The real client exposes both; the schedule paths read them before deciding anything.
+    service_url = "https://example.test/payments/wayforpay"
+    can_manage_schedules = True
+
     def __init__(self) -> None:
-        self.invoice_calls: list[dict[str, Any]] = []
+        self.purchase_calls: list[dict[str, Any]] = []
         self.invoice_error: Exception | None = None
 
-    async def create_invoice(self, **kwargs: Any):
-        from services.wayforpay import Invoice
+    async def purchase(self, **kwargs: Any):
+        from services.wayforpay import REGULAR_MODE_MONTHLY, Purchase
 
-        self.invoice_calls.append(kwargs)
+        self.purchase_calls.append(kwargs)
         if self.invoice_error is not None:
             raise self.invoice_error
         order = kwargs["order_reference"]
-        return Invoice(
+        recurring = kwargs.get("recurring", False)
+        return Purchase(
             order_reference=order,
-            invoice_url=f"https://secure.wayforpay.com/page?o={order}",
+            page_url=f"https://secure.wayforpay.com/page?o={order}",
+            regular_mode=REGULAR_MODE_MONTHLY if recurring else None,
+            date_next=kwargs.get("date_next"),
             raw={"reasonCode": "Ok"},
         )
 

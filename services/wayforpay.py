@@ -2,13 +2,18 @@
 
 Every call is ``POST https://api.wayforpay.com/api``, differing only by ``transactionType``.
 
-Three transaction types: ``CREATE_INVOICE`` (first payment), ``CHECK_STATUS`` (confirmation) and
-``CHARGE`` (renewal from a stored ``recToken``). ``CHARGE`` answers synchronously, so a renewal
-needs no polling; the other two are a request and a later question.
+Asking for money is **Purchase** and only Purchase (``secure.wayforpay.com/pay?behavior=offline``),
+because it is the one method that can carry a monthly schedule. ``CREATE_INVOICE`` was removed on
+2026-10-29: it cannot renew anything, and two ways of asking for money where only one renews is
+how a member ends up on a link that quietly never repeats.
+
+``CHECK_STATUS`` confirms a payment the callback did not reach us about. ``CHARGE`` renews from a
+stored ``recToken`` and is unreachable on this merchant — tokenisation is not available (support,
+2026-10-29) — kept because it is correct code should that ever change.
 
 Signature rules, all HMAC-MD5 over ``;``-joined UTF-8 keyed with the merchant secret:
 
-* CREATE_INVOICE / CHARGE request:
+* Purchase / CHARGE request:
   ``merchantAccount;merchantDomainName;orderReference;orderDate;amount;currency;
   productName[0..n];productCount[0..n];productPrice[0..n]``
   — all names, then all counts, then all prices.
@@ -38,6 +43,26 @@ from db.models import PaymentStatus
 log = logging.getLogger(__name__)
 
 API_URL = "https://api.wayforpay.com/api"
+
+#: Where a **Purchase** is created. ``behavior=offline`` makes it an API call rather than a form
+#: submission: it answers ``{"url": ...}`` with the payment page to send the member to, which is
+#: the only shape usable from a bot — a Telegram button cannot POST a form.
+#:
+#: Purchase exists here for one reason: it is the **only** method that accepts the recurring
+#: parameters. ``CREATE_INVOICE``'s documented parameter list has none of them (wiki 608996852),
+#: so a gateway-side monthly schedule is unreachable from the invoice flow. Confirmed with
+#: WayForPay support on 2026-10-29, who also said card tokenisation is not available on this
+#: merchant — which leaves this as the only route to automatic renewal.
+PURCHASE_URL = "https://secure.wayforpay.com/pay?behavior=offline"
+
+#: Managing an existing schedule: STATUS, SUSPEND, RESUME, REMOVE, EDIT (wiki 852496).
+#: Authenticated with ``merchantPassword``, a 32-character value obtained from WayForPay —
+#: **not** the secret key and not its MD5. Verified against the live API on 2026-10-29: the key
+#: itself is refused for length, and its MD5 answers "Can`t authorize merchant with Password".
+REGULAR_API_URL = "https://api.wayforpay.com/regularApi"
+
+#: The monthly schedule a Purchase can carry. ``monthly`` is the only period this club bills in.
+REGULAR_MODE_MONTHLY = "monthly"
 
 #: Field order of the response signature. Shared by CHECK_STATUS, CHARGE and the (unused) callback.
 RESPONSE_SIGNATURE_FIELDS = (
@@ -187,6 +212,38 @@ def callback_reply(secret_key: str, *, order_reference: str, now: int) -> dict[s
     }
 
 
+def _text(value: Any) -> str | None:
+    """A gateway field as a string, with blank and absent both becoming None."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def charge_key(body: dict[str, Any]) -> str | None:
+    """What identifies one charge inside one order, or None if nothing in the body does.
+
+    ``authCode`` is the bank's authorisation code and is unique per approved charge, so it is the
+    natural answer. A refusal carries none — there was no authorisation — so for those the varying
+    fields are digested instead: the same decline reported twice has the same digest, while next
+    month's decline has a different ``processingDate``.
+
+    This exists because ``payments.order_reference`` is UNIQUE and a monthly schedule may report
+    every charge under the original order number. Without a per-charge identity, month two reads
+    as a duplicate of month one and nobody's access is extended (rule 5).
+    """
+    auth_code = _text(body.get("authCode"))
+    if auth_code:
+        return auth_code[:64]
+    varying = ";".join(
+        str(body.get(name, "") or "")
+        for name in ("transactionStatus", "reasonCode", "processingDate", "createdDate", "amount")
+    )
+    if not varying.strip(";"):
+        return None
+    return hashlib.sha256(varying.encode()).hexdigest()[:32]
+
+
 def map_status(transaction_status: str | None) -> PaymentStatus:
     """Translate a gateway status, defaulting to ERROR for anything unrecognised.
 
@@ -203,9 +260,29 @@ def map_status(transaction_status: str | None) -> PaymentStatus:
 
 
 @dataclass
-class Invoice:
+class Purchase:
+    """A payment page, and the schedule attached to it."""
+
     order_reference: str
-    invoice_url: str
+    page_url: str
+    regular_mode: str | None
+    date_next: str | None
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class RegularPayment:
+    """What ``regularApi`` STATUS says about a schedule."""
+
+    order_reference: str
+    status: str | None
+    mode: str | None
+    amount: Decimal | None
+    currency: str | None
+    next_payment_date: str | None
+    last_payed_date: str | None
+    last_payed_status: str | None
+    reason_code: str | None
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -218,6 +295,10 @@ class TransactionStatus:
     currency: str | None
     reason_code: str | None
     rec_token: str | None
+    #: Identifies **this charge**, not this order. A monthly schedule can report every charge
+    #: under the order number of the Purchase that created it, and that is the one field which
+    #: separates next month's money from a repeat notification about last month's.
+    charge_key: str | None = None
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -233,6 +314,7 @@ class WayForPayClient:
         api_url: str = API_URL,
         timeout: float = 30.0,
         service_url: str | None = None,
+        merchant_password: str | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._merchant_account = merchant_account
@@ -243,6 +325,10 @@ class WayForPayClient:
         # None while the bot polls: without a public HTTPS endpoint there is nowhere to post to,
         # and sending an unreachable serviceUrl would have WayForPay retrying into the void.
         self._service_url = service_url
+        # Only `regularApi` needs this, and it is a credential WayForPay issues separately from
+        # the secret key. None means a schedule can be created but not cancelled through the API —
+        # the caller must say so rather than pretend the cancellation happened.
+        self._merchant_password = merchant_password
         # A seam for tests: httpx.MockTransport lets the request-building and response-parsing
         # paths be exercised without a network, which is worth having on the money paths.
         self._transport = transport
@@ -271,6 +357,16 @@ class WayForPayClient:
             format_amount(amount),
         ]
 
+    @property
+    def service_url(self) -> str | None:
+        """Where the gateway posts results, or None when nothing can receive them."""
+        return self._service_url
+
+    @property
+    def can_manage_schedules(self) -> bool:
+        """Whether ``regularApi`` can be called at all — i.e. a merchantPassword is configured."""
+        return bool(self._merchant_password)
+
     def status_signature_fields(self, *, order_reference: str) -> list[str]:
         return [self._merchant_account, order_reference]
 
@@ -297,7 +393,7 @@ class WayForPayClient:
 
     # --- calls ---------------------------------------------------------------------------
 
-    async def create_invoice(
+    async def purchase(
         self,
         *,
         order_reference: str,
@@ -305,27 +401,70 @@ class WayForPayClient:
         amount: Decimal,
         currency: str,
         product_name: str,
+        recurring: bool = False,
+        regular_amount: Decimal | None = None,
+        date_next: str | None = None,
         order_timeout: int | None = None,
         client_email: str | None = None,
-    ) -> Invoice:
-        """Create an invoice and return its payment URL.
+        language: str = "UA",
+    ) -> Purchase:
+        """Create a payment page and return its URL. The only way this bot asks for money.
 
-        The response to CREATE_INVOICE carries no transaction yet, so it is not signature-verified
-        — there is nothing financial to trust in it. ``invoiceUrl`` is only a link; the money is
-        confirmed later by CHECK_STATUS, which *is* verified.
+        ``recurring=True`` attaches a **monthly schedule**: one payment by the member settles this
+        period and registers a recurring charge on their card. Every month after, WayForPay charges
+        them and posts the result to ``serviceUrl`` — there is no second link and nothing for the
+        member to do again.
+
+        ``recurring=False`` is a single payment and nothing more, for the cases where a schedule
+        would be wrong: a member who already has one (a second would charge them twice a month)
+        and an admin-issued one-off. ``regularMode`` is simply omitted — the gateway treats an
+        absent one as "no recurring".
+
+        This replaced ``CREATE_INVOICE`` outright on 2026-10-29. That method cannot carry the
+        recurring parameters at all (its documented table has none of them, wiki 608996852), so
+        keeping it would have meant two ways of asking for money where only one can renew.
+        Everything the invoice call offered — ``orderTimeout``, ``clientEmail``, ``serviceUrl`` —
+        Purchase takes too.
+
+        ``regularOn=1`` ties the schedule to the payment rather than offering it as a checkbox,
+        and ``regularBehavior=preset`` stops the member editing the amount or the period on the
+        page. ``dateNext`` is when the **next** charge falls, so it must be a future date — the
+        period being paid for now is covered by ``amount``.
+
+        **A serviceUrl is mandatory here.** A schedule whose charges nothing is listening for is
+        money taken with no access granted, every month, silently. Polling cannot substitute: the
+        poller only asks about orders it already knows, and a gateway-side charge creates one it
+        has never heard of. So this raises rather than quietly creating an unmonitored schedule.
+
+        The signature covers exactly the fields CREATE_INVOICE's does, in the same order (wiki
+        852102) — the recurring fields are **not** signed. Verified against the live endpoint on
+        2026-10-29.
         """
+        if recurring and not self._service_url:
+            msg = (
+                "refusing to create a recurring Purchase with no serviceUrl: the gateway would "
+                "charge the card monthly and nothing would hear about it"
+            )
+            raise WayForPayError(msg)
+        if recurring and (regular_amount is None or date_next is None):
+            msg = "a recurring Purchase needs both regular_amount and date_next"
+            raise WayForPayError(msg)
+
         payload: dict[str, Any] = {
-            "transactionType": "CREATE_INVOICE",
             "merchantAccount": self._merchant_account,
             "merchantDomainName": self._merchant_domain,
+            # AUTO is the only documented value for Purchase, and it is what lets 3DS run —
+            # unlike CHARGE, there *is* a cardholder on this page.
+            "merchantTransactionSecureType": "AUTO",
             "apiVersion": 1,
+            "language": language,
             "orderReference": order_reference,
             "orderDate": order_date,
             "amount": format_amount(amount),
             "currency": currency,
             "productName": [product_name],
-            "productPrice": [format_amount(amount)],
             "productCount": [1],
+            "productPrice": [format_amount(amount)],
             "merchantSignature": sign(
                 self._secret_key,
                 self.invoice_signature_fields(
@@ -338,27 +477,117 @@ class WayForPayClient:
                 ),
             ),
         }
+        if recurring:
+            payload.update(
+                {
+                    "regularMode": REGULAR_MODE_MONTHLY,
+                    "regularOn": 1,
+                    "regularBehavior": "preset",
+                    "regularAmount": format_amount(regular_amount),  # type: ignore[arg-type]
+                    "dateNext": date_next,
+                }
+            )
         if order_timeout is not None:
             payload["orderTimeout"] = order_timeout
         if client_email:
             payload["clientEmail"] = client_email
         if self._service_url:
-            # Where WayForPay posts the result — and the **only** place a `recToken` is ever
-            # delivered for an invoice payment, which is what makes automatic renewal possible
-            # at all. Not part of the signature.
+            # Where WayForPay posts the result. Not part of the signature. Mandatory for a
+            # schedule (checked above) and worth sending anyway: it confirms a payment the moment
+            # it happens instead of up to two minutes later.
             payload["serviceUrl"] = self._service_url
 
-        data = await self._post(payload)
-
-        invoice_url = data.get("invoiceUrl")
-        if not invoice_url:
+        data = await self._post(payload, url=PURCHASE_URL)
+        page_url = data.get("url")
+        if not page_url:
             msg = (
-                f"CREATE_INVOICE returned no invoiceUrl for {order_reference}: "
+                f"Purchase returned no url for {order_reference}: "
                 f"reasonCode={data.get('reasonCode')} reason={data.get('reason')!r}"
             )
             raise WayForPayError(msg)
 
-        return Invoice(order_reference=order_reference, invoice_url=invoice_url, raw=data)
+        return Purchase(
+            order_reference=order_reference,
+            page_url=str(page_url),
+            regular_mode=REGULAR_MODE_MONTHLY if recurring else None,
+            date_next=date_next if recurring else None,
+            raw=data,
+        )
+
+    # --- managing a schedule once it exists ------------------------------------------------
+
+    async def regular_request(self, request_type: str, **fields: Any) -> dict[str, Any]:
+        """One ``regularApi`` call. Raises if no merchantPassword is configured.
+
+        Not signed: this API authenticates with the merchant password instead, which is why it
+        must never be logged. Raising on a missing password is deliberate — the caller has to
+        handle "cannot cancel" rather than report a cancellation that did not happen.
+        """
+        if not self._merchant_password:
+            msg = (
+                f"{request_type} needs a WayForPay merchantPassword, which is not configured; "
+                f"the schedule must be stopped by hand in the dashboard"
+            )
+            raise WayForPayError(msg)
+        payload = {
+            "requestType": request_type,
+            "merchantAccount": self._merchant_account,
+            "merchantPassword": self._merchant_password,
+            **fields,
+        }
+        return await self._post(payload, url=REGULAR_API_URL)
+
+    async def regular_status(self, *, order_reference: str) -> RegularPayment:
+        """What the gateway thinks the schedule is doing.
+
+        Statuses: Active, Suspended, Created, Removed, Confirmed, Completed (wiki 852526). The
+        response describes the schedule, not its individual charges — only the last one.
+        """
+        data = await self.regular_request("STATUS", orderReference=order_reference)
+        return RegularPayment(
+            order_reference=order_reference,
+            status=_text(data.get("status")),
+            mode=_text(data.get("mode")),
+            amount=parse_amount(
+                data.get("amount"),
+                order_reference=order_reference,
+                gateway_status=_text(data.get("status")),
+            ),
+            currency=_text(data.get("currency")),
+            next_payment_date=_text(data.get("nextPaymentDate")),
+            last_payed_date=_text(data.get("lastPayedDate")),
+            last_payed_status=_text(data.get("lastPayedStatus")),
+            reason_code=_text(data.get("reasonCode")),
+            raw=data,
+        )
+
+    async def regular_remove(self, *, order_reference: str) -> dict[str, Any]:
+        """Stop a schedule for good. There is no undo — a new Purchase starts a new one."""
+        return await self.regular_request("REMOVE", orderReference=order_reference)
+
+    async def regular_suspend(self, *, order_reference: str) -> dict[str, Any]:
+        """Pause a schedule, keeping it resumable."""
+        return await self.regular_request("SUSPEND", orderReference=order_reference)
+
+    async def regular_resume(self, *, order_reference: str) -> dict[str, Any]:
+        """Restart a suspended schedule."""
+        return await self.regular_request("RESUME", orderReference=order_reference)
+
+    async def regular_edit_amount(
+        self, *, order_reference: str, amount: Decimal, currency: str
+    ) -> dict[str, Any]:
+        """Change what the schedule charges.
+
+        Needed because ``regularAmount`` is fixed when the schedule is created, while this club's
+        prices are computed per invoice — a discount that ends, or a promo that runs out, changes
+        what the member should pay without touching the gateway's copy of the figure.
+        """
+        return await self.regular_request(
+            "EDIT",
+            orderReference=order_reference,
+            amount=format_amount(amount),
+            currency=currency,
+        )
 
     async def charge(
         self,
@@ -464,6 +693,7 @@ class WayForPayClient:
             currency=data.get("currency"),
             reason_code=str(data["reasonCode"]) if data.get("reasonCode") is not None else None,
             rec_token=data.get("recToken"),
+            charge_key=charge_key(data),
             raw=data,
         )
 
@@ -482,13 +712,14 @@ class WayForPayClient:
         order_reference = str(payload.get("orderReference") or "")
         return self._read_transaction(order_reference, payload)
 
-    async def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """One request.
+    async def _post(self, payload: dict[str, Any], *, url: str | None = None) -> dict[str, Any]:
+        """One request. ``url`` overrides the API endpoint for Purchase and regularApi.
 
-        The payload is never logged: it carries the signature, which is the secret's output.
+        The payload is never logged: it carries the signature, which is the secret's output, and
+        for regularApi the merchant password itself.
         """
         async with httpx.AsyncClient(timeout=self._timeout, transport=self._transport) as client:
-            response = await client.post(self._api_url, json=payload)
+            response = await client.post(url or self._api_url, json=payload)
         if response.status_code != 200:
             msg = f"WayForPay returned HTTP {response.status_code}"
             raise WayForPayError(msg)

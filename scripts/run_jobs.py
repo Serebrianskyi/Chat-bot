@@ -7,6 +7,9 @@ convenient while testing, and both are safe to run by hand because both are idem
     python -m scripts.run_jobs poll    # ask WayForPay about invoices that have not settled
     python -m scripts.run_jobs status  # show what the jobs would see, changing nothing
     python -m scripts.run_jobs remind  # warn whoever renews tomorrow (automatic or by hand)
+    python -m scripts.run_jobs purge              # dry run: who blocked the bot and would go
+    python -m scripts.run_jobs purge --apply      # delete them
+    python -m scripts.run_jobs purge --probe      # ask Telegram about every member, not the flag
     python -m scripts.run_jobs lapsed  # who has lost access — reports only unless REMOVAL_ENABLED
     python -m scripts.run_jobs invites # get a link to paid members who are not in the channel
     python -m scripts.run_jobs recover # the full daily sweep now, ignoring the once-a-day guard
@@ -34,6 +37,7 @@ from db.session import create_engine, create_session_factory
 from services.billing import (
     poll_open_payments,
     process_due_subscriptions,
+    purge_blocked_users,
     reconcile_written_off,
     recover_access,
     remove_lapsed_members,
@@ -81,7 +85,7 @@ async def cmd_status() -> int:
     return 0
 
 
-async def _run(job: str, apply: bool = False) -> int:
+async def _run(job: str, apply: bool = False, probe: bool = False) -> int:
     settings = get_settings()
     client = build_client(settings)
     if client is None:
@@ -121,10 +125,21 @@ async def _run(job: str, apply: bool = False) -> int:
                 config=config,
                 force=True,
             )
+        elif job == "purge":
+            counts = await purge_blocked_users(
+                factory,
+                bot,
+                admin_ids=settings.admin_id_set,
+                probe=probe,
+                dry_run=not apply,
+            )
+            if not apply:
+                print("DRY RUN — nothing was deleted. Re-run with --apply to delete them.")
         elif job == "lapsed":
             counts = await remove_lapsed_members(
                 factory,
                 bot,
+                client=client,
                 channel_id=config.channel_id,
                 admin_ids=settings.admin_id_set,
                 config=config,
@@ -163,17 +178,27 @@ def main(argv: list[str] | None = None) -> int:
             "recover",
             "remind",
             "lapsed",
+            "purge",
         ],
+    )
+    parser.add_argument(
+        "--probe",
+        action="store_true",
+        help=(
+            "purge only: ask Telegram about every member instead of reading is_blocked_bot. "
+            "Makes the bot appear to start typing to everyone who has NOT blocked it, so it is "
+            "for the backlog of members who blocked before the bot started recording it."
+        ),
     )
     parser.add_argument(
         "--apply",
         action="store_true",
-        help="reconcile only: actually credit the orders that come back paid",
+        help="reconcile and purge: actually credit the orders / delete the members",
     )
     args = parser.parse_args(argv)
     if args.job == "status":
         return asyncio.run(cmd_status())
-    return asyncio.run(_run(args.job, apply=args.apply))
+    return asyncio.run(_run(args.job, apply=args.apply, probe=args.probe))
 
 
 if __name__ == "__main__":

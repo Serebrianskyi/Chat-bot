@@ -99,6 +99,38 @@ class Settings(BaseSettings):
     #: SecretStr for the same reason as bot_token. This one signs money.
     wayforpay_secret_key: SecretStr | None = None
 
+    #: A second, separate credential, issued by WayForPay on request (sales@wayforpay.com) and
+    #: **not** derivable from the secret key — verified against the live API on 2026-10-29, where
+    #: the key is refused for length and its MD5 is refused for authorisation. It authenticates
+    #: `regularApi`, which is the only way to stop a monthly schedule from here. Without it a
+    #: schedule can be created but only cancelled by hand in the dashboard, so the bot must say
+    #: so rather than tell a member their renewal has stopped.
+    wayforpay_merchant_password: SecretStr | None = None
+
+    # Run the daily billing jobs **every hour** instead of once at 09:00/09:30 Kyiv.
+    #
+    # For trying the member-facing messages without waiting for tomorrow morning. Only the two
+    # harmless jobs are affected — the due-date sweep and the renewal reminder — and both are
+    # guarded against repeating themselves: a reminder fires once per period
+    # (`last_reminder_at`), and the sweep reuses an open payment rather than minting another.
+    # Removal and the monthly purge keep their own schedules whatever this says: they delete
+    # things, and nothing about a test is worth running those twelve times more often.
+    #
+    # Turn it off again when the test is done — hourly sweeps are twelve times the API calls for
+    # no benefit once the messages have been seen.
+    enable_hourly_jobs: bool = False
+
+    #: Whether a member's payment link also sets up a monthly schedule at WayForPay (Purchase
+    #: with `regularMode`), which is what makes renewal automatic.
+    #:
+    #: **On by default** (owner's decision, 2026-10-29: every link handed out from now on should
+    #: renew), but ignored entirely in polling mode: a schedule charges the card whether or not
+    #: anything is listening, and only `MODE=webhook` with a public `BASE_URL` gives the gateway
+    #: somewhere to report each charge. An unmonitored schedule is money taken with no access
+    #: granted, monthly and silently — so the client refuses to create one without a serviceUrl.
+    #: Setting this to false falls back to one-off payment pages, which renew nothing.
+    auto_renew_enabled: bool = True
+
     # When the free first period ends, for everybody who qualifies for one.
     #
     # Set it to the moment billing should begin — e.g. 2026-11-01T00:00:00+02:00 means "free until

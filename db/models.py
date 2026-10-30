@@ -222,8 +222,29 @@ class Subscription(Base):
     # Free period granted once, tracked explicitly so a second /start cannot extend it (A.6).
     free_period_granted: Mapped[bool] = mapped_column(default=False)
 
-    # Stored as soon as WayForPay returns it, so renewals need no migration later.
+    # Stored as soon as WayForPay returns it, so renewals need no migration later. Dead on this
+    # merchant: WayForPay confirmed on 2026-10-29 that card tokenisation is not available, which
+    # is why renewal runs through a gateway-side schedule instead (the three columns below).
     wayforpay_rec_token: Mapped[str | None] = mapped_column(String(255), default=None)
+
+    # --- the gateway-side monthly schedule (Purchase with regularMode) -----------------------
+    #
+    # The schedule belongs to WayForPay: it charges the card every month and tells us afterwards.
+    # `regular_order_reference` is the orderReference of the Purchase that created it, and is the
+    # key `regularApi` identifies it by — STATUS, SUSPEND, REMOVE and EDIT all take that string,
+    # so without it a schedule cannot be stopped from here at all.
+    regular_order_reference: Mapped[str | None] = mapped_column(
+        String(64), default=None, index=True
+    )
+    #: Our view of the schedule: `requested` (the Purchase page was handed over, nobody has paid
+    #: yet), `active`, `suspended`, `removed`. Deliberately not the gateway's own vocabulary —
+    #: `requested` has no gateway equivalent, and it is the state that matters most, because a
+    #: member sitting in it is still owed a payment link.
+    regular_status: Mapped[str | None] = mapped_column(String(16), default=None, index=True)
+    #: When the gateway says it will charge next, as it told us. Never used for access decisions —
+    #: `expires_at` remains the only due date — but a disagreement between the two is the first
+    #: sign that a charge happened and we never heard about it.
+    regular_next_at: Mapped[datetime | None] = mapped_column(UtcDateTime, default=None)
 
     source: Mapped[str] = mapped_column(String(16), default="wayforpay")
     granted_by: Mapped[int | None] = mapped_column(BigInteger, default=None)
@@ -254,6 +275,22 @@ class Payment(Base):
     status: Mapped[PaymentStatus] = mapped_column(
         _enum_column(PaymentStatus), default=PaymentStatus.PENDING_PAYMENT
     )
+
+    #: The order number **the gateway** uses, when it differs from ours. A monthly schedule can
+    #: report every charge under the orderReference of the Purchase that created it, and
+    #: `order_reference` is UNIQUE — so a second charge cannot be stored under it. That row gets a
+    #: local reference of its own and keeps the gateway's string here, which is what CHECK_STATUS
+    #: and `diagnose order` must be asked with. NULL means the two are the same.
+    gateway_order_reference: Mapped[str | None] = mapped_column(
+        String(64), default=None, index=True
+    )
+    #: Identifies **one charge** rather than one order: the gateway's `authCode`, or a digest of
+    #: the fields that vary between charges when there is none. This is what makes a repeated
+    #: notification distinguishable from next month's money arriving under the same order number,
+    #: which `order_reference` alone cannot tell apart (rule 5).
+    charge_key: Mapped[str | None] = mapped_column(String(64), default=None, index=True)
+    #: True for a charge WayForPay made on its own schedule, false for one the member initiated.
+    is_recurring: Mapped[bool] = mapped_column(default=False)
 
     invoice_url: Mapped[str | None] = mapped_column(String(512), default=None)
 

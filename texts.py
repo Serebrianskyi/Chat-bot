@@ -223,6 +223,15 @@ RETRY_AFTER_HOURS = 24
 
 PAYMENT_DENIED = "Оплату не вдалося провести. Спробуйте, будь ласка, ще раз — кнопка нижче."
 
+#: A scheduled charge WayForPay made on its own was refused. The gateway retries on a schedule we
+#: do not control, so this promises nothing about when — it points at the one thing the member can
+#: do right now, which is pay from /subscription.
+SCHEDULE_CHARGE_FAILED = (
+    "🚫 Не вдалося списати оплату за підписку автоматично.\n\n"
+    "Доступ активний до <b>{until}</b>. Щоб продовжити його вручну, "
+    "відкрийте /subscription і натисніть «Оплатити наступний період»."
+)
+
 # --- losing access ---------------------------------------------------------------------------
 
 #: SPEC — sent when a member is removed from the community for non-payment.
@@ -241,6 +250,20 @@ PAYMENT_OVERDUE = (
 # --- cancelling ------------------------------------------------------------------------------
 
 #: SPEC — button label.
+#: Lets a member pay before their period ends. Added 2026-10-29: an admin granted somebody a
+#: discount, the member opened the bot, and there was no way to act on it — their period was
+#: still running, so nothing was owed and no button existed anywhere. Paying early never costs
+#: days, because `extend()` adds a period to the date they already hold.
+PAY_EARLY_BUTTON = "💳 Оплатити наступний період"
+
+PAY_EARLY_PROMPT = (
+    "Наступний період — <b>{amount}</b> за {period} днів.\n"
+    "Після оплати доступ продовжиться до {until}."
+)
+PAY_EARLY_UNAVAILABLE = (
+    "Зараз не вдалося створити посилання на оплату. Спробуйте, будь ласка, згодом."
+)
+
 CANCEL_AUTORENEW_BUTTON = "Скасувати автопродовження"
 
 #: SPEC — «Підписка діє до [дата], далі буде скасована»
@@ -285,6 +308,11 @@ SUBSCRIPTION_STATUS = (
     "<b>Ваша підписка</b>\n\nСтатус: {status}\nВартість: {amount} на {period} днів\nДіє до: {until}"
 )
 
+#: Appended to the card when money will arrive without the member doing anything. Worth saying
+#: explicitly: the whole point of the gateway-side schedule is that they need not come back, and
+#: a screen that does not mention it leaves them wondering whether to pay again.
+SUBSCRIPTION_AUTORENEW_ON = "\n\n♻️ Автопродовження увімкнено — списання відбудеться автоматично."
+
 SUBSCRIPTION_STATUS_UNPAID = (
     "<b>Ваша підписка</b>\n"
     "\n"
@@ -323,7 +351,7 @@ ADMIN_MENU_TITLE = "Адмін-панель"
 ADMIN_NOT_BUILT_YET = "«{label}» буде додано на наступному етапі."
 
 ADMIN_MENU_STATISTICS = "📊 Статистика"
-ADMIN_MENU_BROADCAST = "📣 Розсилка"
+ADMIN_MENU_BROADCAST = "📣 Розсилка учасникам"
 ADMIN_MENU_USERS = "👥 Учасники"
 ADMIN_MENU_KNOWLEDGE_BASE = "📚 База знань"
 ADMIN_MENU_ADD_SUBSCRIBER = "➕ Додати учасника"
@@ -331,7 +359,7 @@ ADMIN_MENU_DISCOUNTS = "🎟 Знижки"
 ADMIN_MENU_GRANT_DISCOUNT = "🎁 Надати знижку"
 ADMIN_MENU_SEND_INVITE = "🔗 Надіслати запрошення"
 ADMIN_MENU_MESSAGE_USER = "✍️ Написати учаснику"
-ADMIN_MENU_CHANNEL_POST = "📢 Написати в канал"
+ADMIN_MENU_CHANNEL_POST = "📢 Пост у канал"
 ADMIN_MENU_GIFT_MONTHS = "🎁 Подарувати місяць"
 ADMIN_MENU_PROMOS = "🎟 Промокоди"
 ADMIN_MENU_CREATE_PROMO = "➕ Створити промокод"
@@ -876,6 +904,72 @@ ADMIN_CHANNEL_FAILED = (
     "з правом публікувати повідомлення."
 )
 ADMIN_CHANNEL_NO_ID = "CHANNEL_ID не заданий — немає куди публікувати."
+
+#: What a member is told when their renewal could not be stopped at the gateway. It promises only
+#: what is true: the request is recorded and a person will finish it. Saying «скасовано» while the
+#: card is still on a schedule would be a lie the next charge exposes.
+CANCEL_PENDING_MANUAL = (
+    "Запит на скасування автопродовження отримано.\n\n"
+    "Доступ активний до <b>{until}</b>. Ми підтвердимо скасування найближчим часом — "
+    "якщо виникнуть питання, напишіть нам."
+)
+
+# --- the gateway-side monthly schedule -------------------------------------------------------
+
+#: An admin is told when the price WayForPay charges on a schedule stops matching the price this
+#: bot would quote. Nobody is refused access over it: the money was taken and the body was signed.
+ADMIN_SCHEDULE_PRICE_DRIFT = (
+    "⚠️ <b>Автопродовження: ціна розійшлася</b>\n\n"
+    "Учасник: <code>{user_id}</code>\n"
+    "Списано: {was}\n"
+    "Поточна ціна: {price}\n"
+    "Регулярний платіж: <code>{order}</code>\n\n"
+    "Щоб вирівняти, змініть суму регулярного платежу."
+)
+
+ADMIN_SCHEDULE_CHARGE_FAILED = (
+    "🚫 <b>Автопродовження не пройшло</b>\n\n"
+    "Учасник: <code>{user_id}</code>\n"
+    "Сума: {amount}\n"
+    "Відповідь банку: {reason}\n"
+    "Доступ до: {until}"
+)
+
+ADMIN_SCHEDULE_CANCEL_FAILED = (
+    "⚠️ <b>Не вдалося скасувати автопродовження</b>\n\n"
+    "Учасник: <code>{user_id}</code>\n"
+    "Регулярний платіж: <code>{order}</code>\n"
+    "Причина: {reason}\n\n"
+    "Зупиніть регулярний платіж у кабінеті WayForPay, інакше картку спишуть знову."
+)
+
+#: A signed notification about money that cannot be matched to anybody. Acknowledged so WayForPay
+#: stops retrying, and reported here because the alternative is money taken and nobody aware.
+ADMIN_UNKNOWN_CALLBACK = (
+    "❓ <b>Невідомий платіж</b>\n\n"
+    "Замовлення: <code>{order}</code>\n"
+    "Статус: {status}\n"
+    "Сума: {amount}\n\n"
+    "Цього замовлення немає в базі — перевірте кабінет WayForPay."
+)
+
+# --- monthly purge of members who blocked the bot --------------------------------------------
+
+ADMIN_PURGE_REPORT = (
+    "🧹 <b>Щомісячне прибирання</b>\n\n"
+    "Заблокували бота: {blocked}\n"
+    "Видалено з бази: {purged}\n"
+    "Залишено (мають оплату): {kept}{extra}"
+)
+ADMIN_PURGE_DRY_RUN = "\n\n<i>Пробний запуск — нічого не видалено.</i>"
+ADMIN_PURGE_FAILED = "\n⚠️ Не вдалося опрацювати: {failed}"
+ADMIN_PURGE_KEPT_LINE = "• {handle} · id <code>{user_id}</code> — {reason}\n"
+ADMIN_PURGE_KEPT_PAID = "є підтверджена оплата"
+ADMIN_PURGE_KEPT_PROMO = "створював промокоди"
+ADMIN_PURGE_KEPT_NOTE = (
+    "\nЦих не видалено: їхні платежі — це єдиний звіт, який можна зіставити з WayForPay. "
+    "Видаліть вручну, якщо вони точно не потрібні."
+)
 
 # --- the report an admin gets from the daily access sweep ------------------------------------
 #

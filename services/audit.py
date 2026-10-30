@@ -24,6 +24,7 @@ class Action:
     # Phase 2A
     PAYMENT_MISSING = "payment.missing"  # due date passed unpaid; an admin was told
     PAYMENT_COMPLETE = "payment.complete"
+    PAYMENT_FAILED = "payment.failed"  # a scheduled charge the gateway could not take
     DISCOUNT_GRANTED = "discount.granted"
     DISCOUNT_REVOKED = "discount.revoked"
     # Phase 3
@@ -48,6 +49,8 @@ class Action:
     PROMO_CREATED = "promo.created"
     PROMO_REVOKED = "promo.revoked"
     PROMO_REDEEMED = "promo.redeemed"
+    #: A member who blocked the bot was deleted by the monthly purge.
+    USER_PURGED = "user.purged"
     #: One row per daily access-recovery sweep, which is also how the job knows it has already
     #: run today and must not run again on the next deploy.
     ACCESS_RECOVERED = "access.recovered"

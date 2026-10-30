@@ -24,6 +24,7 @@ from services.billing import (
     BillingConfig,
     poll_open_payments,
     process_due_subscriptions,
+    purge_blocked_users,
     recover_access,
     remove_lapsed_members,
     send_renewal_reminders,
@@ -93,17 +94,45 @@ def build_client(settings: Settings) -> WayForPayClient | None:
         secret_key=settings.wayforpay_secret_key.get_secret_value(),  # type: ignore[union-attr]
         # Where payment results are posted. None while polling — see `service_url`.
         service_url=service_url(settings),
+        # Only `regularApi` needs this, and it is optional: a schedule can be created without it
+        # and merely cannot be cancelled through the API.
+        merchant_password=(
+            settings.wayforpay_merchant_password.get_secret_value()
+            if settings.wayforpay_merchant_password
+            else None
+        ),
     )
+
+
+def _warn_if_renewal_is_inert(settings: Settings) -> None:
+    """Say so, loudly, when links will go out as one-offs despite auto-renew being on.
+
+    This is the quiet failure: a `run_jobs due` from a shell where `MODE` is not set gets no
+    `serviceUrl`, so every link it hands out renews nothing — and the members who received them
+    look fine until their access lapses a month later.
+    """
+    if settings.auto_renew_enabled and service_url(settings) is None:
+        log.warning(
+            "AUTO_RENEW_ENABLED is on but there is no serviceUrl (MODE=%s, BASE_URL=%s): every "
+            "payment link will be a ONE-OFF and will not renew. Set MODE=webhook and BASE_URL.",
+            settings.mode,
+            settings.base_url or "unset",
+        )
 
 
 def build_billing_config(settings: Settings) -> BillingConfig:
     from datetime import timedelta
 
+    _warn_if_renewal_is_inert(settings)
     return BillingConfig(
         period_days=settings.subscription_period_days,
         grace=timedelta(days=settings.subscription_grace_days),
         display_timezone=settings.display_timezone,
         channel_id=settings.channel_id,
+        # A schedule charges the card whether or not anything is listening, so it is only created
+        # when the gateway has somewhere to report each charge — i.e. webhook mode with a public
+        # BASE_URL. `service_url` returning None is exactly that condition.
+        auto_renew=settings.auto_renew_enabled and service_url(settings) is not None,
     )
 
 
@@ -166,10 +195,15 @@ def start_scheduler(
         coalesce=True,
         max_instances=1,
     )
+    # `hour="*"` under ENABLE_HOURLY_JOBS, so the two member-facing jobs can be watched without
+    # waiting for tomorrow morning. Both are idempotent within a period, so running them twelve
+    # times a day changes what a member receives not at all — only how soon.
+    daily_hour: int | str = "*" if settings.enable_hourly_jobs else DUE_JOB_HOUR
+
     scheduler.add_job(
         process_due_subscriptions,
         "cron",
-        hour=DUE_JOB_HOUR,
+        hour=daily_hour,
         minute=0,
         id="process_due_subscriptions",
         kwargs={
@@ -186,7 +220,7 @@ def start_scheduler(
     scheduler.add_job(
         send_renewal_reminders,
         "cron",
-        hour=DUE_JOB_HOUR,
+        hour=daily_hour,
         minute=30,
         id="send_renewal_reminders",
         kwargs={
@@ -207,6 +241,9 @@ def start_scheduler(
         kwargs={
             "session_factory": session_factory,
             "bot": bot,
+            # Needed to stop a gateway-side schedule before showing somebody the door: a charge
+            # that lands after the removal takes money for a channel they are no longer in.
+            "client": client,
             "channel_id": config.channel_id,
             "admin_ids": admin_ids,
             "config": config,
@@ -235,11 +272,43 @@ def start_scheduler(
         max_instances=1,
     )
 
+    # Monthly, on the 1st: delete members who have blocked the bot, read from `is_blocked_bot`,
+    # which the my_chat_member handler keeps current. No API calls and no probing — nothing about
+    # this needs to be prompt, a blocked member costing nothing but a row.
+    # Fifteen minutes after the recovery sweep so the two reports do not arrive together.
+    scheduler.add_job(
+        purge_blocked_users,
+        "cron",
+        day=1,
+        hour=RECOVERY_HOUR,
+        minute=15,
+        timezone=ZoneInfo(RECOVERY_TIMEZONE),
+        id="purge_blocked_users",
+        kwargs={
+            "session_factory": session_factory,
+            "bot": bot,
+            "admin_ids": admin_ids,
+        },
+        coalesce=True,
+        max_instances=1,
+    )
+
     scheduler.start()
+    if settings.enable_hourly_jobs:
+        # Loud, because it is a test setting that costs twelve times the API calls and is easy to
+        # leave on: the log is the only place it shows.
+        log.warning(
+            "ENABLE_HOURLY_JOBS is on: the due-date sweep and the renewal reminder run EVERY HOUR "
+            "instead of once at %s:00/%s:30 %s. Turn it off when the test is done.",
+            DUE_JOB_HOUR,
+            DUE_JOB_HOUR,
+            settings.display_timezone,
+        )
     log.info(
-        "Billing jobs started: payments polled every %ss, due dates checked daily at "
+        "Billing jobs started: payments polled every %ss, due dates checked %s at "
         "%s:00 %s, access recovered daily at %s:00 %s, removal enabled=%s",
         POLL_INTERVAL_SECONDS,
+        "hourly" if settings.enable_hourly_jobs else "daily",
         DUE_JOB_HOUR,
         settings.display_timezone,
         RECOVERY_HOUR,

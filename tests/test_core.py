@@ -227,7 +227,11 @@ async def test_start_registers_once_and_invoices_a_paying_joiner(
         assert (
             await session.execute(select(func.count()).select_from(Subscription))
         ).scalar_one() == 1
-    assert len(fake_wayforpay.invoice_calls) == 1
+    assert len(fake_wayforpay.purchase_calls) == 1
+    # And that link renews: a joiner's first payment is what registers the monthly schedule, so
+    # if this ever goes out as a one-off the club silently stops renewing (payments design §1b).
+    assert fake_wayforpay.purchase_calls[0]["recurring"] is True
+    assert fake_wayforpay.purchase_calls[0]["regular_amount"] == REGULAR_PRICE
 
     # The first /start sends two messages, not three: the club pitch, then the tariff carrying
     # the pay button. The button used to arrive in a message of its own headed "time to renew",
@@ -272,7 +276,7 @@ async def test_a_hundred_percent_discount_grants_the_period_and_the_channel_link
     )
 
     # Nothing to pay, so nothing was invoiced and no pay button was offered.
-    assert fake_wayforpay.invoice_calls == []
+    assert fake_wayforpay.purchase_calls == []
     sent = recording_session.of_type("SendMessage")
     assert not any(
         b.url
@@ -362,7 +366,7 @@ async def test_a_founding_member_is_matched_pinned_and_given_a_free_month(
     assert sub.price_tier is PriceTier.DISCOUNTED
     assert sub.free_period_granted is True
     assert sub.expires_at == sub.started_at + timedelta(days=PERIOD_DAYS)
-    assert fake_wayforpay.invoice_calls == []  # nothing owed yet
+    assert fake_wayforpay.purchase_calls == []  # nothing owed yet
     async with session_factory() as session:
         claimed = await session.scalar(select(Discount))
     assert claimed.user_id == USER_ID
@@ -595,26 +599,39 @@ def test_a_tampered_response_is_refused():
 
 @pytest.fixture
 def config() -> BillingConfig:
+    """Production's shape: every payment link carries a monthly schedule (auto_renew is on)."""
     return BillingConfig(period_days=PERIOD_DAYS, grace=timedelta(days=3), channel_id=CHANNEL_ID)
 
 
 class FakeGateway:
     def __init__(self):
-        self.invoice_calls = []
         self.status_calls = []
         self.status_result = None
         self.charge_calls = []
         self.charge_result = None
+        self.purchase_calls = []
+        self.remove_calls = []
+        self.remove_result = {"reasonCode": 4100, "reason": "Ok"}
 
-    async def create_invoice(self, **kw):
-        from services.wayforpay import Invoice
+    #: The real client exposes these; the schedule paths read them before deciding anything.
+    service_url = "https://example.test/payments/wayforpay"
+    can_manage_schedules = True
 
-        self.invoice_calls.append(kw)
-        return Invoice(
+    async def purchase(self, **kw):
+        from services.wayforpay import REGULAR_MODE_MONTHLY, Purchase
+
+        self.purchase_calls.append(kw)
+        return Purchase(
             order_reference=kw["order_reference"],
-            invoice_url=f"https://secure.wayforpay.com/x?{kw['order_reference']}",
+            page_url=f"https://secure.wayforpay.com/page?vkh={kw['order_reference']}",
+            regular_mode=REGULAR_MODE_MONTHLY if kw.get("recurring") else None,
+            date_next=kw.get("date_next"),
             raw={},
         )
+
+    async def regular_remove(self, *, order_reference):
+        self.remove_calls.append(order_reference)
+        return self.remove_result
 
     async def check_status(self, *, order_reference):
         self.status_calls.append(order_reference)
@@ -658,7 +675,16 @@ def declined(order_ref, amount=REGULAR_PRICE, currency=CURRENCY):
     )
 
 
-async def seed_due(session_factory, *, price=REGULAR_PRICE, overdue_days=0):
+async def seed_due(
+    session_factory, *, price=REGULAR_PRICE, overdue_days=0, free_period_granted=True
+):
+    """A member who has come due.
+
+    ``free_period_granted=True`` by default so the member qualifies to be chased: since
+    2026-10-29 the daily job only sends a link to somebody who has paid before or whose free
+    period is ending. A plain never-paid member is deliberately left alone, which
+    ``test_a_member_who_never_paid_is_not_chased_again`` covers.
+    """
     async with session_factory() as session:
         session.add(User(telegram_id=USER_ID, username="member"))
         session.add(User(telegram_id=ADMIN_ID, username="boss"))
@@ -672,6 +698,7 @@ async def seed_due(session_factory, *, price=REGULAR_PRICE, overdue_days=0):
                 period_days=PERIOD_DAYS,
                 started_at=NOW - timedelta(days=PERIOD_DAYS),
                 expires_at=NOW - timedelta(days=overdue_days),
+                free_period_granted=free_period_granted,
             )
         )
         await session.commit()
@@ -832,6 +859,7 @@ async def test_one_broken_row_does_not_cost_everyone_else_their_payment(
                 period_days=PERIOD_DAYS,
                 started_at=NOW - timedelta(days=PERIOD_DAYS),
                 expires_at=NOW,
+                free_period_granted=True,  # so the due job chases them
             )
         )
         await session.commit()
@@ -1251,7 +1279,7 @@ async def test_a_stored_card_is_charged_instead_of_being_asked_to_pay(
     # Charged, not invoiced: no payment link was created or sent.
     assert counts["renewed"] == 1
     assert counts["invoiced"] == 0
-    assert gw.invoice_calls == []
+    assert gw.purchase_calls == []
     assert len(gw.charge_calls) == 1
     assert gw.charge_calls[0]["rec_token"] == "tok-abc"
     assert gw.charge_calls[0]["amount"] == REGULAR_PRICE  # this member's own price
@@ -1438,7 +1466,7 @@ async def test_the_day_before_reminder_differs_by_whether_a_card_is_on_file(
     assert with_card[0].reply_markup is None  # nothing to tap: it happens by itself
     # The one who must pay by hand gets a usable link, not a description of one.
     assert no_card[0].reply_markup.inline_keyboard[0][0].url
-    assert len(gw.invoice_calls) == 1
+    assert len(gw.purchase_calls) == 1
 
     # Runs daily, so it must not warn the same member every morning (G3.7).
     recording_session.calls.clear()
@@ -1586,13 +1614,78 @@ async def test_a_fully_discounted_renewal_is_granted_not_invoiced(
 
     assert counts["free"] == 1
     assert counts["invoiced"] == 0
-    assert gw.invoice_calls == []  # nothing to pay, so nothing asked for
+    assert gw.purchase_calls == []  # nothing to pay, so nothing asked for
 
     sub = await load_sub(session_factory)
     assert sub.status is SubscriptionStatus.ACTIVE
     assert sub.expires_at == NOW + timedelta(days=PERIOD_DAYS)
     # And the link, because a free member still has to get into the channel.
     assert recording_session.of_type("CreateChatInviteLink")
+
+
+async def test_a_member_who_never_paid_is_not_chased_again(
+    session_factory, bot, config, recording_session
+):
+    """Owner's instruction, 2026-10-29. 151 subscriptions were past due, and the daily job was
+    DMing every one of them a fresh payment link each morning — invoices expire after two hours,
+    so each run issued another.
+
+    Somebody who has never paid already had their link at `/start` and chose not to use it. They
+    are to be approached deliberately, with a promo code through 📣 Розсилка, not dripped at by
+    a cron job. Two groups are still chased: anyone who has paid before, and anyone whose free
+    period is ending.
+    """
+    await seed_due(session_factory, overdue_days=5, free_period_granted=False)
+    gw = FakeGateway()
+
+    counts = await process_due_subscriptions(
+        session_factory, gw, bot, admin_ids=frozenset({ADMIN_ID}), config=config, now=NOW
+    )
+
+    assert counts["not_chased"] == 1
+    assert counts["invoiced"] == 0
+    assert gw.purchase_calls == []
+    assert [c for c in recording_session.of_type("SendMessage") if c.chat_id == USER_ID] == []
+
+    # A founding member whose free period has ended **is** chased: they were promised a first
+    # period and have to be asked once it runs out.
+    async with session_factory() as session:
+        sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
+        sub.free_period_granted = True
+        await session.commit()
+
+    again = await process_due_subscriptions(
+        session_factory, gw, bot, admin_ids=frozenset({ADMIN_ID}), config=config, now=NOW
+    )
+    assert again["invoiced"] == 1
+    assert len(gw.purchase_calls) == 1
+
+    # And so is somebody who has paid before — a renewal is an ordinary billing conversation.
+    async with session_factory() as session:
+        sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
+        sub.free_period_granted = False
+        session.add(
+            Payment(
+                user_id=USER_ID,
+                subscription_id=sub.id,
+                order_reference="sub-paid-before",
+                amount=REGULAR_PRICE,
+                currency=CURRENCY,
+                status=PaymentStatus.COMPLETE,
+                created_at=NOW - timedelta(days=40),
+                settled_at=NOW - timedelta(days=40),
+            )
+        )
+        await session.execute(
+            Payment.__table__.delete().where(Payment.order_reference != "sub-paid-before")
+        )
+        await session.commit()
+
+    third = await process_due_subscriptions(
+        session_factory, gw, bot, admin_ids=frozenset({ADMIN_ID}), config=config, now=NOW
+    )
+    assert third["not_chased"] == 0
+    assert third["invoiced"] == 1
 
 
 async def test_a_discount_changes_the_invoiced_sum(session_factory, bot, config):
@@ -1615,7 +1708,7 @@ async def test_a_discount_changes_the_invoiced_sum(session_factory, bot, config)
         session_factory, gw, bot, admin_ids=frozenset({ADMIN_ID}), config=config, now=NOW
     )
 
-    assert gw.invoice_calls[0]["amount"] == Decimal("8.00")
+    assert gw.purchase_calls[0]["amount"] == Decimal("8.00")
     assert (await load_sub(session_factory)).price == Decimal("10.00")  # base untouched
 
 
@@ -1633,7 +1726,7 @@ async def test_the_due_job_is_idempotent(session_factory, bot, config):
 
     assert (first["invoiced"], first["overdue"]) == (1, 1)
     assert (second["invoiced"], second["overdue"]) == (0, 0)
-    assert len(gw.invoice_calls) == 1
+    assert len(gw.purchase_calls) == 1
 
 
 async def test_an_overdue_member_is_recorded_not_removed_and_no_admin_is_pestered(
@@ -1935,7 +2028,7 @@ async def test_a_broadcast_to_unpaid_members_follows_the_text_with_a_pay_button(
     assert button.text == texts.JOIN_CLUB_BUTTON
     assert button.url  # a real invoice URL from the gateway
     # The offer is what was actually invoiced, not just what the message claimed.
-    assert fake_wayforpay.invoice_calls[-1]["amount"] == Decimal("8.00")
+    assert fake_wayforpay.purchase_calls[-1]["amount"] == Decimal("8.00")
 
     async with session_factory() as session:
         entry = await session.scalar(select(AuditLog).where(AuditLog.action == "broadcast.sent"))
@@ -2010,7 +2103,7 @@ async def test_the_lifetime_group_walks_the_same_broadcast_flow_as_unpaid_member
     assert len(with_button) == 1
     assert with_button[0].reply_markup.inline_keyboard[0][0].text == texts.JOIN_CLUB_BUTTON
     assert with_button[0].reply_markup.inline_keyboard[0][0].url
-    assert fake_wayforpay.invoice_calls[-1]["amount"] == Decimal("8.00")
+    assert fake_wayforpay.purchase_calls[-1]["amount"] == Decimal("8.00")
 
 
 async def test_text_over_either_telegram_limit_is_refused_with_a_reason(
@@ -2300,6 +2393,65 @@ async def test_gifting_a_month_adds_to_a_paid_date_and_never_overwrites_it(
     assert entry.details["months"] == 1
 
 
+async def test_a_member_whose_period_is_running_can_still_pay(
+    dispatcher, bot, session_factory, fake_wayforpay, recording_session
+):
+    """Reported by the admin, 2026-10-29: «Надати знижку» looked broken.
+
+    They granted somebody a discount, the member opened the bot — and there was no way to act
+    on it. Their period was still running, so nothing was owed, so no pay button existed
+    anywhere in the bot. The discount was real and would have applied at the next invoice, but
+    from both sides it read as a failure.
+
+    Paying early costs the member nothing: `extend` adds a period to the date they already hold.
+    """
+    from db.models import utcnow
+
+    paid_until = utcnow() + timedelta(days=20)
+    async with session_factory() as session:
+        session.add(User(telegram_id=USER_ID, username="member"))
+        session.add(
+            Subscription(
+                user_id=USER_ID,
+                status=SubscriptionStatus.TRIAL,  # a free period: nothing owed yet
+                price=REGULAR_PRICE,
+                currency=CURRENCY,
+                price_tier=PriceTier.REGULAR,
+                period_days=PERIOD_DAYS,
+                started_at=utcnow(),
+                expires_at=paid_until,
+            )
+        )
+        await session.commit()
+
+    member = make_user(USER_ID, username="member")
+    await dispatcher.feed_update(bot, make_message(member, "/subscription"))
+
+    card = recording_session.of_type("SendMessage")[-1]
+    buttons = [b.text for row in card.reply_markup.inline_keyboard for b in row]
+    assert texts.PAY_EARLY_BUTTON in buttons
+    # Cancelling is still offered; the pay button is an addition, not a replacement.
+    assert texts.CANCEL_AUTORENEW_BUTTON in buttons
+
+    # No invoice yet — drawing the screen must not create orders nobody asked for.
+    assert fake_wayforpay.purchase_calls == []
+
+    recording_session.calls.clear()
+    await dispatcher.feed_update(bot, make_callback(member, "sub:pay", update_id=2))
+
+    assert len(fake_wayforpay.purchase_calls) == 1
+    offered = recording_session.of_type("SendMessage")[-1]
+    pay = offered.reply_markup.inline_keyboard[0][0]
+    assert pay.url  # a real link
+    # The date quoted is their current expiry plus a period, not a month from today: paying
+    # early must not cost them the days they already hold.
+    assert texts.day(paid_until + timedelta(days=PERIOD_DAYS)) in offered.text
+
+    # Tapping twice reuses the invoice rather than minting a second order.
+    await dispatcher.feed_update(bot, make_callback(member, "sub:pay", update_id=3))
+    assert len(fake_wayforpay.purchase_calls) == 1
+
+
 async def test_cancelling_a_subscription_keeps_the_paid_period(dispatcher, bot, session_factory):
     """SPEC: «Підписка діє до [дата], далі буде скасована»."""
     from db.models import utcnow
@@ -2388,6 +2540,8 @@ async def seed_member(session_factory, *, standing: Decimal | None = None, days_
                 period_days=PERIOD_DAYS,
                 started_at=utcnow(),
                 expires_at=utcnow() + timedelta(days=days_left),
+                # These tests are about promo pricing, not about who the daily job chases.
+                free_period_granted=True,
             )
         )
         await session.commit()
@@ -2470,7 +2624,7 @@ async def test_a_promo_is_counted_in_periods_not_days(session_factory, bot, conf
     await process_due_subscriptions(
         session_factory, gw, bot, admin_ids=frozenset({ADMIN_ID}), config=config
     )
-    assert gw.invoice_calls[0]["amount"] == Decimal("8.00")
+    assert gw.purchase_calls[0]["amount"] == Decimal("8.00")
     async with session_factory() as session:
         spent = await session.scalar(
             select(PromoRedemption).where(PromoRedemption.user_id == USER_ID)
@@ -3093,6 +3247,9 @@ def test_every_member_facing_message_is_ukrainian_and_formats_cleanly():
         "over": 336,
         "sent": 50,
         "blocked": 2,
+        "purged": 2,
+        "order": "sub-1-2",
+        "kept": "",
         "invoiced": 48,
         "failed": 0,
     }
@@ -3115,3 +3272,574 @@ def test_every_member_facing_message_is_ukrainian_and_formats_cleanly():
         assert "&" not in stripped, f"{attr} has an unescaped & — Telegram rejects the send"
         assert len(value) <= 4096, attr
     assert checked > 40, "the sweep found suspiciously few strings"
+
+
+# ======================================================================================
+# The monthly purge — it deletes rows, so the two exemptions are the whole test
+# ======================================================================================
+
+
+class ProbeBot:
+    """A bot for which the named ids have blocked the chat."""
+
+    def __init__(self, blocked: set[int]) -> None:
+        self.blocked = blocked
+        self.probed: list[int] = []
+        self.said: list[str] = []
+
+    async def send_chat_action(self, *, chat_id: int, action: str):
+        import types
+
+        from aiogram.exceptions import TelegramForbiddenError
+
+        self.probed.append(chat_id)
+        if chat_id in self.blocked:
+            raise TelegramForbiddenError(
+                method=types.SimpleNamespace(), message="bot was blocked by the user"
+            )
+        return True
+
+    async def send_message(self, chat_id, text, **kwargs):
+        self.said.append(text)
+        return None
+
+
+async def test_the_purge_spares_a_payer_and_an_admin_and_deletes_the_rest(session_factory):
+    """Deleting a member is irreversible, so the exemptions and the FK list are what is tested.
+
+    A blocked member who never paid goes, with every row that references them. A blocked member
+    with a `complete` payment stays — their payments are the only thing reconcilable against
+    WayForPay (rule 6) — and an admin is never touched however they left.
+    """
+    from db.models import Base, Payment, PaymentStatus, Subscription, User, utcnow
+    from services.billing import _purge_statements, purge_blocked_users
+
+    # Every table with a foreign key to users must be handled, or the delete fails mid-sweep on
+    # a month-end run. Asserted against the metadata so a new table fails here instead.
+    referencing = {
+        fk.parent.table.name
+        for table in Base.metadata.tables.values()
+        for fk in table.foreign_keys
+        if fk.column.table.name == "users"
+    }
+    handled = {statement.table.name for statement in _purge_statements(1)}
+    assert not referencing - handled, f"{referencing - handled} reference users and are not purged"
+
+    payer, quitter = 777_000_001, 777_000_002
+
+    async with session_factory() as session:
+        for telegram_id, username, blocked in (
+            (ADMIN_ID, "boss", True),
+            (payer, "paid", True),
+            (quitter, "gone", True),
+            (USER_ID, "staying", False),
+        ):
+            session.add(User(telegram_id=telegram_id, username=username, is_blocked_bot=blocked))
+            session.add(
+                Subscription(
+                    user_id=telegram_id,
+                    status=SubscriptionStatus.ACTIVE,
+                    price=REGULAR_PRICE,
+                    currency=CURRENCY,
+                    price_tier=PriceTier.REGULAR,
+                    period_days=PERIOD_DAYS,
+                    started_at=utcnow(),
+                    expires_at=utcnow() + timedelta(days=5),
+                )
+            )
+        session.add(
+            Payment(
+                user_id=payer,
+                order_reference="paid-once",
+                amount=REGULAR_PRICE,
+                currency=CURRENCY,
+                status=PaymentStatus.COMPLETE,
+            )
+        )
+        await session.commit()
+
+    bot = ProbeBot(blocked={ADMIN_ID, payer, quitter})
+    counts = await purge_blocked_users(
+        session_factory, bot, admin_ids=frozenset({ADMIN_ID}), now=utcnow()
+    )
+
+    assert bot.probed == [], "the scheduled job reads the flag and probes nobody"
+    assert counts == {"checked": 2, "blocked": 2, "purged": 1, "kept_paid": 1, "failed": 0}
+
+    async with session_factory() as session:
+        assert set(await session.scalars(select(User.telegram_id))) == {ADMIN_ID, payer, USER_ID}
+        assert (
+            await session.scalar(select(Subscription.id).where(Subscription.user_id == quitter))
+            is None
+        )
+        assert await session.scalar(select(Payment.id).where(Payment.user_id == payer)) is not None
+
+    assert bot.said and "Заблокували бота: 2" in bot.said[0]
+
+
+async def test_a_dry_run_purge_deletes_nothing(session_factory):
+    """The month-end list is reviewed before it is acted on, the way `lapsed` is."""
+    from db.models import User, utcnow
+    from services.billing import purge_blocked_users
+
+    async with session_factory() as session:
+        session.add(User(telegram_id=USER_ID, username="gone", is_blocked_bot=True))
+        await session.commit()
+
+    counts = await purge_blocked_users(
+        session_factory,
+        ProbeBot(blocked=set()),
+        admin_ids=frozenset({ADMIN_ID}),
+        dry_run=True,
+        now=utcnow(),
+    )
+    assert counts["purged"] == 1
+    async with session_factory() as session:
+        assert await session.get(User, USER_ID) is not None
+
+
+# ======================================================================================
+# The gateway-side monthly schedule — Purchase, and the charges it makes on its own
+# ======================================================================================
+
+
+async def test_a_recurring_purchase_is_signed_like_an_invoice_and_refuses_to_run_unheard():
+    """The request that sets up automatic renewal, checked field by field.
+
+    WayForPay confirmed on 2026-10-29 that tokenisation is unavailable here, so this call is the
+    only route to automatic renewal — and `CREATE_INVOICE` has no recurring parameters at all.
+    The signature is computed from the documented field list (wiki 852102) rather than from the
+    code's own helper, so a change to that helper cannot quietly satisfy this.
+    """
+    import hashlib
+    import hmac
+    import json
+
+    import httpx
+
+    from services.wayforpay import PURCHASE_URL, WayForPayClient, WayForPayError
+
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"url": "https://secure.wayforpay.com/page?vkh=abc"})
+
+    client = WayForPayClient(
+        merchant_account="acct",
+        merchant_domain="example.com",
+        secret_key="secret",  # noqa: S106
+        service_url="https://example.test/payments/wayforpay",
+        transport=httpx.MockTransport(handler),
+    )
+
+    page = await client.purchase(
+        order_reference="sub-1-100",
+        order_date=100,
+        amount=Decimal("8"),
+        currency="EUR",
+        product_name="Sub",
+        recurring=True,
+        regular_amount=Decimal("8"),
+        date_next="01.12.2026",
+    )
+
+    assert page.page_url == "https://secure.wayforpay.com/page?vkh=abc"
+    assert seen["url"] == PURCHASE_URL
+    body = seen["body"]
+    expected = hmac.new(
+        b"secret",
+        b"acct;example.com;sub-1-100;100;8.00;EUR;Sub;1;8.00",
+        hashlib.md5,
+    ).hexdigest()
+    assert body["merchantSignature"] == expected
+    # The recurring fields travel in the payload only — signing them would break the signature.
+    assert body["regularMode"] == "monthly"
+    assert body["regularOn"] == 1
+    assert body["regularBehavior"] == "preset"
+    assert body["regularAmount"] == "8.00"
+    assert body["dateNext"] == "01.12.2026"
+    # Without this the gateway charges the card monthly and nothing hears about it.
+    assert body["serviceUrl"] == "https://example.test/payments/wayforpay"
+
+    unheard = WayForPayClient(
+        merchant_account="acct",
+        merchant_domain="example.com",
+        secret_key="secret",  # noqa: S106
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(WayForPayError):
+        await unheard.purchase(
+            order_reference="sub-1-101",
+            order_date=100,
+            amount=Decimal("8"),
+            currency="EUR",
+            product_name="Sub",
+            recurring=True,
+            regular_amount=Decimal("8"),
+            date_next="01.12.2026",
+        )
+
+    # A one-off page off the same method: no schedule, and nothing promising one. This is what a
+    # member who already has a schedule gets, and it is why CREATE_INVOICE could go entirely.
+    await client.purchase(
+        order_reference="sub-1-102",
+        order_date=100,
+        amount=Decimal("8"),
+        currency="EUR",
+        product_name="Sub",
+    )
+    assert "regularMode" not in seen["body"]
+    assert "dateNext" not in seen["body"]
+
+
+async def test_a_schedule_is_set_up_with_a_future_charge_date(session_factory):
+    """`dateNext` is the end of the period being paid for, not the expiry the member holds.
+
+    151 of the live subscriptions are past due, so their `expires_at` is in the past and the
+    gateway refuses a `dateNext` that is not in the future. Using `extend` here is also what keeps
+    the gateway's schedule and `expires_at` agreeing by construction.
+    """
+    from services.billing import SCHEDULE_ACTIVE, SCHEDULE_REQUESTED, issue_invoice
+
+    await seed_due(session_factory, overdue_days=9)
+    gw = FakeGateway()
+    schedule_config = BillingConfig(period_days=PERIOD_DAYS, channel_id=CHANNEL_ID, auto_renew=True)
+
+    async with session_factory() as session:
+        sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
+        payment = await issue_invoice(
+            session, gw, subscription=sub, config=schedule_config, now=NOW
+        )
+        await session.commit()
+        reference = payment.order_reference
+        assert sub.regular_status == SCHEDULE_REQUESTED
+        assert sub.regular_order_reference == reference
+
+    call = gw.purchase_calls[0]
+    assert call["recurring"] is True
+    # NOW + one period, because the period being bought starts today — not NOW - 9 days.
+    assert call["date_next"] == texts.day(NOW + timedelta(days=PERIOD_DAYS))
+    assert call["regular_amount"] == REGULAR_PRICE
+
+    # Abandoned the page and came back tomorrow: still a schedule. `requested` means a page was
+    # handed over and nobody paid it, and it never clears without a payment — so treating it as
+    # "already has one" would leave this member unable to ever get a schedule again.
+    async with session_factory() as session:
+        sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
+        await issue_invoice(session, gw, subscription=sub, config=schedule_config, now=NOW)
+        await session.commit()
+    assert gw.purchase_calls[1]["recurring"] is True
+
+    # Once the gateway is actually charging them, a second schedule would take the money twice a
+    # month — so they get a payment page without one: the same call minus the recurring fields.
+    async with session_factory() as session:
+        sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
+        sub.regular_status = SCHEDULE_ACTIVE
+        await session.commit()
+        await issue_invoice(session, gw, subscription=sub, config=schedule_config, now=NOW)
+        await session.commit()
+    assert len(gw.purchase_calls) == 3
+    assert gw.purchase_calls[2]["recurring"] is False
+
+
+async def test_each_scheduled_charge_extends_once_whichever_reference_it_arrives_under(
+    session_factory, bot, config, recording_session, in_community
+):
+    """The failure this guards against is money in, no access.
+
+    Nobody knows whether WayForPay reports a monthly charge under the original `orderReference`
+    or a new one — the wiki does not say and support was not waited for — so both are handled.
+    Under the original one, `payments.order_reference` is UNIQUE and `apply_payment_result` ignores
+    a result for an already-complete row, so without a per-charge identity month two would be read
+    as a repeat of month one and nothing extended.
+    """
+    from services.billing import SCHEDULE_ACTIVE, process_callback
+
+    class Client:
+        """Only `read_callback` is exercised here; the signature check is tested elsewhere."""
+
+        def read_callback(self, payload):
+            from services.wayforpay import TransactionStatus, charge_key, map_status
+
+            return TransactionStatus(
+                order_reference=payload["orderReference"],
+                status=map_status(payload["transactionStatus"]),
+                gateway_status=payload["transactionStatus"],
+                amount=Decimal(payload["amount"]),
+                currency=payload["currency"],
+                reason_code="1100",
+                rec_token=None,
+                charge_key=charge_key(payload),
+                raw=payload,
+            )
+
+    def body(reference, auth_code):
+        return {
+            "orderReference": reference,
+            "transactionStatus": "Approved",
+            "amount": str(REGULAR_PRICE),
+            "currency": CURRENCY,
+            "authCode": auth_code,
+            "processingDate": auth_code,
+        }
+
+    await seed_due(session_factory)
+    gw = FakeGateway()
+    schedule_config = BillingConfig(period_days=PERIOD_DAYS, channel_id=CHANNEL_ID, auto_renew=True)
+    await process_due_subscriptions(
+        session_factory, gw, bot, admin_ids=frozenset({ADMIN_ID}), config=schedule_config, now=NOW
+    )
+    reference = (await one_payment(session_factory)).order_reference
+
+    client = Client()
+    kwargs = {"admin_ids": frozenset({ADMIN_ID}), "config": config}
+
+    # Month one: the member pays the page themselves. Invite and all.
+    assert await process_callback(
+        session_factory, bot, client=client, payload=body(reference, "aaa"), now=NOW, **kwargs
+    )
+    first = (await load_sub(session_factory)).expires_at
+    assert (await load_sub(session_factory)).regular_status == SCHEDULE_ACTIVE
+    assert recording_session.of_type("CreateChatInviteLink")
+
+    # The same notification again — WayForPay retries until acknowledged.
+    assert not await process_callback(
+        session_factory, bot, client=client, payload=body(reference, "aaa"), now=NOW, **kwargs
+    )
+    assert (await load_sub(session_factory)).expires_at == first
+
+    # Month two under the ORIGINAL reference: a different charge, so a period is owed.
+    # They are in the channel by now, so a renewal must not send another single-use link.
+    in_community()
+    month_two = NOW + timedelta(days=PERIOD_DAYS)
+    assert await process_callback(
+        session_factory,
+        bot,
+        client=client,
+        payload=body(reference, "bbb"),
+        now=month_two,
+        **kwargs,
+    )
+    second = (await load_sub(session_factory)).expires_at
+    assert second > first
+
+    # Month three under a reference of the gateway's own, resolved via the stored schedule.
+    month_three = NOW + timedelta(days=2 * PERIOD_DAYS)
+    assert await process_callback(
+        session_factory,
+        bot,
+        client=client,
+        payload=body(f"{reference}_1", "ccc"),
+        now=month_three,
+        **kwargs,
+    )
+    assert (await load_sub(session_factory)).expires_at > second
+
+    async with session_factory() as session:
+        rows = list(
+            await session.scalars(
+                select(Payment).where(Payment.user_id == USER_ID).order_by(Payment.id)
+            )
+        )
+    # One row per charge, each carrying the gateway's own reference for reconciliation.
+    assert [row.is_recurring for row in rows] == [False, True, True]
+    assert [row.status for row in rows] == [PaymentStatus.COMPLETE] * 3
+    assert rows[2].gateway_order_reference == f"{reference}_1"
+    # A renewal sends no invite to somebody already in the channel.
+    assert len(recording_session.of_type("CreateChatInviteLink")) == 1
+
+    # Unless they are **outside** it — a card that declined long enough to get them removed, then
+    # worked. Without this they are charged, extended, and left out of what they just paid for.
+    from aiogram.types import ChatMemberLeft
+
+    recording_session.responses["GetChatMember"] = ChatMemberLeft.model_validate(
+        {"status": "left", "user": {"id": USER_ID, "is_bot": False, "first_name": "Out"}}
+    )
+    assert await process_callback(
+        session_factory,
+        bot,
+        client=client,
+        payload=body(reference, "ddd"),
+        now=NOW + timedelta(days=3 * PERIOD_DAYS),
+        **kwargs,
+    )
+    assert len(recording_session.of_type("CreateChatInviteLink")) == 2
+
+
+async def test_a_member_is_never_told_a_renewal_stopped_when_the_gateway_refused(session_factory):
+    """A card charged after «скасовано» is the worst trust failure available here.
+
+    So the gateway is asked first and the local flag follows. With no `merchantPassword` the API
+    cannot be called at all, which is a real outcome on this merchant — it is a credential
+    WayForPay issues separately, verified against the live API on 2026-10-29.
+    """
+    from services.billing import SCHEDULE_ACTIVE, SCHEDULE_REMOVED, stop_schedule
+
+    await seed_member(session_factory)
+    async with session_factory() as session:
+        sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
+        sub.regular_order_reference = "sub-222222222-1"
+        sub.regular_status = SCHEDULE_ACTIVE
+        await session.commit()
+
+    async def attempt(client):
+        async with session_factory() as session:
+            sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
+            outcome = await stop_schedule(session, client, subscription=sub, now=utcnow_for_test())
+            await session.commit()
+            return outcome, sub.regular_status
+
+    # No credential: refused, and the schedule is still live so nothing may claim otherwise.
+    gw = FakeGateway()
+    gw.can_manage_schedules = False
+    (stopped, why), status = await attempt(gw)
+    assert stopped is False
+    assert why == "no-credential"
+    assert status == SCHEDULE_ACTIVE
+
+    # The gateway answers with a refusal code rather than Ok.
+    gw = FakeGateway()
+    gw.remove_result = {"reasonCode": 1113, "reason": "Invalid signature"}
+    (stopped, _why), status = await attempt(gw)
+    assert stopped is False
+    assert status == SCHEDULE_ACTIVE
+
+    # And the good path: REMOVE accepted, so the schedule is gone and cancelling may proceed.
+    gw = FakeGateway()
+    (stopped, why), status = await attempt(gw)
+    assert (stopped, why) == (True, None)
+    assert status == SCHEDULE_REMOVED
+    assert gw.remove_calls == ["sub-222222222-1"]
+
+
+async def test_a_schedule_that_stopped_paying_is_chased_by_hand_and_never_silently_lapses(
+    session_factory, bot, config
+):
+    """The worst outcome in the system: a dead card, a schedule still marked active, and a member
+    who is never asked to pay, lapses, and is removed.
+
+    So the sweep's skip is bounded. Inside the window WayForPay owns the charge and the member is
+    left alone; past it they get a link like anybody else, while the schedule stays in place so a
+    charge that does land later still extends them.
+    """
+    from sqlalchemy import delete
+
+    from services.billing import SCHEDULE_ACTIVE, SCHEDULE_CHASE_AFTER, process_due_subscriptions
+
+    async def sweep(overdue):
+        await seed_due(session_factory, overdue_days=0)
+        async with session_factory() as session:
+            sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
+            sub.regular_status = SCHEDULE_ACTIVE
+            sub.regular_order_reference = "sub-222222222-1"
+            sub.expires_at = NOW - overdue
+            await session.commit()
+        gw = FakeGateway()
+        counts = await process_due_subscriptions(
+            session_factory, gw, bot, admin_ids=frozenset({ADMIN_ID}), config=config, now=NOW
+        )
+        async with session_factory() as session:
+            await session.execute(delete(Payment))
+            await session.execute(delete(Subscription))
+            await session.execute(delete(AuditLog))
+            await session.execute(delete(User))
+            await session.commit()
+        return counts, gw
+
+    # Due today: the gateway is charging them, so the bot must not.
+    counts, gw = await sweep(timedelta(0))
+    assert counts["scheduled"] == 1
+    assert counts["invoiced"] == 0
+    assert gw.purchase_calls == []
+
+    # Days past the window with nothing collected: they get a link rather than silence.
+    counts, gw = await sweep(SCHEDULE_CHASE_AFTER + timedelta(days=1))
+    assert counts["scheduled"] == 0
+    assert counts["invoiced"] == 1
+    assert len(gw.purchase_calls) == 1
+
+
+async def test_removing_a_lapsed_member_stops_the_gateway_charging_their_card(
+    session_factory, bot, config, in_community
+):
+    """Removal without this takes somebody's money for a channel they are no longer in.
+
+    A lapsed member on a schedule is there *because* payment failed, so the schedule is a declined
+    card the gateway may still retry. If a retry succeeds after the removal, they have paid and
+    cannot get in.
+    """
+    from services.billing import SCHEDULE_ACTIVE, SCHEDULE_REMOVED, remove_lapsed_members
+
+    in_community()
+    await seed_due(session_factory, overdue_days=10)
+    async with session_factory() as session:
+        sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
+        sub.regular_status = SCHEDULE_ACTIVE
+        sub.regular_order_reference = "sub-222222222-1"
+        await session.commit()
+
+    gw = FakeGateway()
+    counts = await remove_lapsed_members(
+        session_factory,
+        bot,
+        client=gw,
+        channel_id=CHANNEL_ID,
+        admin_ids=frozenset({ADMIN_ID}),
+        config=config,
+        now=NOW,
+        enabled=True,
+    )
+
+    assert counts["removed"] == 1
+    assert gw.remove_calls == ["sub-222222222-1"], "the schedule must be stopped at the gateway"
+    async with session_factory() as session:
+        sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
+    assert sub.regular_status == SCHEDULE_REMOVED
+    assert sub.status is SubscriptionStatus.EXPIRED
+
+
+async def test_the_poller_asks_about_a_scheduled_charge_by_the_gateways_own_reference(
+    session_factory, bot, config
+):
+    """Ours and WayForPay's order numbers are not the same row for a scheduled charge.
+
+    `payments.order_reference` is UNIQUE, so a charge reported under the original number is stored
+    under a local reference of its own. Polling with that would get "order not found" and the row
+    would sit at ERROR for ever — money taken, never confirmed.
+    """
+    from db.models import Payment, PaymentStatus, utcnow
+    from services.billing import poll_open_payments
+
+    await seed_member(session_factory)
+    async with session_factory() as session:
+        sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
+        session.add(
+            Payment(
+                user_id=USER_ID,
+                subscription_id=sub.id,
+                order_reference="local-ref-for-month-two",
+                gateway_order_reference="sub-222222222-original",
+                charge_key="bbb",
+                is_recurring=True,
+                amount=REGULAR_PRICE,
+                currency=CURRENCY,
+                status=PaymentStatus.PENDING,
+                created_at=utcnow(),
+            )
+        )
+        await session.commit()
+
+    gw = FakeGateway()
+    gw.status_result = approved("sub-222222222-original")
+    await poll_open_payments(
+        session_factory, gw, bot, config=config, admin_ids=frozenset({ADMIN_ID}), now=utcnow()
+    )
+
+    assert gw.status_calls == ["sub-222222222-original"]
+    async with session_factory() as session:
+        row = await session.scalar(
+            select(Payment).where(Payment.order_reference == "local-ref-for-month-two")
+        )
+    assert row.status is PaymentStatus.COMPLETE

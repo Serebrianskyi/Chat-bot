@@ -5,6 +5,7 @@
     python -m scripts.diagnose reasons    # what WayForPay actually said, grouped
     python -m scripts.diagnose order <order_reference>   # one stored gateway body, in full
     python -m scripts.diagnose fields     # every field WayForPay has ever sent, read or ignored
+    python -m scripts.diagnose schedules  # who is on a monthly schedule, and what the gateway says
     python -m scripts.diagnose access --channel   # as above, plus a live membership check
 
 Written for one question: of the people who paid, which ones did the bot fail and which ones
@@ -42,8 +43,16 @@ from services.audit import Action
 # The same definition the retry job uses. Imported rather than repeated: a diagnostic that
 # disagrees with the job about who is in the channel is worse than no diagnostic.
 from services.billing import IN_CHANNEL
+from services.scheduler import build_client
 from services.wayforpay import RESPONSE_SIGNATURE_FIELDS
 from texts import day, money
+
+
+def _local(value, tz: str = "Europe/Kyiv") -> str:
+    """A stored UTC timestamp in the zone a person reads (rule 1: convert for display only)."""
+    if value is None:
+        return "—"
+    return value.astimezone(ZoneInfo(tz)).strftime("%d.%m.%Y %H:%M")
 
 
 def _handle(user: User | None, user_id: int) -> str:
@@ -173,6 +182,33 @@ async def cmd_access(check_channel: bool) -> int:
                 )
             if not suspect:
                 print("  None.")
+
+            # How many people are in the channel, against how many this bot knows about.
+            #
+            # A bot cannot enumerate a channel's members — the Bot API offers only
+            # `getChatMember` for one known id — so anybody who joined without ever starting the
+            # bot is invisible here and **cannot be removed by `remove_lapsed_members`**, which
+            # reads the subscriptions table. The gap below is the number of people an admin has
+            # to review in Telegram by hand. Reported rather than silently ignored, because the
+            # expectation that "the bot will exclude them" is not one the Bot API can meet.
+            if bot is not None:
+                try:
+                    in_channel = await bot.get_chat_member_count(chat_id=settings.channel_id)
+                except Exception as exc:  # noqa: BLE001 - the reason is the useful part
+                    print(f"\n== CHANNEL ==\n  could not read the member count: {exc}")
+                else:
+                    known = len(subscriptions)
+                    print("\n== CHANNEL VS DATABASE ==")
+                    print(f"  members in the channel      {in_channel}")
+                    print(f"  subscriptions the bot knows {known}")
+                    unknown = in_channel - known - 1  # the bot itself is a member
+                    if unknown > 0:
+                        print(
+                            f"  ⚠️  about {unknown} people in the channel have no subscription row."
+                        )
+                        print("     They never started the bot, so the bot cannot see or remove")
+                        print("     them — Telegram offers no way to list a channel's members.")
+                        print("     Review those by hand in Telegram.")
 
             print("\n== SUMMARY ==")
             for verdict, count in verdicts.most_common():
@@ -342,12 +378,26 @@ async def cmd_order(order_reference: str) -> int:
                 select(Payment).where(Payment.order_reference == order_reference)
             )
             if payment is None:
+                # A charge WayForPay made on its own schedule is stored under a local reference
+                # of its own, because `order_reference` is UNIQUE and the gateway may reuse the
+                # original number for every month. The string off the dashboard is the gateway's
+                # one, so it has to be looked up here too.
+                payment = await session.scalar(
+                    select(Payment)
+                    .where(Payment.gateway_order_reference == order_reference)
+                    .order_by(Payment.created_at.desc())
+                )
+            if payment is None:
                 print(f"No payment with order_reference {order_reference!r}.")
                 print("List what there is with:  python -m scripts.diagnose reasons")
                 return 1
 
             user = await session.get(User, payment.user_id)
             print(f"order            {payment.order_reference}")
+            if payment.gateway_order_reference:
+                print(f"gateway order    {payment.gateway_order_reference}")
+            if payment.is_recurring:
+                print(f"charge           scheduled by WayForPay (charge_key {payment.charge_key})")
             print(f"member           {_handle(user, payment.user_id)}")
             print(f"our status       {payment.status.value}")
             print(f"gateway status   {payment.wayforpay_status}")
@@ -459,13 +509,112 @@ async def cmd_fields() -> int:
     return 0
 
 
+async def cmd_schedules(ask_gateway: bool) -> int:
+    """Who is on a gateway-side monthly schedule, and whether it is actually charging them.
+
+    This is how automatic renewal gets verified, because the only part of it this bot performs is
+    handing over a link: the charges happen at WayForPay. So two sources are printed side by side —
+    what the database believes, and (with ``--live``) what ``regularApi`` STATUS says, which is the
+    gateway's own answer including the date it will next charge.
+
+    A disagreement between the two is the thing to look for. `active` here with `Removed` there
+    means a member is being chased by nobody; the reverse means a card still being charged under a
+    subscription this bot thinks it cancelled.
+
+    ``--live`` needs `WAYFORPAY_MERCHANT_PASSWORD` and makes one API call per schedule. Without it
+    this is a pure database report, which is still enough to answer "did the link I just sent set
+    up a schedule at all".
+    """
+    settings = get_settings()
+    engine = create_engine(settings.database_url)
+    factory = create_session_factory(engine)
+    tz = settings.display_timezone
+    client = build_client(settings) if ask_gateway else None
+    if ask_gateway and (client is None or not client.can_manage_schedules):
+        print("--live needs WAYFORPAY_MERCHANT_PASSWORD (and the rest of the WayForPay config).")
+        print("Request it from sales@wayforpay.com, quoting the merchant login.")
+        return 1
+
+    try:
+        async with factory() as session:
+            rows = list(
+                await session.execute(
+                    select(Subscription, User)
+                    .join(User, User.telegram_id == Subscription.user_id)
+                    .where(Subscription.regular_order_reference.is_not(None))
+                    .order_by(Subscription.regular_status, Subscription.expires_at)
+                )
+            )
+
+        if not rows:
+            print("No member is on a monthly schedule yet.")
+            print("A schedule is created by the payment link itself: check that the bot is in")
+            print("webhook mode (MODE=webhook with BASE_URL), then send yourself /start.")
+            return 0
+
+        print(f"{len(rows)} member(s) with a schedule\n")
+        for subscription, user in rows:
+            print(f"{_handle(user, subscription.user_id)}")
+            print(f"  order          {subscription.regular_order_reference}")
+            print(f"  our status     {subscription.regular_status}")
+            print(f"  access until   {_local(subscription.expires_at, tz)}")
+            if subscription.regular_next_at:
+                print(f"  next charge    {_local(subscription.regular_next_at, tz)} (our copy)")
+            charges = None
+            async with factory() as session:
+                charges = list(
+                    await session.scalars(
+                        select(Payment)
+                        .where(
+                            Payment.user_id == subscription.user_id,
+                            Payment.is_recurring.is_(True),
+                        )
+                        .order_by(Payment.created_at)
+                    )
+                )
+            # The proof that renewal actually happened: a row per charge WayForPay made itself.
+            print(f"  auto charges   {len(charges)}")
+            for payment in charges:
+                print(
+                    f"    {_local(payment.created_at, tz)}  {payment.amount} {payment.currency}  "
+                    f"{payment.status.value}  gateway order {payment.gateway_order_reference}"
+                )
+
+            if client is not None:
+                try:
+                    live = await client.regular_status(
+                        order_reference=str(subscription.regular_order_reference)
+                    )
+                except Exception as exc:  # noqa: BLE001 - a diagnostic must not die on one member
+                    print(f"  gateway        could not be asked: {type(exc).__name__}")
+                else:
+                    print(f"  gateway status {live.status} (mode {live.mode})")
+                    print(f"  gateway next   {live.next_payment_date}")
+                    print(f"  gateway last   {live.last_payed_date} {live.last_payed_status or ''}")
+                    print(f"  gateway amount {live.amount} {live.currency}")
+            print()
+        return 0
+    finally:
+        await engine.dispose()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("report", choices=["access", "invites", "reasons", "order", "fields"])
+    parser.add_argument(
+        "report", choices=["access", "invites", "reasons", "order", "fields", "schedules"]
+    )
     parser.add_argument(
         "order_reference",
         nargs="?",
         help="order only: which order's stored gateway body to print",
+    )
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help=(
+            "schedules only: also ask WayForPay what each schedule is doing. Needs "
+            "WAYFORPAY_MERCHANT_PASSWORD; one API call per schedule"
+        ),
     )
     parser.add_argument(
         "--channel",
@@ -473,6 +622,8 @@ def main(argv: list[str] | None = None) -> int:
         help="also ask Telegram whether each payer is in the channel (one API call per member)",
     )
     args = parser.parse_args(argv)
+    if args.report == "schedules":
+        return asyncio.run(cmd_schedules(ask_gateway=args.live))
     if args.report == "fields":
         return asyncio.run(cmd_fields())
     if args.report == "order":

@@ -3,15 +3,20 @@
 A paid Telegram community bot: private-channel access, WayForPay recurring subscriptions,
 a knowledge base, networking profiles and an admin panel.
 
-**Status: deployed on Railway, taking payments.** `/start` registers a member, prices them,
-invoices them on the spot, and confirms the payment by polling `CHECK_STATUS`. A paid member gets
-a single-use channel invite. An overdue member is reported to an admin — **not** removed; removal
-is deliberately deferred until the payment path has been proven with real money.
+**Status: deployed on Railway, taking payments.** `/start` registers a member, prices them, and
+hands them a WayForPay **Purchase** page on the spot. In webhook mode that page also sets up a
+**monthly schedule**: one payment settles the period and WayForPay charges the card every month
+after, reporting each charge to `/payments/wayforpay`. A paid member gets a single-use channel
+invite. An overdue member is reported to an admin — **not** removed; removal is deliberately
+deferred until the payment path has been proven with real money.
 
-**Biggest gap:** automatic renewals are not built, and the payment confirmation already tells
-members «оплата автоматична». Until `CHARGE` is wired up, a renewal needs them to tap a link again.
+**Biggest gap:** cancelling a schedule from the bot needs `WAYFORPAY_MERCHANT_PASSWORD`, a
+credential WayForPay issues on request (sales@wayforpay.com). Without it the bot tells a member
+their cancellation is being processed and alerts an admin to stop the schedule in the dashboard —
+it never claims a renewal stopped when it has not. Verify a schedule with
+`python -m scripts.diagnose schedules --live`.
 
-`CLAUDE.md` holds the full done/next list. Scope and gate: `docs/phase-2a-scope.md`.
+`CLAUDE.md` holds the full done/next list. Renewal mechanics: `docs/telegram-bot-payments-design.md` §1b. Scope and gate: `docs/phase-2a-scope.md`.
 Mechanics: `docs/telegram-bot-payments-design.md`.
 
 ## The three documents that govern this project
@@ -282,6 +287,9 @@ All of these live in `.env` locally and in platform environment variables in pro
 | `WAYFORPAY_MERCHANT_ACCOUNT` | Phase 2A | Merchant login |
 | `WAYFORPAY_MERCHANT_DOMAIN` | Phase 2A | Domain registered with WayForPay |
 | `WAYFORPAY_SECRET_KEY` | Phase 2A | Secret Key. Never logged, never committed |
+| `WAYFORPAY_MERCHANT_PASSWORD` | optional | 32-char credential from WayForPay (sales@wayforpay.com) for `regularApi`. Without it a monthly schedule cannot be cancelled from the bot |
+| `ENABLE_HOURLY_JOBS` | optional | Run the due-date sweep and renewal reminder hourly instead of daily at 09:00/09:30, to watch the messages without waiting a day. Removal and the purge are unaffected |
+| `AUTO_RENEW_ENABLED` | optional | Payment links also set up a monthly schedule at WayForPay. **Defaults to true**; inert unless `MODE=webhook` with a `BASE_URL` |
 | `MODE` | Phase 4 | `polling` (dev) or `webhook` (prod) |
 | `BASE_URL` | Phase 4 | Public HTTPS base used to register the webhook |
 | `WEBHOOK_SECRET` | Phase 4 | Matched against `X-Telegram-Bot-Api-Secret-Token` |

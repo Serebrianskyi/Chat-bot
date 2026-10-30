@@ -7,6 +7,10 @@ with which of the two required rights are actually granted.
 
 That turns "find your channel id" from a research task into reading one message.
 
+It also carries the only notification Telegram gives when a member **blocks or unblocks the bot**:
+a ``my_chat_member`` update for their private chat, status ``kicked`` then ``member`` again. That
+is written to ``users.is_blocked_bot`` here, which is what the monthly purge reads.
+
 ``my_chat_member`` arrives without any ``allowed_updates`` configuration; only ``chat_member``
 (membership changes of *other* users) has to be requested explicitly.
 """
@@ -18,6 +22,7 @@ from aiogram.enums import ChatMemberStatus, ChatType
 from aiogram.types import ChatMemberUpdated, Message
 
 import texts
+from services import users
 from services.billing import notify_admins
 
 log = logging.getLogger(__name__)
@@ -43,10 +48,25 @@ def _rights_report(member) -> str:
 
 
 async def handle_my_chat_member(
-    event: ChatMemberUpdated, bot: Bot, admin_ids: frozenset[int]
+    event: ChatMemberUpdated, bot: Bot, admin_ids: frozenset[int], session
 ) -> None:
-    """Tell the admins the chat id, and whether the bot can actually work there."""
+    """Tell the admins the chat id, and whether the bot can actually work there.
+
+    The same update type also announces a member blocking or unblocking the bot in their private
+    chat, which is the only notification Telegram gives for it — so that is recorded here rather
+    than discovered by probing everybody once a month.
+    """
     chat = event.chat
+    if chat.type == ChatType.PRIVATE:
+        # KICKED means blocked; MEMBER on the way back means unblocked. Any other status for a
+        # private chat is not a thing Telegram sends.
+        status = event.new_chat_member.status
+        if status == ChatMemberStatus.KICKED:
+            await users.mark_blocked_bot(session, chat.id, blocked=True)
+        elif status == ChatMemberStatus.MEMBER:
+            await users.mark_blocked_bot(session, chat.id, blocked=False)
+        return
+
     if chat.type not in COMMUNITY_TYPES:
         return
 

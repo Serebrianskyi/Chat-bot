@@ -8,6 +8,11 @@ win and this one gets corrected.
 
 ## 1. Decision
 
+> **Reversed on 2026-10-29 by §1b.** WayForPay support confirmed that card tokenisation is not
+> available on this merchant, which makes merchant-driven `CHARGE` unreachable and a
+> WayForPay-side schedule the only route to automatic renewal. §1 and §1a are kept as the record
+> of how that was arrived at; **§1b is the design in force.**
+
 **One invoice per user per period. No WayForPay-side subscriptions.**
 
 WayForPay can hold a real subscription object and charge on its own schedule (`regularApi`).
@@ -88,6 +93,128 @@ Two details of the callback, both easy to get wrong:
 `CHARGE` also requires `merchantTransactionType` and `merchantTransactionSecureType`, both
 mandatory and both absent from the first implementation — corrected the same day, `SALE` and
 `NON3DS` (nobody is present at a renewal to answer a 3-D Secure challenge).
+
+---
+
+## 1b. Reversal, 2026-10-29 — renewal runs on a WayForPay-side schedule
+
+WayForPay support, asked whether tokenisation could be enabled:
+
+> Наразі робота з токенами недоступна. Для щомісячних підписок Ви можете використовувати
+> регулярні платежі. Регулярні платежі доступні при сплаті клієнтом на платіжній сторінці методом
+> Purchase з передачею параметрів регулярного платежу. (wiki 852102)
+
+So the token §1a was waiting for is never coming, and `attempt_charge` — correct, tested code —
+can never fire on this merchant. The owner's decision the same day: **rebuild the payment flow on
+`Purchase` and stop waiting.**
+
+### What changes
+
+**The payment link.** `CREATE_INVOICE`'s documented parameter list (wiki 608996852) contains no
+recurring fields at all — verified field by field — so recurring is unreachable from the invoice
+flow. A payment link that should renew is now a **Purchase**: `POST
+secure.wayforpay.com/pay?behavior=offline`, which answers `{"url": ...}` — the only shape usable
+from a bot, since a Telegram button cannot POST a form. Confirmed against the live endpoint on
+2026-10-29: JSON body accepted, EUR accepted, recurring parameters accepted.
+
+Fields added over an invoice: `regularMode=monthly`, `regularOn=1`, `regularBehavior=preset`,
+`regularAmount`, `dateNext`. **None of them are signed** — the signature is byte-identical to
+`CREATE_INVOICE`'s, same nine fields in the same order, so `invoice_signature_fields` is reused
+unchanged. `merchantTransactionSecureType` is `AUTO`, not the `NON3DS` that `CHARGE` uses: there
+*is* a cardholder on this page, and 3DS must be allowed to run.
+
+**`dateNext` is the end of the period being bought**, not the expiry the member currently holds.
+The gateway refuses a date that is not in the future, and 151 of 172 subscriptions are past due.
+It is computed with the same `extend()` the payment itself applies, so the gateway's schedule and
+`expires_at` agree by construction rather than by coincidence.
+
+**Who charges whom.** One payment by the member settles the period *and* registers the schedule.
+Every month after, WayForPay charges the card and POSTs the result to `serviceUrl`. Consequently:
+
+- a member with an active schedule is **skipped** by the daily due-date sweep — chasing them would
+  hand out a second payment page and take the money twice — but only for two days past the due
+  date. A declined card leaves the schedule `active`, because the gateway may retry and cancelling
+  what it might still collect would be worse; skipping on that status alone would mean the member
+  is never sent a link, lapses, and is removed by `remove_lapsed_members` having never been asked
+  to pay. Past the window they are chased by hand with the schedule left in place, so a charge that
+  does land later simply extends them again;
+- `renews_automatically()` replaces the bare `recToken` check, so the reminder's «Завтра
+  відбудеться автоматичне списання» is finally true for somebody;
+- a renewal sends **no** invite — unless the member is outside the channel, which happens when a
+  card declines long enough for `remove_lapsed_members` to take them out and then starts working
+  again. Without that check they are charged, extended and left outside what they just paid for;
+  an unreadable membership answer is treated as outside, since a spare link costs nothing beside
+  that;
+- **removal stops the schedule before showing anybody the door.** Same reasoning in reverse: a
+  retry that succeeds after a removal takes money for a channel they are no longer in;
+- `CHECK_STATUS` and the reconcile sweep ask with `payments.gateway_order_reference`, because our
+  reference for a scheduled charge is one WayForPay has never heard of — polling with it would
+  leave the row at ERROR for ever.
+
+**A schedule is never created without a `serviceUrl`.** The client raises instead. A schedule whose
+charges nothing is listening for is money taken with no access granted, monthly and silently —
+the 77-order failure of 2026-10-09, except permanent. `AUTO_RENEW_ENABLED` is therefore ignored
+unless `MODE=webhook` with a `BASE_URL`.
+
+### The one thing the documentation does not say
+
+**Under which `orderReference` a monthly charge is reported.** The wiki does not state it, support
+was asked, and the owner chose not to wait. Both possibilities are handled and the branch taken is
+logged at warning level, so the first real charge settles it from one log line:
+
+| Case | How it is recognised | What happens |
+|---|---|---|
+| Same reference as the original | row exists, already `complete`, **different `charge_key`** | a new `payments` row, gateway's string in `gateway_order_reference` |
+| A reference of the gateway's own | no row; resolved via `subscriptions.regular_order_reference`, then a prefix match, then the `sub-<id>-<ts>` shape **but only for a member who has a live schedule** — every order ever written has that shape, so matching on it alone would turn a late notification about an old one-off order into a free period | a new `payments` row |
+| A repeat of a charge already applied | same `charge_key` | nothing, and no second period (rule 5) |
+| Unplaceable | none of the above | acknowledged, and an admin is told |
+
+`charge_key` is the gateway's `authCode` — unique per approved charge — or a digest of the varying
+fields for a refusal, which carries no `authCode`. Without it, month two under the original
+reference reads as a duplicate of month one: `payments.order_reference` is UNIQUE so no second row
+can be written, and `apply_payment_result` ignores a result for an already-`complete` row. The
+money would arrive and nobody's access would be extended.
+
+### Amount checking changes shape for a scheduled charge
+
+Rule 8 verifies the amount against *that user's* price, because on a member-initiated payment a
+mismatch means a tampered body. A scheduled charge is different: the gateway holds its own copy of
+`regularAmount`, fixed when the schedule was created, while this club computes a price per invoice
+— so a discount ending or a promo running out makes the two disagree **legitimately**. The body is
+signature-verified either way, so the money is real. The period is granted and an admin is told the
+two copies have parted company; the fix is a `regularApi` EDIT, which is a person's decision.
+
+### Cancellation inverts
+
+«Скасувати автопродовження» must stop the schedule **at WayForPay before** anything local changes,
+because the charges are not ours to stop. `regularApi` (`https://api.wayforpay.com/regularApi`)
+authenticates with `merchantPassword`, a 32-character credential WayForPay issues on request
+(sales@wayforpay.com) — established empirically on 2026-10-29: the secret key is refused for
+length and its MD5 answers *"Can`t authorize merchant with Password"*.
+
+**Until that credential exists, a schedule cannot be cancelled from the bot.** `stop_schedule`
+returns False, the member is told their request is being processed — never that it is done — and
+an admin is sent the order reference to remove in the dashboard. A card charged after «скасовано»
+is the worst trust failure available here, which is why no local flag is flipped on a failure.
+
+### `CREATE_INVOICE` is gone entirely (owner's decision, 2026-10-29)
+
+Not kept for one-offs. Purchase does both: omit the recurring fields and it is a single payment,
+which is what a member who already has a schedule gets (a second schedule would charge them twice
+a month) and what an admin-issued one-off is. Everything the invoice call offered —
+`orderTimeout`, `clientEmail`, `serviceUrl` — Purchase takes too, so nothing was traded away.
+
+Keeping it would have left two ways of asking for money where only one renews, and the failure
+that produces is silent: a member pays a link that never repeats, and nobody notices until their
+access lapses a month later.
+
+A 100% discount still creates no gateway order at all — nothing to pay means nothing to ask for.
+
+### What stays
+`CHECK_STATUS` stays as the confirmation fallback for a callback that never arrives.
+`attempt_charge` and `recToken` stay in place, unreachable but correct, in case tokenisation is
+ever enabled — and `renews_automatically()` keeps a token-holder out of the chasing path so a
+token appearing later cannot double-charge anybody.
 
 ---
 

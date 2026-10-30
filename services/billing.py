@@ -18,25 +18,29 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from decimal import Decimal
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import texts
 from db.models import (
     AuditLog,
+    Discount,
     Payment,
     PaymentStatus,
+    PromoCode,
+    PromoRedemption,
     Subscription,
     SubscriptionStatus,
     User,
     utcnow,
 )
 from services import discounts as discount_service
-from services import promos
+from services import promos, users
 from services import subscriptions as subs
 from services.audit import Action, record_action
 from services.pricing import extend
@@ -64,6 +68,33 @@ class BillingConfig:
     display_timezone: str = "UTC"
     #: The private channel a paid member is invited into. None means invites cannot be sent.
     channel_id: str | None = None
+    #: Whether a payment link should also set up a monthly schedule at WayForPay. Default **on**,
+    #: matching `config.auto_renew_enabled`: from 2026-10-29 every link handed out is meant to
+    #: renew. `build_billing_config` still turns it off when the gateway has nowhere to report a
+    #: charge to (polling mode), which is the condition that actually matters.
+    auto_renew: bool = True
+
+
+#: Our own vocabulary for a gateway-side schedule. `requested` has no gateway equivalent and is
+#: the one that matters most: the Purchase page was handed over but nobody has paid it, so the
+#: member is still owed a link and the daily sweep must keep chasing them.
+SCHEDULE_REQUESTED = "requested"
+SCHEDULE_ACTIVE = "active"
+SCHEDULE_SUSPENDED = "suspended"
+SCHEDULE_REMOVED = "removed"
+
+#: How late a gateway-side charge may be before the member is chased by hand as well. The charge
+#: falls on the due date itself, and a declined one leaves the schedule looking active, so some
+#: tolerance is needed — but not unlimited, or a dead card means silent removal.
+SCHEDULE_CHASE_AFTER = timedelta(days=2)
+
+#: Statuses in which a schedule is worth acting on: `stop_schedule` asks the gateway about either,
+#: and an unknown order reference is only credited to a member who has one.
+#:
+#: **Not** the test for "give them a one-off instead" — that is `SCHEDULE_ACTIVE` alone, since
+#: only an active schedule will actually charge the card and `requested` never clears without a
+#: payment. See `issue_invoice`.
+LIVE_SCHEDULE_STATUSES = frozenset({SCHEDULE_REQUESTED, SCHEDULE_ACTIVE})
 
 
 def _pay_keyboard(invoice_url: str) -> InlineKeyboardMarkup:
@@ -103,6 +134,7 @@ async def issue_invoice(
     subscription: Subscription,
     config: BillingConfig,
     now: datetime,
+    recurring: bool | None = None,
 ) -> Payment:
     """Create an invoice for one subscription and persist it.
 
@@ -113,6 +145,14 @@ async def issue_invoice(
     expire: the same member is billed the reduced amount while it lives and the base amount
     afterwards, with no job needed to expire anything. Whatever is charged is recorded on the
     payment row, and that row is what the gateway's answer is checked against (A.14).
+
+    **Every link is a Purchase.** With `config.auto_renew` on it carries `regularMode=monthly`, so
+    the one payment settles this period *and* registers a monthly charge on the member's card —
+    the only automatic renewal available on this merchant (tokenisation is not: WayForPay,
+    2026-10-29). Without it, the same call without the recurring fields. `CREATE_INVOICE` is gone
+    entirely: it cannot carry a schedule, so keeping it meant a second way of asking for money
+    that quietly never repeats. `recurring` overrides the config for one call — used for a member
+    who already has a schedule, where a second would charge them twice a month.
     """
     order_reference = await _unique_order_reference(session, subscription.user_id, now)
 
@@ -151,17 +191,41 @@ async def issue_invoice(
     await promos.consume_period(session, user_id=subscription.user_id, now=now)
     await session.flush()
 
+    # A second schedule for somebody the gateway is already charging would take the money twice,
+    # so an **active** one turns this into a one-off page.
+    #
+    # `requested` deliberately does not: it means a schedule page was handed over and nobody paid
+    # it. Treating that as "already has one" would mean a member who opens the page, wanders off
+    # and comes back tomorrow is given a one-off instead — and `requested` never clears without a
+    # payment, so they could never get a schedule again. That is exactly how "every link from now
+    # on renews" would fail, silently, for anyone who does not pay on the first try.
+    schedule = config.auto_renew if recurring is None else recurring
+    if schedule and subscription.regular_status == SCHEDULE_ACTIVE:
+        schedule = False
+
+    # `dateNext` is when the **next** charge falls, so it is this period's end, not the expiry the
+    # member holds now — which for anybody past due is in the past, and the gateway refuses a date
+    # that is not in the future. The same `extend` the payment itself will apply, so the gateway's
+    # schedule and `expires_at` agree by construction.
+    next_at = subs.extend(subscription.expires_at, now=now, period_days=subscription.period_days)
+
     try:
-        invoice = await client.create_invoice(
+        page = await client.purchase(
             order_reference=order_reference,
             order_date=int(now.timestamp()),
             amount=amount,
             currency=currency,
             product_name=config.product_name,
+            recurring=schedule,
+            regular_amount=amount if schedule else None,
+            # The gateway wants DD.MM.YYYY, which is exactly how `texts.day` renders a date, in
+            # the same zone members read it in (rule 1). Rendering it any other way would have the
+            # bot promise one date and the card charged on another.
+            date_next=texts.day(next_at) if schedule else None,
             order_timeout=int(config.invoice_timeout.total_seconds()),
         )
     except Exception:
-        # No invoice exists at the gateway, so this row describes nothing. Left behind it would
+        # No order exists at the gateway, so this row describes nothing. Left behind it would
         # be worse than useless: the poller would CHECK_STATUS an order WayForPay never created,
         # and open_payment() would treat it as "already invoiced" and never retry this member
         # until it timed out. Remove it and let the next run start cleanly.
@@ -169,8 +233,21 @@ async def issue_invoice(
         await session.flush()
         raise
 
-    payment.invoice_url = invoice.invoice_url
-    payment.raw_response = invoice.raw
+    payment.invoice_url = page.page_url
+    payment.raw_response = page.raw
+    if schedule:
+        # `requested`, not `active`: the schedule exists only once somebody pays the page. Until
+        # then this member is still owed a payment link like anyone else, and the daily sweep must
+        # keep chasing them.
+        subscription.regular_order_reference = order_reference
+        subscription.regular_status = SCHEDULE_REQUESTED
+        subscription.regular_next_at = next_at
+        log.info(
+            "Order %s is a monthly schedule for %s; next charge %s",
+            order_reference,
+            subscription.user_id,
+            subscription.regular_next_at,
+        )
     return payment
 
 
@@ -393,6 +470,7 @@ async def announce_confirmed_payment(
     admin_ids: frozenset[int],
     config: BillingConfig,
     now: datetime,
+    send_invite: bool = True,
 ) -> None:
     """Tell a member their payment landed, and get them into the channel.
 
@@ -426,14 +504,15 @@ async def announce_confirmed_payment(
         except TelegramForbiddenError:
             log.warning("Paid but unreachable: %s", subscription.user_id)
 
-        await deliver_invite(
-            session,
-            bot,
-            subscription=subscription,
-            channel_id=config.channel_id,
-            admin_ids=admin_ids,
-            now=now,
-        )
+        if send_invite:
+            await deliver_invite(
+                session,
+                bot,
+                subscription=subscription,
+                channel_id=config.channel_id,
+                admin_ids=admin_ids,
+                now=now,
+            )
     except Exception:
         log.exception("Paid and extended, but announcing it failed for %s", payment.order_reference)
 
@@ -484,7 +563,7 @@ async def poll_open_payments(
 
             counts["checked"] += 1
             try:
-                result = await client.check_status(order_reference=payment.order_reference)
+                result = await client.check_status(order_reference=gateway_reference(payment))
             except WayForPayError:
                 # Includes a signature mismatch: never act on a body we cannot trust.
                 log.exception("Status check failed for %s", payment.order_reference)
@@ -727,11 +806,10 @@ async def send_renewal_reminders(
 
     Two different messages, because two different things are about to happen:
 
-    * **a stored card** — money will be taken on its own, so the warning is to check the balance
-      («Завтра відбудеться автоматичне списання»);
-    * **no stored card** — nothing will be taken and they must pay by hand, so the reminder
-      carries a payment link. Today that is everybody: no token can be obtained on the current
-      integration (docs/telegram-bot-payments-design.md §1a).
+    * **renewing on its own** — a gateway-side monthly schedule (or, in theory, a stored card),
+      so the warning is to check the balance («Завтра відбудеться автоматичне списання»);
+    * **neither** — nothing will be taken and they must pay by hand, so the reminder carries a
+      payment link.
 
     ``last_reminder_at`` makes it fire once per period (G3.7): a job that runs daily must not
     send the same warning every morning of the window.
@@ -776,7 +854,7 @@ async def send_renewal_reminders(
                 now=now,
             )
 
-            if subscription.wayforpay_rec_token:
+            if renews_automatically(subscription):
                 delivered = await _tell(bot, subscription.user_id, texts.RENEWAL_REMINDER)
                 counts["automatic"] += delivered
             else:
@@ -841,6 +919,38 @@ async def _tell(bot: Bot, chat_id: int, text: str, *, reply_markup=None) -> int:
 # --- job 2: chase due subscriptions --------------------------------------------------------
 
 
+async def _should_chase(session: AsyncSession, *, subscription: Subscription) -> bool:
+    """Whether this member should be sent a payment link at all.
+
+    Owner's instruction, 2026-10-29: chase only people the club has a paying relationship with.
+    Two groups qualify, and nobody else:
+
+    * **anyone with a ``complete`` payment** — a renewal, which is an ordinary billing
+      conversation;
+    * **anyone whose free period is ending** (``free_period_granted``) — the founding members,
+      who have never paid but were promised a first period and must be asked once it runs out.
+
+    Everyone else already received a link at ``/start`` and chose not to pay. Re-sending it every
+    morning is what this stops: 151 subscriptions were past due, so the daily job was DMing 151
+    people a fresh link a day. They are to be approached deliberately instead — 📣 Розсилка with a
+    promo code — not dripped at by a cron job.
+
+    Returning False does not mean "no longer a member": the row is still invoiced-when-due by
+    anything an admin triggers by hand, and ``remove_lapsed_members`` still sees them.
+    """
+    if subscription.free_period_granted:
+        return True
+    paid_before = await session.scalar(
+        select(Payment.id)
+        .where(
+            Payment.user_id == subscription.user_id,
+            Payment.status == PaymentStatus.COMPLETE,
+        )
+        .limit(1)
+    )
+    return paid_before is not None
+
+
 async def process_due_subscriptions(
     session_factory: async_sessionmaker,
     client: WayForPayClient,
@@ -862,8 +972,10 @@ async def process_due_subscriptions(
     counts = {
         "invoiced": 0,
         "renewed": 0,
+        "scheduled": 0,
         "charge_failed": 0,
         "free": 0,
+        "not_chased": 0,
         "unreachable": 0,
         "overdue": 0,
     }
@@ -895,9 +1007,31 @@ async def process_due_subscriptions(
             if subscription.status is not SubscriptionStatus.PAST_DUE:
                 subscription.status = SubscriptionStatus.PAST_DUE
 
+            # Somebody who has never paid and never had a free period has already had their
+            # link, at /start. They are not chased again — see `_should_chase`.
+            if not await _should_chase(session, subscription=subscription):
+                counts["not_chased"] += 1
+                continue
+
             # A stored card means the money is taken, not asked for. This is the whole promise
             # `PAYMENT_FIRST_CONFIRMED` makes — «оплата автоматична» — and until renewals existed
             # the bot was saying something untrue. See the design doc's Job 1 table.
+            # An active schedule means WayForPay is charging this card itself, so chasing the
+            # member as well would hand them a second payment page and take the money twice.
+            #
+            # **Only for as long as the schedule is actually paying.** A declined card leaves the
+            # schedule `active` — the gateway may retry and we must not cancel what it might still
+            # collect — and skipping on that alone would mean this member is never sent a link,
+            # lapses, and is removed by `remove_lapsed_members` without once being asked to pay.
+            # After the grace window they are chased like anyone else; the schedule is left in
+            # place, so a charge that does land later simply extends them again.
+            if (
+                subscription.regular_status == SCHEDULE_ACTIVE
+                and now - subscription.expires_at < SCHEDULE_CHASE_AFTER
+            ):
+                counts["scheduled"] += 1
+                continue
+
             if subscription.wayforpay_rec_token:
                 if await attempt_charge(
                     session,
@@ -993,6 +1127,7 @@ async def remove_lapsed_members(
     channel_id: str | None,
     admin_ids: frozenset[int],
     config: BillingConfig,
+    client: WayForPayClient | None = None,
     now: datetime | None = None,
     enabled: bool = False,
 ) -> dict[str, int]:
@@ -1051,6 +1186,28 @@ async def remove_lapsed_members(
                     subscription.expires_at.isoformat(),
                 )
                 continue
+
+            # Stop the gateway charging a card for somebody being shown the door. They are only
+            # here because payment failed, so an `active` schedule means a declined card the
+            # gateway may still retry — and a charge that succeeded after the removal would take
+            # their money for a channel they are no longer in.
+            stopped, why = await stop_schedule(session, client, subscription=subscription, now=now)
+            if not stopped:
+                log.error(
+                    "Removing %s but their schedule %s could not be stopped: %s",
+                    subscription.user_id,
+                    subscription.regular_order_reference,
+                    why,
+                )
+                await notify_admins(
+                    bot,
+                    admin_ids,
+                    texts.ADMIN_SCHEDULE_CANCEL_FAILED.format(
+                        user_id=subscription.user_id,
+                        order=subscription.regular_order_reference or "—",
+                        reason=why or "—",
+                    ),
+                )
 
             removed = await subs.remove_from_community(
                 bot, chat_id=channel_id, user_id=subscription.user_id
@@ -1153,7 +1310,7 @@ async def reconcile_written_off(
 
             counts["checked"] += 1
             try:
-                result = await client.check_status(order_reference=payment.order_reference)
+                result = await client.check_status(order_reference=gateway_reference(payment))
             except Exception:
                 log.exception("Reconcile failed for %s", payment.order_reference)
                 counts["errors"] += 1
@@ -1259,6 +1416,10 @@ IN_CHANNEL = frozenset({"creator", "administrator", "member", "restricted"})
 #: excluded on purpose: a free first period is not a payment, and the owner's instruction of
 #: 2026-10-09 is that members who have not paid are not to be messaged yet.
 PAID_STATUSES = (SubscriptionStatus.ACTIVE, SubscriptionStatus.CANCELLED)
+
+#: Seconds between probes in the monthly purge. Matches the broadcast rate: the probe is an API
+#: call per member, and nothing about a monthly tidy-up justifies a burst (rule 10).
+PROBE_INTERVAL = 1 / 20
 
 #: How long a freshly sent link is left alone. Without it, a payment confirmed minutes earlier —
 #: by the poller or by the daily reconciliation — would be followed straight away by a "retry",
@@ -1755,19 +1916,21 @@ async def process_callback(
     result = client.read_callback(payload)  # verifies the signature first
 
     async with session_factory() as session:
-        payment = await session.scalar(
-            select(Payment).where(Payment.order_reference == result.order_reference)
+        payment = await _payment_for_callback(
+            session, result=result, admin_ids=admin_ids, bot=bot, now=now
         )
         if payment is None:
-            # An order this bot never created. Logged rather than raised: the notification is
-            # genuine (it passed the signature), so it is acknowledged and dropped — retrying it
-            # would not make the row appear.
-            log.error(
-                "Callback for an unknown order %s (%s); nothing to apply",
-                result.order_reference,
-                result.gateway_status,
-            )
             return False
+
+        # Keep the gateway's own order number on the row even for a first payment: a schedule
+        # that later reports under it must find this row, and `diagnose order` must be able to
+        # ask WayForPay with the string WayForPay knows.
+        if payment.gateway_order_reference is None and result.order_reference != (
+            payment.order_reference
+        ):
+            payment.gateway_order_reference = result.order_reference
+        if result.charge_key and payment.charge_key is None:
+            payment.charge_key = result.charge_key
 
         extended = await subs.apply_payment_result(
             session,
@@ -1782,6 +1945,7 @@ async def process_callback(
             now=now,
         )
         if extended:
+            await _confirm_schedule(session, bot, payment=payment, admin_ids=admin_ids, now=now)
             await announce_confirmed_payment(
                 session,
                 bot,
@@ -1789,14 +1953,637 @@ async def process_callback(
                 admin_ids=admin_ids,
                 config=config,
                 now=now,
+                send_invite=await _needs_invite(
+                    bot, payment=payment, config=config, subscription_id=payment.subscription_id
+                ),
+            )
+        elif payment.is_recurring and result.status is not PaymentStatus.PENDING:
+            await _report_failed_charge(
+                session, bot, payment=payment, result=result, admin_ids=admin_ids, now=now
             )
         await session.commit()
 
     log.info(
-        "Callback %s: %s -> extended=%s, token=%s",
+        "Callback %s: %s -> extended=%s, recurring=%s, token=%s",
         result.order_reference,
         result.gateway_status,
         extended,
+        payment.is_recurring,
         "yes" if result.rec_token else "no",
     )
     return extended
+
+
+async def _needs_invite(
+    bot: Bot, *, payment: Payment, config: BillingConfig, subscription_id: int | None
+) -> bool:
+    """Whether this payment should be followed by a channel invite.
+
+    A member-initiated payment always is: it is either their first or they are coming back, and
+    `deliver_invite` is the only thing that gets them in.
+
+    A **scheduled** charge usually is not — they are already in the channel, and a second
+    single-use link is noise. But not always: somebody whose card declined long enough to be
+    removed by `remove_lapsed_members`, and whose card then works, would otherwise be charged,
+    extended, and left outside the channel they just paid for. So the gateway is asked. An
+    unreadable answer counts as "not in", because sending a spare link costs nothing next to
+    silently keeping a payer out.
+    """
+    if not payment.is_recurring:
+        return True
+    if not config.channel_id or subscription_id is None:
+        return False
+    status, error = await _channel_status(bot, config.channel_id, payment.user_id)
+    if error is not None:
+        log.warning("Could not check %s's membership (%s); inviting anyway", payment.user_id, error)
+        return True
+    return status not in IN_CHANNEL
+
+
+async def _confirm_schedule(
+    session: AsyncSession,
+    bot: Bot,
+    *,
+    payment: Payment,
+    admin_ids: frozenset[int],
+    now: datetime,
+) -> None:
+    """Mark the schedule live, and say so if the gateway's price has drifted from ours.
+
+    A schedule only becomes real when somebody pays the page it came from, so this is where
+    `requested` turns into `active` — until then the member is still owed a payment link.
+
+    The drift check is the price of letting the gateway hold its own copy of the amount: it was
+    fixed when the schedule was created, while this club computes a price per invoice, so a
+    discount ending or a promo running out changes what should be charged without changing what
+    will be. Nobody is refused access over it — the money was taken and the body was signed — but
+    an admin is told, because the fix is a `regularApi` EDIT and only a person can decide it.
+    """
+    subscription = await session.get(Subscription, payment.subscription_id)
+    if subscription is None or subscription.regular_order_reference is None:
+        return
+
+    if subscription.regular_status == SCHEDULE_REQUESTED:
+        # Point the schedule at the page that was **paid**, not at the last one issued. A member
+        # can be handed a second page after abandoning the first, and whichever they eventually
+        # pay is the one WayForPay registered the schedule against — which is the only reference
+        # `regularApi` will accept when it comes to cancelling it.
+        subscription.regular_order_reference = (
+            payment.gateway_order_reference or payment.order_reference
+        )
+    subscription.regular_status = SCHEDULE_ACTIVE
+    subscription.regular_next_at = subscription.expires_at
+
+    user = await session.get(User, subscription.user_id)
+    expected, currency, _discount = await discount_service.effective_price(
+        session,
+        subscription=subscription,
+        username=user.username if user else None,
+        now=now,
+    )
+    if payment.amount == expected and payment.currency == currency:
+        return
+
+    log.warning(
+        "Schedule for %s charged %s %s but the price is now %s %s",
+        subscription.user_id,
+        payment.amount,
+        payment.currency,
+        expected,
+        currency,
+    )
+    await notify_admins(
+        bot,
+        admin_ids,
+        texts.ADMIN_SCHEDULE_PRICE_DRIFT.format(
+            user_id=subscription.user_id,
+            was=texts.money(payment.amount, payment.currency),
+            price=texts.money(expected, currency),
+            order=subscription.regular_order_reference,
+        ),
+    )
+
+
+async def _report_failed_charge(
+    session: AsyncSession,
+    bot: Bot,
+    *,
+    payment: Payment,
+    result,
+    admin_ids: frozenset[int],
+    now: datetime,
+) -> None:
+    """A scheduled charge that did not go through: tell the member, and tell an admin.
+
+    The gateway retries on its own schedule and we do not control it, so the member is given a
+    live link rather than a promise — paying it settles the period whatever the schedule does
+    next. Silence here is the failure mode that matters: their access lapses in a few days and
+    nothing has told them why (rule 10).
+    """
+    subscription = await session.get(Subscription, payment.subscription_id)
+    if subscription is None:
+        return
+
+    try:
+        await bot.send_message(
+            subscription.user_id,
+            texts.SCHEDULE_CHARGE_FAILED.format(until=texts.day(subscription.expires_at)),
+        )
+    except TelegramForbiddenError:
+        log.warning("Charge failed and %s has blocked the bot", subscription.user_id)
+    except Exception:
+        log.exception("Could not tell %s their charge failed", subscription.user_id)
+
+    await notify_admins(
+        bot,
+        admin_ids,
+        texts.ADMIN_SCHEDULE_CHARGE_FAILED.format(
+            user_id=subscription.user_id,
+            amount=texts.money(payment.amount, payment.currency),
+            reason=result.gateway_status or "—",
+            until=texts.day(subscription.expires_at),
+        ),
+    )
+    await record_action(
+        session,
+        actor_id=subscription.user_id,
+        action=Action.PAYMENT_FAILED,
+        target_user_id=subscription.user_id,
+        details={
+            "order_reference": payment.order_reference,
+            "gateway_order_reference": payment.gateway_order_reference,
+            "gateway_status": result.gateway_status,
+            "reason_code": result.reason_code,
+            "schedule": True,
+        },
+        now=now,
+    )
+
+
+#: ``reasonCode`` the regularApi answers a successful request with (wiki 852521).
+REGULAR_API_OK = "4100"
+
+
+async def stop_schedule(
+    session: AsyncSession,
+    client: WayForPayClient | None,
+    *,
+    subscription: Subscription,
+    now: datetime,
+) -> tuple[bool, str | None]:
+    """Stop this member's gateway-side schedule. ``(stopped, why not)``.
+
+    **Nothing may tell a member their renewal is cancelled until this returns True.** The charges
+    happen at WayForPay, so a local flag stops nothing: the card would be debited next month under
+    a subscription the bot calls cancelled, which is the worst trust failure available here.
+
+    Returns ``(True, None)`` when there was nothing to stop, which is the ordinary case for
+    anybody who has never been on a schedule.
+
+    ``merchantPassword`` is a separate credential WayForPay issues on request, and without it this
+    API cannot be called at all — so "cannot cancel" is a real outcome, reported rather than
+    papered over.
+    """
+    reference = subscription.regular_order_reference
+    if not reference or subscription.regular_status not in LIVE_SCHEDULE_STATUSES:
+        return True, None
+
+    if client is None or not client.can_manage_schedules:
+        log.error(
+            "Cannot stop the schedule %s for %s: no WayForPay merchantPassword is configured",
+            reference,
+            subscription.user_id,
+        )
+        return False, "no-credential"
+
+    try:
+        answer = await client.regular_remove(order_reference=reference)
+    except Exception as exc:
+        log.exception("REMOVE failed for schedule %s", reference)
+        return False, type(exc).__name__
+
+    reason_code = str(answer.get("reasonCode") or "")
+    if reason_code != REGULAR_API_OK:
+        log.error(
+            "REMOVE refused for schedule %s: reasonCode=%s reason=%r",
+            reference,
+            reason_code,
+            answer.get("reason"),
+        )
+        return False, f"{reason_code}: {answer.get('reason')}"
+
+    subscription.regular_status = SCHEDULE_REMOVED
+    subscription.regular_next_at = None
+    await record_action(
+        session,
+        actor_id=subscription.user_id,
+        action=Action.SUBSCRIPTION_CANCELLED,
+        target_user_id=subscription.user_id,
+        details={"schedule": reference, "regular_api": "REMOVE"},
+        now=now,
+    )
+    log.info("Schedule %s removed for %s", reference, subscription.user_id)
+    return True, None
+
+
+def gateway_reference(payment: Payment) -> str:
+    """The order number to ask WayForPay about.
+
+    Ours and theirs are the same for a payment the member initiated. They are **not** for a charge
+    the gateway made on its own schedule: `payments.order_reference` is UNIQUE, so a second charge
+    reported under the original number has to be stored under a local reference of its own, with
+    the gateway's string kept beside it. Asking CHECK_STATUS with our reference would get "order
+    not found" and the row would sit at ERROR for ever.
+    """
+    return payment.gateway_order_reference or payment.order_reference
+
+
+def renews_automatically(subscription: Subscription) -> bool:
+    """Whether money will arrive without the member doing anything.
+
+    Two mechanisms, only one of which works on this merchant: a stored card we charge ourselves
+    (`recToken` — unavailable here, WayForPay 2026-10-29) and a schedule the gateway charges on
+    its own. Either way the member must not be asked to pay by hand, and the reminder they get is
+    "check your balance" rather than "here is a link".
+    """
+    return bool(subscription.wayforpay_rec_token) or subscription.regular_status == SCHEDULE_ACTIVE
+
+
+async def _payment_for_callback(
+    session: AsyncSession,
+    *,
+    result,
+    admin_ids: frozenset[int],
+    bot: Bot,
+    now: datetime,
+) -> Payment | None:
+    """The ``payments`` row a notification is about, creating one if it reports a new charge.
+
+    Four cases, in the order they are tried:
+
+    1. **A row under that exact order reference, not yet settled** — the ordinary first payment.
+       Returned as-is.
+    2. **A row under that reference, already settled, and the notification is about the *same*
+       charge** — a repeat delivery. None, so nothing is applied twice (rule 5).
+    3. **A row under that reference, already settled, and a *different* charge** — the gateway's
+       monthly schedule reporting the next month under the original order number. A new row is
+       created: ours keyed locally, the gateway's string kept in `gateway_order_reference`.
+    4. **No row at all, but the reference belongs to a member we can identify** — the same
+       schedule reporting under a reference of its own. Also a new row.
+
+    Cases 3 and 4 exist because **nobody knows which of the two WayForPay does**: the wiki does
+    not say, support was asked and the owner chose not to wait. Both are handled, and the branch
+    taken is logged at warning level, so the first real charge in production settles it from one
+    log line.
+
+    Anything else is reported to an admin rather than dropped: a signed notification about money
+    we cannot place is exactly the thing that must not pass quietly.
+    """
+    existing = await session.scalar(
+        select(Payment).where(Payment.order_reference == result.order_reference)
+    )
+    if existing is None:
+        existing = await session.scalar(
+            select(Payment)
+            .where(Payment.gateway_order_reference == result.order_reference)
+            .order_by(Payment.created_at.desc())
+            .limit(1)
+        )
+
+    if existing is not None and existing.status is not PaymentStatus.COMPLETE:
+        return existing
+
+    if existing is not None:
+        if result.charge_key is not None and existing.charge_key == result.charge_key:
+            log.info(
+                "Callback repeats charge %s of order %s; already applied",
+                result.charge_key,
+                result.order_reference,
+            )
+            return None
+        already = await session.scalar(
+            select(Payment.id).where(
+                Payment.charge_key == result.charge_key,
+                Payment.charge_key.is_not(None),
+            )
+        )
+        if already is not None:
+            log.info("Callback repeats charge %s, already stored", result.charge_key)
+            return None
+        log.warning(
+            "Order %s reports a second charge (%s): the schedule reuses the original "
+            "orderReference",
+            result.order_reference,
+            result.charge_key,
+        )
+        # From the schedule, not from the row that was found: that lookup takes the newest row
+        # under this gateway reference, and a row with no subscription_id would propagate into a
+        # charge that cannot extend anything ("has no subscription to extend").
+        owner = await _schedule_owner(session, result.order_reference)
+        subscription_id = owner.id if owner is not None else existing.subscription_id
+        return await _new_recurring_payment(
+            session,
+            subscription_id=subscription_id,
+            user_id=owner.user_id if owner is not None else existing.user_id,
+            result=result,
+            now=now,
+        )
+
+    subscription = await _schedule_owner(session, result.order_reference)
+    if subscription is None:
+        # Genuine (it passed the signature) but unplaceable. Acknowledged so WayForPay stops
+        # retrying, and an admin is told, because the alternative is money taken and nobody aware.
+        log.error(
+            "Callback for an unknown order %s (%s); nothing to apply",
+            result.order_reference,
+            result.gateway_status,
+        )
+        await notify_admins(
+            bot,
+            admin_ids,
+            texts.ADMIN_UNKNOWN_CALLBACK.format(
+                order=result.order_reference,
+                status=result.gateway_status or "—",
+                amount=result.amount if result.amount is not None else "—",
+            ),
+        )
+        return None
+
+    log.warning(
+        "Order %s is a scheduled charge for %s under a new reference",
+        result.order_reference,
+        subscription.user_id,
+    )
+    return await _new_recurring_payment(
+        session,
+        subscription_id=subscription.id,
+        user_id=subscription.user_id,
+        result=result,
+        now=now,
+    )
+
+
+async def _schedule_owner(session: AsyncSession, order_reference: str) -> Subscription | None:
+    """Whose schedule a reference we have never seen belongs to, if it can be told.
+
+    Two ways, both cheap: the schedule's own reference is stored on the subscription, and a
+    reference the gateway derived from ours still begins with it. Our references are
+    ``sub-<telegram_id>-<timestamp>``, so the member's id is also readable straight out of the
+    string — used last, because a prefix match is evidence and a parsed id is a guess.
+    """
+    subscription = await session.scalar(
+        select(Subscription).where(Subscription.regular_order_reference == order_reference)
+    )
+    if subscription is not None:
+        return subscription
+
+    for candidate in await session.scalars(
+        select(Subscription).where(Subscription.regular_order_reference.is_not(None))
+    ):
+        stored = candidate.regular_order_reference or ""
+        if stored and order_reference.startswith(stored):
+            return candidate
+
+    # Last resort, and deliberately the narrowest: **every** order this bot has ever written has
+    # the `sub-<id>-<ts>` shape, including the ~150 ordinary invoices, so matching on the shape
+    # alone would turn any late notification about an old one-off order into a free period. Only a
+    # member who actually has a live schedule can be credited this way.
+    parts = order_reference.split("-")
+    if len(parts) >= 2 and parts[0] == "sub" and parts[1].isdigit():
+        candidate = await session.scalar(
+            select(Subscription).where(Subscription.user_id == int(parts[1]))
+        )
+        if candidate is not None and candidate.regular_status in LIVE_SCHEDULE_STATUSES:
+            return candidate
+    return None
+
+
+async def _new_recurring_payment(
+    session: AsyncSession,
+    *,
+    subscription_id: int | None,
+    user_id: int,
+    result,
+    now: datetime,
+) -> Payment:
+    """A row for a charge WayForPay made on its own, so the money has somewhere to land.
+
+    The amount recorded is **what was taken**, not what we expected. On a member-initiated
+    payment those are the same by construction and a mismatch means a tampered body, which is why
+    `apply_payment_result` refuses one. A scheduled charge is different: the gateway holds its own
+    copy of the figure, fixed when the schedule was created, so a discount ending or a promo
+    running out makes the two disagree legitimately. The body is signature-verified either way, so
+    the money is real; `_report_price_drift` tells an admin the two copies have parted company.
+    """
+    reference = await _unique_order_reference(session, user_id, now)
+    payment = Payment(
+        user_id=user_id,
+        subscription_id=subscription_id,
+        order_reference=reference,
+        gateway_order_reference=result.order_reference,
+        charge_key=result.charge_key,
+        is_recurring=True,
+        amount=result.amount if result.amount is not None else Decimal("0"),
+        currency=result.currency or "",
+        status=PaymentStatus.PENDING,
+        created_at=now,
+    )
+    session.add(payment)
+    await session.flush()
+    return payment
+
+
+# --- monthly: forget members who blocked the bot ---------------------------------------------
+
+
+#: Tables whose rows reference ``users.telegram_id``, in the order they must be deleted: children
+#: before parents. ``audit_log`` appears twice because both ``actor_id`` and ``target_user_id``
+#: are foreign keys to users, so a row naming the member either way blocks the delete.
+#: ``discounts.user_id`` and ``audit_log.target_user_id`` are plain columns rather than declared
+#: foreign keys, so nothing would stop the delete — they are here because a purge that left a
+#: member's discount and the record of it behind would not be a purge.
+#: ``promo_codes.created_by`` is deliberately **not** here: a campaign belongs to the club, not to
+#: whoever typed it, and other members' redemptions point at it. Anybody who owns one is kept
+#: instead of deleted — see ``_keep_reason``.
+#: ``test_the_purge_spares_a_payer_and_an_admin_and_deletes_the_rest`` checks this list against
+#: the metadata, so a new table referencing users fails a test rather than a monthly job.
+def _purge_statements(telegram_id: int):
+    return (
+        delete(PromoRedemption).where(PromoRedemption.user_id == telegram_id),
+        delete(Payment).where(Payment.user_id == telegram_id),
+        delete(Discount).where(Discount.user_id == telegram_id),
+        delete(Subscription).where(Subscription.user_id == telegram_id),
+        delete(AuditLog).where(AuditLog.actor_id == telegram_id),
+        delete(AuditLog).where(AuditLog.target_user_id == telegram_id),
+        delete(User).where(User.telegram_id == telegram_id),
+    )
+
+
+async def purge_blocked_users(
+    session_factory: async_sessionmaker,
+    bot: Bot,
+    *,
+    admin_ids: frozenset[int],
+    probe: bool = False,
+    dry_run: bool = False,
+    now: datetime | None = None,
+) -> dict[str, int]:
+    """Delete members who have blocked the bot. Monthly, on the 1st.
+
+    Who counts as blocked is read from ``users.is_blocked_bot``, which
+    ``handlers/chat_membership.py`` writes from the ``my_chat_member`` update Telegram sends when
+    somebody blocks the bot — and clears from the update it sends when they unblock. So the flag
+    is current, and the job makes **no API calls at all** in its scheduled form.
+
+    ``probe=True`` instead asks the gateway about every member directly, for the backlog of people
+    who blocked the bot before that handler existed. It is not the scheduled mode: the probe makes
+    the bot appear to start typing to everyone who has *not* blocked it (``users.has_blocked_bot``
+    explains why), which is acceptable as a deliberate one-off and not as a monthly surprise.
+
+    **Two groups are never deleted:**
+
+    * **admins**, for the same reason removal spares them — no amount of subscription state
+      should be able to erase the owner's own row;
+    * **anyone with a ``complete`` payment.** Their ``payments`` rows are the only record that
+      can be reconciled against WayForPay (standing rule 6), and a deleted payment is a figure
+      the gateway reports and this database cannot explain. They are listed for an admin to
+      decide about by hand.
+
+    Deleting a member also deletes the ``audit_log`` rows naming them, including records of admin
+    actions *taken on* them — a gifted month disappears with its recipient. That is a knowing
+    exception to rule 2: the alternative is keeping a ``users`` row for ever so its audit trail
+    has somewhere to point.
+
+    ``dry_run=True`` reports what it would delete and changes nothing, which is how the list gets
+    checked before a month-end run (the same shape as ``remove_lapsed_members`` under
+    ``REMOVAL_ENABLED=false``).
+
+    Monthly rather than daily because nothing depends on it being prompt: a blocked member costs
+    nothing but a row.
+    """
+    now = now or utcnow()
+    counts = {"checked": 0, "blocked": 0, "purged": 0, "kept_paid": 0, "failed": 0}
+    kept: list[tuple[str, int, str]] = []
+
+    async with session_factory() as session:
+        query = select(User.telegram_id, User.username)
+        if not probe:
+            query = query.where(User.is_blocked_bot.is_(True))
+        candidates = list((await session.execute(query)).all())
+
+    for telegram_id, username in candidates:
+        if telegram_id in admin_ids:
+            continue
+        counts["checked"] += 1
+        try:
+            if probe:
+                blocked = await _probe_once(bot, telegram_id)
+                # One probe per member, paced like any other bulk send (rule 10).
+                await asyncio.sleep(PROBE_INTERVAL)
+                if not blocked:
+                    continue
+
+            counts["blocked"] += 1
+            async with session_factory() as session:
+                reason = await _keep_reason(session, telegram_id)
+                if reason is not None:
+                    counts["kept_paid"] += 1
+                    kept.append(
+                        (f"@{username}" if username else f"id {telegram_id}", telegram_id, reason)
+                    )
+                    log.info("Blocked but kept: %s (%s)", telegram_id, reason)
+                    continue
+
+                if dry_run:
+                    log.info("Would purge %s (@%s): blocked, never paid", telegram_id, username)
+                    counts["purged"] += 1
+                    continue
+
+                for statement in _purge_statements(telegram_id):
+                    await session.execute(statement)
+
+                await record_action(
+                    session,
+                    # The audit row cannot name the purged member — `target_user_id` is a foreign
+                    # key to the row being deleted — so their id is kept in the details instead.
+                    actor_id=min(admin_ids) if admin_ids else telegram_id,
+                    action=Action.USER_PURGED,
+                    details={
+                        "user_id": telegram_id,
+                        "username": username,
+                        "reason": "blocked the bot",
+                    },
+                    now=now,
+                )
+                await session.commit()
+
+            counts["purged"] += 1
+            log.info("Purged %s: they blocked the bot and never paid", telegram_id)
+        except Exception:
+            # One member's failure must not end the sweep: the rest of the list is unaffected, and
+            # a half-finished purge that reported nothing would look like a clean run.
+            counts["failed"] += 1
+            log.exception("Could not purge %s", telegram_id)
+
+    if counts["blocked"]:
+        report = texts.ADMIN_PURGE_REPORT.format(
+            blocked=counts["blocked"],
+            purged=counts["purged"],
+            kept=counts["kept_paid"],
+            extra=texts.ADMIN_PURGE_DRY_RUN if dry_run else "",
+        )
+        if kept:
+            report += "\n\n" + "".join(
+                texts.ADMIN_PURGE_KEPT_LINE.format(handle=handle, user_id=user_id, reason=reason)
+                for handle, user_id, reason in kept[:REPORT_LIMIT]
+            )
+            report += texts.ADMIN_PURGE_KEPT_NOTE
+        if counts["failed"]:
+            report += texts.ADMIN_PURGE_FAILED.format(failed=counts["failed"])
+        if not dry_run:
+            await notify_admins(bot, admin_ids, report)
+        else:
+            log.info("purge dry run report:\n%s", report)
+    else:
+        log.info("purge_blocked_users: nobody is marked as having blocked the bot")
+
+    log.info("purge_blocked_users: %s", counts)
+    return counts
+
+
+async def _keep_reason(session, telegram_id: int) -> str | None:
+    """Why this blocked member must not be deleted, or None if nothing stops it.
+
+    A ``complete`` payment is the main one: those rows are the only record reconcilable against
+    WayForPay (rule 6). Owning a promo campaign is the other — the code outlives whoever typed it,
+    and other members' redemptions point at it.
+    """
+    paid = await session.scalar(
+        select(Payment.id)
+        .where(Payment.user_id == telegram_id, Payment.status == PaymentStatus.COMPLETE)
+        .limit(1)
+    )
+    if paid is not None:
+        return texts.ADMIN_PURGE_KEPT_PAID
+    authored = await session.scalar(
+        select(PromoCode.id).where(PromoCode.created_by == telegram_id).limit(1)
+    )
+    if authored is not None:
+        return texts.ADMIN_PURGE_KEPT_PROMO
+    return None
+
+
+async def _probe_once(bot: Bot, telegram_id: int) -> bool:
+    """``has_blocked_bot``, retried once past a flood limit.
+
+    A ``RetryAfter`` is the one failure that must not be read as "has not blocked": it would turn
+    a rate-limited sweep into a clean-looking result (rule 10).
+    """
+    from aiogram.exceptions import TelegramRetryAfter
+
+    try:
+        return await users.has_blocked_bot(bot, telegram_id)
+    except TelegramRetryAfter as exc:
+        log.warning("Flood limit while probing %s; waiting %ss", telegram_id, exc.retry_after)
+        await asyncio.sleep(exc.retry_after + 1)
+        return await users.has_blocked_bot(bot, telegram_id)
