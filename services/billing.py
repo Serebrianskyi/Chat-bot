@@ -44,7 +44,7 @@ from services import promos, users
 from services import subscriptions as subs
 from services.audit import Action, record_action
 from services.pricing import extend
-from services.wayforpay import WayForPayClient, WayForPayError
+from services.wayforpay import RegularPayment, WayForPayClient, WayForPayError
 
 log = logging.getLogger(__name__)
 
@@ -171,6 +171,34 @@ async def issue_invoice(
         username=user.username if user else None,
         now=now,
     )
+    # What the **gateway** should charge from next period on, which is not what is being paid now:
+    # a one-month offer sent as `regularAmount` would become that price for ever (2026-10-31).
+    recurring_amount, recurring_currency = await discount_service.recurring_price(
+        session,
+        subscription=subscription,
+        username=user.username if user else None,
+        now=now,
+    )
+
+    if recurring_currency != currency:
+        # Nothing sane to send: the gateway takes one currency per schedule. Log it rather than
+        # guessing, and let the amounts be equal so at least nothing silently halves.
+        log.error(
+            "Recurring currency %s differs from %s for %s; using the invoice currency",
+            recurring_currency,
+            currency,
+            subscription.user_id,
+        )
+        recurring_amount = amount
+    if recurring_amount != amount:
+        log.info(
+            "Schedule for %s: %s %s now, %s %s from the next period",
+            subscription.user_id,
+            amount,
+            currency,
+            recurring_amount,
+            currency,
+        )
     if discount is not None:
         log.info(
             "Invoice for %s uses discount %s: %s %s instead of %s %s",
@@ -228,7 +256,7 @@ async def issue_invoice(
             currency=currency,
             product_name=config.product_name,
             recurring=schedule,
-            regular_amount=amount if schedule else None,
+            regular_amount=recurring_amount if schedule else None,
             # The gateway wants DD.MM.YYYY, which is exactly how `texts.day` renders a date, in
             # the same zone members read it in (rule 1). Rendering it any other way would have the
             # bot promise one date and the card charged on another.
@@ -1844,6 +1872,15 @@ async def recover_access(
             log.exception("Access recovery: reconciliation failed; the bot is still running")
             failed_steps.append("перевірка оплат")
 
+    if client is not None:
+        try:
+            results["schedules"] = await realign_schedules(
+                session_factory, bot, client, admin_ids=admin_ids, now=now
+            )
+        except Exception:
+            log.exception("Access recovery: re-pricing schedules failed; the bot is still running")
+            failed_steps.append("звірка регулярних платежів")
+
     try:
         results["invites"] = await retry_missing_invites(
             session_factory,
@@ -1890,6 +1927,85 @@ async def recover_access(
 
     log.info("Access recovery finished: %s", results)
     return results
+
+
+async def realign_schedules(
+    session_factory: async_sessionmaker,
+    bot: Bot,
+    client: WayForPayClient,
+    *,
+    admin_ids: frozenset[int],
+    now: datetime | None = None,
+) -> dict[str, int]:
+    """Check every live schedule against what its member should pay, and correct it. Daily.
+
+    Needed because a schedule's amount is frozen at the gateway while prices here are not: a promo
+    with three months left is still discounted when the schedule is created, and the day it runs
+    out nothing would otherwise tell WayForPay to charge the full tariff again. One confirmation-
+    time check cannot cover that; a daily pass can.
+
+    Also catches the reverse — an admin granting a discount to somebody already on a schedule,
+    which would otherwise keep charging them the old price.
+
+    Needs a ``merchantPassword``: without it the amounts cannot even be read, so the sweep reports
+    that it could do nothing rather than appearing to have checked.
+    """
+    now = now or utcnow()
+    counts = {"checked": 0, "aligned": 0, "mismatched": 0, "unreadable": 0}
+
+    if not client.can_manage_schedules:
+        log.warning("Cannot re-price schedules: no WayForPay merchantPassword is configured")
+        return counts
+
+    async with session_factory() as session:
+        live_ones = list(
+            await session.scalars(
+                select(Subscription).where(Subscription.regular_status == SCHEDULE_ACTIVE)
+            )
+        )
+
+    for subscription in live_ones:
+        counts["checked"] += 1
+        async with session_factory() as session:
+            fresh = await session.get(Subscription, subscription.id)
+            if fresh is None or fresh.regular_order_reference is None:
+                continue
+            try:
+                live = await client.regular_status(order_reference=fresh.regular_order_reference)
+            except Exception:
+                log.exception("Could not read schedule %s", fresh.regular_order_reference)
+                counts["unreadable"] += 1
+                continue
+
+            if live.status not in GATEWAY_SCHEDULE_LIVE:
+                # The gateway stopped charging and nothing here knew. Recorded so the member goes
+                # back to being chased by hand rather than waiting for a charge that never comes.
+                log.warning(
+                    "Schedule %s is %r at the gateway; marking it dead",
+                    fresh.regular_order_reference,
+                    live.status,
+                )
+                fresh.regular_status = SCHEDULE_REMOVED
+                fresh.regular_next_at = None
+                counts["mismatched"] += 1
+                await session.commit()
+                continue
+
+            agreed = await align_schedule_amount(
+                session,
+                bot,
+                client,
+                subscription=fresh,
+                live=live,
+                admin_ids=admin_ids,
+                now=now,
+            )
+            if not agreed:
+                counts["aligned"] += 1
+            await session.commit()
+
+    log.info("realign_schedules: %s", counts)
+    return counts
 
 
 # --- the serviceUrl callback: confirmation without polling ----------------------------------
@@ -2019,7 +2135,7 @@ async def _schedule_state(
     *,
     subscription: Subscription,
     admin_ids: frozenset[int],
-) -> str:
+) -> tuple[str, "RegularPayment | None"]:
     """What the **gateway** says about this schedule: active, removed, or unknown.
 
     `merchantPassword` is what makes this question askable, and it is a credential WayForPay
@@ -2041,17 +2157,17 @@ async def _schedule_state(
                 user_id=subscription.user_id, order=reference or "—"
             ),
         )
-        return SCHEDULE_UNVERIFIED
+        return SCHEDULE_UNVERIFIED, None
 
     try:
         live = await client.regular_status(order_reference=reference)
     except Exception:
         log.exception("Could not read the schedule %s back from the gateway", reference)
-        return SCHEDULE_UNVERIFIED
+        return SCHEDULE_UNVERIFIED, None
 
     if live.status in GATEWAY_SCHEDULE_LIVE:
         log.info("Schedule %s confirmed by the gateway as %s", reference, live.status)
-        return SCHEDULE_ACTIVE
+        return SCHEDULE_ACTIVE, live
 
     # Paid, but no schedule: the member unticked the switch, or paid by a method that does not
     # carry one. They are an ordinary manual payer, and an admin is told so somebody can offer
@@ -2064,7 +2180,7 @@ async def _schedule_state(
             user_id=subscription.user_id, order=reference, status=live.status or "—"
         ),
     )
-    return SCHEDULE_REMOVED
+    return SCHEDULE_REMOVED, live
 
 
 async def _confirm_schedule(
@@ -2105,7 +2221,7 @@ async def _confirm_schedule(
     # does is worse than not knowing: the daily sweep skips a member it thinks the gateway is
     # charging. This bot held exactly that false belief on 2026-10-30, when a real payment left
     # "Регулярні платежі" empty and nobody would ever have been charged again.
-    subscription.regular_status = await _schedule_state(
+    subscription.regular_status, live = await _schedule_state(
         bot,
         client,
         subscription=subscription,
@@ -2113,34 +2229,90 @@ async def _confirm_schedule(
     )
     subscription.regular_next_at = subscription.expires_at
 
+    if subscription.regular_status == SCHEDULE_ACTIVE:
+        await align_schedule_amount(
+            session, bot, client, subscription=subscription, live=live, admin_ids=admin_ids, now=now
+        )
+
+
+async def align_schedule_amount(
+    session: AsyncSession,
+    bot: Bot,
+    client: WayForPayClient | None,
+    *,
+    subscription: Subscription,
+    live: "RegularPayment | None",
+    admin_ids: frozenset[int],
+    now: datetime,
+) -> bool:
+    """Make the gateway charge what the member actually owes. True when they already agree.
+
+    The gateway holds **its own** copy of the amount, fixed when the schedule was created, and no
+    amount of per-invoice pricing here reaches it. So a discount that ends, a promo that runs out,
+    or a tariff change leaves WayForPay charging yesterday's figure for ever — which is how a
+    one-month 1 EUR offer became 1 EUR a month on 2026-10-31.
+
+    `regularApi` EDIT is the only fix, so this is attempted rather than merely reported. An admin
+    is told only when it cannot be done, because then somebody has to open the dashboard.
+    """
+    reference = subscription.regular_order_reference
+    if live is None or reference is None:
+        return True
+
     user = await session.get(User, subscription.user_id)
-    expected, currency, _discount = await discount_service.effective_price(
+    expected, currency = await discount_service.recurring_price(
         session,
         subscription=subscription,
         username=user.username if user else None,
         now=now,
     )
-    if payment.amount == expected and payment.currency == currency:
-        return
+    if (
+        live.amount is not None
+        and live.amount == expected
+        and (live.currency or currency) == (currency)
+    ):
+        return True
 
     log.warning(
-        "Schedule for %s charged %s %s but the price is now %s %s",
+        "Schedule %s charges %s %s but %s should pay %s %s",
+        reference,
+        live.amount,
+        live.currency,
         subscription.user_id,
-        payment.amount,
-        payment.currency,
         expected,
         currency,
     )
+    if client is not None and client.can_manage_schedules:
+        try:
+            answer = await client.regular_edit_amount(
+                order_reference=reference, amount=expected, currency=currency
+            )
+        except Exception:
+            log.exception("EDIT failed for schedule %s", reference)
+        else:
+            if str(answer.get("reasonCode") or "") == REGULAR_API_OK:
+                log.info("Schedule %s re-priced to %s %s", reference, expected, currency)
+                return True
+            log.error(
+                "EDIT refused for %s: %s %s",
+                reference,
+                answer.get("reasonCode"),
+                answer.get("reason"),
+            )
+
     await notify_admins(
         bot,
         admin_ids,
         texts.ADMIN_SCHEDULE_PRICE_DRIFT.format(
             user_id=subscription.user_id,
-            was=texts.money(payment.amount, payment.currency),
+            was=texts.money(live.amount, live.currency or currency)
+            if live.amount is not None
+            else "—",
             price=texts.money(expected, currency),
-            order=subscription.regular_order_reference,
+            order=reference,
         ),
     )
+    return False
 
 
 async def _report_failed_charge(
@@ -2202,6 +2374,12 @@ async def _report_failed_charge(
 #: ``reasonCode`` the regularApi answers a successful request with (wiki 852521).
 REGULAR_API_OK = "4100"
 
+#: Answers that mean **there is nothing to stop**, which is not a failure (wiki 852131):
+#: 4102 no such regular payment, 4106 already completed, 4107 already closed. Treating 4102 as an
+#: error had the bot alerting admins that a cancellation had failed when the member simply never
+#: had a schedule — reported 2026-10-31, for a member who had not even asked to cancel.
+REGULAR_API_NOTHING_TO_STOP = frozenset({"4102", "4106", "4107"})
+
 
 async def stop_schedule(
     session: AsyncSession,
@@ -2242,6 +2420,20 @@ async def stop_schedule(
         return False, type(exc).__name__
 
     reason_code = str(answer.get("reasonCode") or "")
+    if reason_code in REGULAR_API_NOTHING_TO_STOP:
+        # Nothing there to cancel: no schedule was ever created, or it has already finished. The
+        # member is in exactly the state the caller wanted, so this is success — and our copy is
+        # corrected, since it evidently disagreed with the gateway.
+        log.info(
+            "Schedule %s needs no stopping (%s: %s)",
+            reference,
+            reason_code,
+            answer.get("reason"),
+        )
+        subscription.regular_status = SCHEDULE_REMOVED
+        subscription.regular_next_at = None
+        return True, None
+
     if reason_code != REGULAR_API_OK:
         log.error(
             "REMOVE refused for schedule %s: reasonCode=%s reason=%r",

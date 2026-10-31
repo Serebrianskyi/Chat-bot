@@ -4013,3 +4013,75 @@ async def test_a_payment_is_not_proof_of_a_schedule(session_factory, bot, config
         await issue_invoice(session, gw, subscription=sub, config=config, now=NOW)
         await session.commit()
     assert gw.purchase_calls[-1]["recurring"] is False
+
+
+async def test_a_one_month_discount_does_not_become_the_price_for_ever(session_factory, config):
+    """2026-10-31, with real money: a 1 EUR one-month offer went out as `regularAmount`, so the
+    gateway's schedule was set to charge 1 EUR a month indefinitely.
+
+    WayForPay separates `amount` (now) from `regularAmount` (every month after) for exactly this.
+    The schedule must carry what the member owes **once the discount is gone**, because nothing
+    this bot computes per invoice ever reaches the gateway's copy of the figure.
+    """
+    from db.models import Discount, DiscountKind
+    from services.billing import issue_invoice
+
+    await seed_member(session_factory, days_left=0)
+    async with session_factory() as session:
+        sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
+        session.add(
+            Discount(
+                user_id=USER_ID,
+                kind=DiscountKind.FIXED_PRICE,
+                fixed_price=Decimal("1"),
+                currency=CURRENCY,
+                # One period only: expired by the time the gateway charges again. Dated from the
+                # suite's clock, which is what `issue_invoice` is given.
+                valid_until=NOW + timedelta(days=PERIOD_DAYS - 1),
+            )
+        )
+        await session.commit()
+
+    gw = FakeGateway()
+    async with session_factory() as session:
+        sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
+        payment = await issue_invoice(session, gw, subscription=sub, config=config, now=NOW)
+        await session.commit()
+        charged_now = payment.amount
+
+    call = gw.purchase_calls[-1]
+    assert call["recurring"] is True
+    assert charged_now == Decimal("1.00"), "this period is the discounted one"
+    assert call["amount"] == Decimal("1.00")
+    # ...and every period after it is not.
+    assert call["regular_amount"] == REGULAR_PRICE
+
+
+async def test_nothing_to_cancel_is_not_a_failed_cancellation(session_factory):
+    """Reported 2026-10-31: admins got «Не вдалося скасувати автопродовження … 4102: Rule is not
+    found» for a member who had not asked to cancel anything.
+
+    4102 means the gateway has no such schedule — so the member is already in the state the caller
+    wanted. Calling that a failure sends admins to the dashboard to stop something that does not
+    exist, and teaches them to ignore the alert that matters.
+    """
+    from services.billing import SCHEDULE_ACTIVE, SCHEDULE_REMOVED, stop_schedule
+
+    await seed_member(session_factory)
+    async with session_factory() as session:
+        sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
+        sub.regular_order_reference = "sub-317304336-1793382382"
+        sub.regular_status = SCHEDULE_ACTIVE
+        await session.commit()
+
+    gw = FakeGateway()
+    gw.remove_result = {"reasonCode": 4102, "reason": "Rule is not found"}
+    async with session_factory() as session:
+        sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
+        stopped, why = await stop_schedule(session, gw, subscription=sub, now=utcnow_for_test())
+        await session.commit()
+        status = sub.regular_status
+
+    assert (stopped, why) == (True, None)
+    # And our copy is corrected, since it plainly disagreed with the gateway.
+    assert status == SCHEDULE_REMOVED

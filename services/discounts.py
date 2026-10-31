@@ -16,7 +16,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.models import Discount, DiscountKind, Subscription, normalise_username
+from db.models import Discount, DiscountKind, PromoCode, Subscription, normalise_username
 from services.audit import Action, record_action
 
 log = logging.getLogger(__name__)
@@ -122,6 +122,45 @@ async def effective_price(
         now=now,
     )
     return amount, currency, discount
+
+
+async def recurring_price(
+    session: AsyncSession, *, subscription: Subscription, username: str | None, now: datetime
+) -> tuple[Decimal, str]:
+    """What the member should pay from the period **after** the one being bought now.
+
+    This is what a gateway-side schedule needs, and it is not the same number as
+    ``effective_price``. WayForPay holds its own copy of ``regularAmount``, fixed when the schedule
+    is created, and nothing this bot computes per invoice ever reaches it — so a one-month 1 EUR
+    offer sent as ``regularAmount`` becomes 1 EUR a month for ever. Found that way on 2026-10-31,
+    with a real schedule charging the promotional price.
+
+    So the discount is evaluated **one period into the future**: a ``valid_until`` that falls
+    before then has expired by the time the gateway charges, and a promo with only one period left
+    will have been spent by the payment being made now. Anything still live then does apply, and
+    the two amounts come out equal — which is correct for an open-ended discount.
+    """
+    from services import promos
+
+    next_at = now + timedelta(days=subscription.period_days)
+
+    discount = await find_active(
+        session, telegram_id=subscription.user_id, username=username, now=next_at
+    )
+    if discount is None:
+        standing, currency = subscription.price, subscription.currency
+    else:
+        standing, currency = apply_to(subscription.price, subscription.currency, discount)
+
+    # `> 1`, not `> 0`: this is called before `consume_period`, so the period being paid for now is
+    # still counted. A promo with one period left gives it to today's payment and nothing after.
+    redemption = await promos.live_redemption(session, user_id=subscription.user_id, now=next_at)
+    if redemption is not None and redemption.periods_remaining > 1:
+        promo = await session.get(PromoCode, redemption.promo_code_id)
+        if promo is not None:
+            standing, currency = promos.apply_promo(standing, currency, promo)
+
+    return standing, currency
 
 
 async def grant(
