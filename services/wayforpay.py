@@ -29,6 +29,7 @@ Sources: wiki.wayforpay.com /en/view/608996852 (create invoice), /en/view/852117
 /en/view/852102 (response signature field list).
 """
 
+import asyncio
 import hashlib
 import hmac
 import logging
@@ -64,6 +65,19 @@ REGULAR_API_URL = "https://api.wayforpay.com/regularApi"
 #: The monthly schedule a Purchase can carry. ``monthly`` is the only period this club bills in.
 REGULAR_MODE_MONTHLY = "monthly"
 
+#: Smallest gap between two Purchase creations, in seconds.
+#:
+#: The gateway rate-limits this endpoint and answers `HTTP 429` when pushed: on 2026-11-01 a bulk
+#: run created them back to back at five to eight a second and most members got **no payment
+#: link** — the one failure mode that costs money directly. Enforced inside the client rather than
+#: at each call site, so a broadcast, the daily sweep and a reminder cannot each be fast on their
+#: own and collectively too fast.
+PURCHASE_MIN_INTERVAL = 0.4
+
+#: How long to wait before retrying a rate-limited request, per attempt. Overridden by a
+#: `Retry-After` header when the gateway sends one.
+RETRY_BACKOFF = (1.0, 3.0, 9.0)
+
 #: Field order of the response signature. Shared by CHECK_STATUS, CHARGE and the (unused) callback.
 RESPONSE_SIGNATURE_FIELDS = (
     "merchantAccount",
@@ -95,6 +109,14 @@ class WayForPayError(RuntimeError):
 
 class SignatureMismatch(WayForPayError):
     """The response signature did not match. Treat the body as forged and do not act on it."""
+
+
+class RateLimited(WayForPayError):
+    """HTTP 429. Carries how long the gateway asked us to wait, when it said."""
+
+    def __init__(self, message: str, *, retry_after: float) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 def format_amount(amount: Decimal) -> str:
@@ -316,6 +338,7 @@ class WayForPayClient:
         service_url: str | None = None,
         merchant_password: str | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
+        purchase_interval: float = PURCHASE_MIN_INTERVAL,
     ) -> None:
         self._merchant_account = merchant_account
         self._merchant_domain = merchant_domain
@@ -332,6 +355,10 @@ class WayForPayClient:
         # A seam for tests: httpx.MockTransport lets the request-building and response-parsing
         # paths be exercised without a network, which is worth having on the money paths.
         self._transport = transport
+        # Purchase creation is paced here, for every caller at once. Tests pass 0.
+        self._purchase_interval = purchase_interval
+        self._purchase_gate = asyncio.Lock()
+        self._last_purchase = 0.0
 
     # --- signature construction, kept public so tests can assert the field order ----------
 
@@ -510,6 +537,7 @@ class WayForPayClient:
             # it happens instead of up to two minutes later.
             payload["serviceUrl"] = self._service_url
 
+        await self._wait_turn()
         data = await self._post(payload, url=PURCHASE_URL)
         page_url = data.get("url")
         if not page_url:
@@ -725,19 +753,71 @@ class WayForPayClient:
         order_reference = str(payload.get("orderReference") or "")
         return self._read_transaction(order_reference, payload)
 
+    async def _wait_turn(self) -> None:
+        """Hold the next Purchase back until ``PURCHASE_MIN_INTERVAL`` has passed since the last.
+
+        One lock for the whole client, so concurrent callers queue rather than race. A monotonic
+        clock, because a wall-clock adjustment mid-sweep must not turn into a long sleep.
+        """
+        if self._purchase_interval <= 0:
+            return
+        async with self._purchase_gate:
+            loop = asyncio.get_running_loop()
+            wait = self._last_purchase + self._purchase_interval - loop.time()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_purchase = loop.time()
+
     async def _post(self, payload: dict[str, Any], *, url: str | None = None) -> dict[str, Any]:
-        """One request. ``url`` overrides the API endpoint for Purchase and regularApi.
+        """One request, retried while the gateway says it is too busy.
+
+        ``url`` overrides the API endpoint for Purchase and regularApi.
+
+        **429 is retried, nothing else is.** A rate-limited Purchase means a member received no
+        payment link at all, so giving up on the first refusal costs money; any other failure is
+        either permanent or about the content of the request, and repeating it would just be
+        noise. The gateway's own ``Retry-After`` wins over our backoff when it sends one.
 
         The payload is never logged: it carries the signature, which is the secret's output, and
         for regularApi the merchant password itself.
         """
-        async with httpx.AsyncClient(timeout=self._timeout, transport=self._transport) as client:
-            response = await client.post(url or self._api_url, json=payload)
-        if response.status_code != 200:
-            msg = f"WayForPay returned HTTP {response.status_code}"
-            raise WayForPayError(msg)
-        try:
-            return response.json()
-        except ValueError as exc:
-            msg = "WayForPay returned a body that is not JSON"
-            raise WayForPayError(msg) from exc
+        target = url or self._api_url
+        for attempt, backoff in enumerate((*RETRY_BACKOFF, None), start=1):
+            async with httpx.AsyncClient(
+                timeout=self._timeout, transport=self._transport
+            ) as client:
+                response = await client.post(target, json=payload)
+
+            if response.status_code == 429:
+                asked = response.headers.get("Retry-After")
+                try:
+                    wait = float(asked) if asked else None
+                except ValueError:
+                    wait = None
+                wait = wait if wait is not None else backoff
+                if wait is None:
+                    msg = (
+                        f"WayForPay rate-limited us after {attempt} attempts; "
+                        f"no payment link was created"
+                    )
+                    raise RateLimited(msg, retry_after=0.0)
+                log.warning(
+                    "WayForPay answered 429 (attempt %s); waiting %.1fs before retrying",
+                    attempt,
+                    wait,
+                )
+                await asyncio.sleep(wait)
+                continue
+
+            if response.status_code != 200:
+                msg = f"WayForPay returned HTTP {response.status_code}"
+                raise WayForPayError(msg)
+            try:
+                return response.json()
+            except ValueError as exc:
+                msg = "WayForPay returned a body that is not JSON"
+                raise WayForPayError(msg) from exc
+
+        # Unreachable: the loop either returns or raises.
+        msg = "WayForPay request exhausted its retries"
+        raise WayForPayError(msg)

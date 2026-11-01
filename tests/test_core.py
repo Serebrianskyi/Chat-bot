@@ -3468,6 +3468,8 @@ async def test_a_recurring_purchase_is_signed_like_an_invoice_and_refuses_to_run
         secret_key="secret",  # noqa: S106
         service_url="https://example.test/payments/wayforpay",
         transport=httpx.MockTransport(handler),
+        # The real client paces Purchase creation; a test must not wait for it.
+        purchase_interval=0,
     )
 
     page = await client.purchase(
@@ -3507,6 +3509,7 @@ async def test_a_recurring_purchase_is_signed_like_an_invoice_and_refuses_to_run
         merchant_domain="example.com",
         secret_key="secret",  # noqa: S106
         transport=httpx.MockTransport(handler),
+        purchase_interval=0,
     )
     with pytest.raises(WayForPayError):
         await unheard.purchase(
@@ -4085,3 +4088,71 @@ async def test_nothing_to_cancel_is_not_a_failed_cancellation(session_factory):
     assert (stopped, why) == (True, None)
     # And our copy is corrected, since it plainly disagreed with the gateway.
     assert status == SCHEDULE_REMOVED
+
+
+async def test_a_rate_limited_purchase_is_retried_rather_than_dropped():
+    """2026-11-01: a bulk run created Purchases five to eight a second, WayForPay answered 429,
+    and every refused member got **no payment link** — the one failure that costs money directly.
+
+    So 429 is retried (and only 429: anything else is permanent or about the request itself), and
+    the gateway's own `Retry-After` wins over our backoff.
+    """
+    import httpx
+
+    from services.wayforpay import WayForPayClient, WayForPayError
+
+    attempts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(str(request.url))
+        if len(attempts) < 3:
+            # Second refusal names its own wait, which must be honoured over the backoff.
+            headers = {"Retry-After": "0"} if len(attempts) == 2 else {}
+            return httpx.Response(429, json={"reason": "too many"}, headers=headers)
+        return httpx.Response(200, json={"url": "https://secure.wayforpay.com/page?vkh=ok"})
+
+    client = WayForPayClient(
+        merchant_account="acct",
+        merchant_domain="example.com",
+        secret_key="secret",  # noqa: S106
+        service_url="https://example.test/payments/wayforpay",
+        transport=httpx.MockTransport(handler),
+        purchase_interval=0,
+    )
+    args = {
+        "order_reference": "sub-1-1",
+        "order_date": 1,
+        "amount": Decimal("8"),
+        "currency": "EUR",
+        "product_name": "Sub",
+        "recurring": True,
+        "regular_amount": Decimal("8"),
+        "date_next": "01.12.2026",
+    }
+
+    # The first backoff is a whole second; nothing about the test needs to feel it.
+    from unittest import mock
+
+    with mock.patch("services.wayforpay.RETRY_BACKOFF", (0, 0, 0)):
+        page = await client.purchase(**args)
+    assert page.page_url.endswith("vkh=ok")
+    assert len(attempts) == 3, "it gave up instead of retrying"
+
+    # A failure that is not a rate limit is not retried: repeating it would only make noise.
+    calls: list[str] = []
+
+    def refuses(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return httpx.Response(500, json={})
+
+    broken = WayForPayClient(
+        merchant_account="acct",
+        merchant_domain="example.com",
+        secret_key="secret",  # noqa: S106
+        service_url="https://example.test/payments/wayforpay",
+        transport=httpx.MockTransport(refuses),
+        purchase_interval=0,
+    )
+    with pytest.raises(WayForPayError):
+        await broken.purchase(**args)
+    assert len(calls) == 1
