@@ -288,6 +288,9 @@ def start_scheduler(
             "session_factory": session_factory,
             "bot": bot,
             "admin_ids": admin_ids,
+            # Needed to spare anybody still sitting in the channel: their row is the only record
+            # saying they should ever be taken out of it.
+            "channel_id": config.channel_id,
         },
         coalesce=True,
         max_instances=1,

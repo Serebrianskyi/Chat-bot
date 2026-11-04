@@ -6,6 +6,7 @@
     python -m scripts.diagnose order <order_reference>   # one stored gateway body, in full
     python -m scripts.diagnose fields     # every field WayForPay has ever sent, read or ignored
     python -m scripts.diagnose schedules  # who is on a monthly schedule, and what the gateway says
+    python -m scripts.diagnose member @handle 12345      # access, channel membership, links sent
     python -m scripts.diagnose access --channel   # as above, plus a live membership check
 
 Written for one question: of the people who paid, which ones did the bot fail and which ones
@@ -33,7 +34,7 @@ from zoneinfo import ZoneInfo
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from config import get_settings
 from db.models import AuditLog, Payment, PaymentStatus, Subscription, User, utcnow
@@ -598,15 +599,133 @@ async def cmd_schedules(ask_gateway: bool) -> int:
         await engine.dispose()
 
 
+async def cmd_member(targets: list[str]) -> int:
+    """Everything known about specific members: access, channel membership, orders, links sent.
+
+    Written for the question that cannot be answered from one table — "do they actually have
+    access to the channel, and did they ever receive an invoice?" The first half needs a live
+    `getChatMember`, because a bot cannot enumerate a channel; the second needs the `audit_log`,
+    because a `payments` row proves an order was created at the gateway, not that anybody was
+    reachable when the link was sent.
+
+    Takes ids or @usernames, in any mix. Read-only; one Telegram call per member.
+    """
+    settings = get_settings()
+    engine = create_engine(settings.database_url)
+    factory = create_session_factory(engine)
+    tz = settings.display_timezone
+    bot = Bot(
+        token=settings.bot_token.get_secret_value(),
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+
+    try:
+        for target in targets:
+            handle = target.lstrip("@").lower()
+            async with factory() as session:
+                if handle.isdigit():
+                    user = await session.get(User, int(handle))
+                else:
+                    user = await session.scalar(
+                        select(User).where(func.lower(User.username) == handle)
+                    )
+                if user is None:
+                    print(f"{target}: no users row — they have never started the bot\n")
+                    continue
+
+                subscription = await session.scalar(
+                    select(Subscription).where(Subscription.user_id == user.telegram_id)
+                )
+                orders = list(
+                    await session.scalars(
+                        select(Payment)
+                        .where(Payment.user_id == user.telegram_id)
+                        .order_by(Payment.created_at.desc())
+                        .limit(5)
+                    )
+                )
+                links = list(
+                    await session.scalars(
+                        select(AuditLog)
+                        .where(
+                            AuditLog.target_user_id == user.telegram_id,
+                            AuditLog.action.in_([Action.PAYMENT_LINK_SENT, Action.INVITE_SENT]),
+                        )
+                        .order_by(AuditLog.created_at.desc())
+                        .limit(5)
+                    )
+                )
+
+            print(f"{_handle(user, user.telegram_id)}  id {user.telegram_id}")
+            known = "yes" if user.is_blocked_bot else "not as far as we know"
+            print(f"  blocked the bot   {known}")
+            if subscription is None:
+                print("  subscription      none\n")
+                continue
+            print(f"  status            {subscription.status.value}")
+            print(f"  price             {subscription.price} {subscription.currency}")
+            print(f"  access until      {_local(subscription.expires_at, tz)}")
+            print(f"  free period used  {subscription.free_period_granted}")
+            print(f"  schedule          {subscription.regular_status or 'none'}")
+
+            # The channel is the one thing the database cannot know.
+            if settings.channel_id:
+                status, error = await _membership_status(bot, settings.channel_id, user.telegram_id)
+                print(f"  in the channel    {status or f'unknown ({error})'}")
+            else:
+                print("  in the channel    unknown (CHANNEL_ID is not set)")
+
+            if orders:
+                print("  recent orders")
+                for order in orders:
+                    print(
+                        f"    {_local(order.created_at, tz)}  {order.amount} {order.currency}  "
+                        f"{order.status.value}  {order.order_reference}"
+                    )
+            else:
+                print("  recent orders     none — no invoice has ever been created for them")
+
+            if links:
+                print("  links sent")
+                for entry in links:
+                    detail = entry.details or {}
+                    delivered = detail.get("delivered")
+                    mark = {True: "delivered", False: "NOT delivered", None: ""}.get(delivered, "")
+                    extra = f" ({detail.get('reason')})" if detail.get("reason") else ""
+                    print(f"    {_local(entry.created_at, tz)}  {entry.action}  {mark}{extra}")
+            else:
+                print("  links sent        nothing recorded")
+            print()
+        return 0
+    finally:
+        await bot.session.close()
+        await engine.dispose()
+
+
+async def _membership_status(
+    bot: Bot, channel_id: str, user_id: int
+) -> tuple[str | None, str | None]:
+    """``(status, error)`` from one ``getChatMember``. Never raises."""
+    try:
+        member = await bot.get_chat_member(chat_id=channel_id, user_id=user_id)
+    except Exception as exc:  # noqa: BLE001 - the reason is printed
+        return None, type(exc).__name__
+    return member.status, None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
-        "report", choices=["access", "invites", "reasons", "order", "fields", "schedules"]
+        "report",
+        choices=["access", "invites", "reasons", "order", "fields", "schedules", "member"],
     )
     parser.add_argument(
         "order_reference",
-        nargs="?",
-        help="order only: which order's stored gateway body to print",
+        nargs="*",
+        help=(
+            "order: which order's stored gateway body to print. "
+            "member: one or more ids or @usernames"
+        ),
     )
     parser.add_argument(
         "--live",
@@ -622,6 +741,10 @@ def main(argv: list[str] | None = None) -> int:
         help="also ask Telegram whether each payer is in the channel (one API call per member)",
     )
     args = parser.parse_args(argv)
+    if args.report == "member":
+        if not args.order_reference:
+            parser.error("member needs at least one id or @username")
+        return asyncio.run(cmd_member(args.order_reference))
     if args.report == "schedules":
         return asyncio.run(cmd_schedules(ask_gateway=args.live))
     if args.report == "fields":
@@ -629,7 +752,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.report == "order":
         if not args.order_reference:
             parser.error("order needs an order_reference")
-        return asyncio.run(cmd_order(args.order_reference))
+        return asyncio.run(cmd_order(args.order_reference[0]))
     if args.report == "reasons":
         return asyncio.run(cmd_reasons())
     if args.report == "invites":

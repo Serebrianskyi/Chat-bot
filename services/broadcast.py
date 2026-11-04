@@ -30,7 +30,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 import texts
 from db.models import DiscountKind, PaymentStatus, utcnow
-from services import billing
+from services import billing, users
 from services import discounts as discount_service
 from services import subscriptions as subs
 from services.audit import Action, record_action
@@ -324,6 +324,15 @@ async def send_broadcast(
         )
         if outcome == "blocked":
             result.blocked += 1
+            # **Recorded, not just counted.** A broadcast is the only thing that reaches every
+            # member at once, so it is where blocks are discovered in bulk: one post found 79 of
+            # them on 2026-11-01 while the monthly purge, which reads this flag, could see 4.
+            # Without this the knowledge dies with the report.
+            async with session_factory() as session:
+                try:
+                    await users.mark_blocked_bot(session, user_id, blocked=True)
+                except Exception:
+                    log.exception("Could not record that %s has blocked the bot", user_id)
         elif outcome == "failed":
             result.failed += 1
         else:

@@ -462,7 +462,7 @@ async def _tell_member(
             until=texts.day(
                 extend(subscription.expires_at, now=now, period_days=subscription.period_days)
             ),
-        )
+        ) + billing.pay_link_note(config.invoice_timeout)
         markup = InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text=texts.PAY_EARLY_BUTTON, url=payment.invoice_url)]

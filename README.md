@@ -282,7 +282,7 @@ All of these live in `.env` locally and in platform environment variables in pro
 | `SUBSCRIPTION_PRICE` | Phase 2A | Regular monthly price for a new joiner |
 | `SUBSCRIPTION_CURRENCY` | Phase 2A | Defaults to `UAH` |
 | `SUBSCRIPTION_PERIOD_DAYS` | Phase 2A | Defaults to 30 |
-| `SUBSCRIPTION_GRACE_DAYS` | Phase 2A | Days overdue before an admin is alerted. Defaults to 3 |
+| `SUBSCRIPTION_GRACE_DAYS` | Phase 2A | Days overdue before access closes and an admin is alerted. **Defaults to 1** |
 | `LEGACY_OFFER_DEADLINE` | optional | After this, community membership no longer buys a free month |
 | `WAYFORPAY_MERCHANT_ACCOUNT` | Phase 2A | Merchant login |
 | `WAYFORPAY_MERCHANT_DOMAIN` | Phase 2A | Domain registered with WayForPay |

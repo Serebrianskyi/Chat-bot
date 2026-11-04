@@ -25,6 +25,10 @@ class Action:
     PAYMENT_MISSING = "payment.missing"  # due date passed unpaid; an admin was told
     PAYMENT_COMPLETE = "payment.complete"
     PAYMENT_FAILED = "payment.failed"  # a scheduled charge the gateway could not take
+    #: A payment link was DM'd to a member — or could not be. "Did they ever get an invoice?" is
+    #: otherwise unanswerable from the database: the `payments` row proves an order was created,
+    #: not that the member was reachable.
+    PAYMENT_LINK_SENT = "payment.link_sent"
     DISCOUNT_GRANTED = "discount.granted"
     DISCOUNT_REVOKED = "discount.revoked"
     # Phase 3

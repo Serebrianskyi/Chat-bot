@@ -165,7 +165,8 @@ async def pay_now(
             until=texts.day(
                 extend(subscription.expires_at, now=now, period_days=subscription.period_days)
             ),
-        ),
+        )
+        + billing.pay_link_note(),
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [

@@ -49,10 +49,21 @@ from services.wayforpay import RegularPayment, WayForPayClient, WayForPayError
 log = logging.getLogger(__name__)
 
 #: How long an unpaid invoice stays worth polling before it is written off as abandoned.
-INVOICE_TIMEOUT = timedelta(hours=2)
+INVOICE_TIMEOUT = timedelta(hours=24)
+
+#: How long a fresh order is asked about on **every** poll run. Somebody who is going to pay does
+#: it within minutes of tapping the button, and those minutes are when a fast answer matters: the
+#: member is still looking at their phone waiting for the channel link.
+POLL_EAGER_FOR = timedelta(minutes=15)
+
+#: And afterwards, at most this often. The payment window became 24 hours on 2026-11-04, so
+#: polling every order every minute for a day would be ~1,400 requests per unpaid order — against
+#: an endpoint that answers `429` when pushed, for an answer the `serviceUrl` callback already
+#: delivers the moment a payment happens. Polling is the fallback, and a fallback can be slow.
+POLL_SLOW_EVERY = timedelta(minutes=10)
 
 #: How long after the due date a member is chased before an admin is told.
-DEFAULT_GRACE = timedelta(days=3)
+DEFAULT_GRACE = timedelta(hours=24)
 
 # Member-facing wording lives in texts.py.
 
@@ -103,6 +114,29 @@ LIVE_SCHEDULE_STATUSES = frozenset({SCHEDULE_REQUESTED, SCHEDULE_ACTIVE, SCHEDUL
 
 #: What `regularApi` STATUS calls a schedule that is or will be charging (wiki 852526).
 GATEWAY_SCHEDULE_LIVE = frozenset({"Active", "Created", "Confirmed"})
+
+
+def _due_for_poll(payment: Payment, *, now: datetime) -> bool:
+    """Whether this order should be asked about on this run. See `POLL_EAGER_FOR`."""
+    if payment.last_checked_at is None:
+        return True
+    if now - payment.created_at <= POLL_EAGER_FOR:
+        return True
+    return now - payment.last_checked_at >= POLL_SLOW_EVERY
+
+
+def pay_link_note(timeout: timedelta = INVOICE_TIMEOUT) -> str:
+    """The line that tells a member how long their link lives and where to get another.
+
+    Derived from the timeout actually sent to the gateway as ``orderTimeout``, so the promise in
+    the message and the behaviour of the page cannot drift apart. Two hours was the old value and
+    it was never mentioned to anybody: a member opening the DM in the evening found a dead page
+    and no instructions.
+    """
+    hours = max(1, int(timeout.total_seconds() // 3600))
+    return texts.PAY_LINK_NOTE.format(
+        hours=texts.hours_phrase(hours), button=texts.PAY_EARLY_BUTTON
+    )
 
 
 def _pay_keyboard(invoice_url: str) -> InlineKeyboardMarkup:
@@ -389,12 +423,29 @@ async def settle_without_payment(
 
 
 async def send_payment_link(
-    bot: Bot, *, subscription: Subscription, payment: Payment, message: str | None = None
+    bot: Bot,
+    *,
+    subscription: Subscription,
+    payment: Payment,
+    message: str | None = None,
+    session: AsyncSession | None = None,
+    now: datetime | None = None,
 ) -> bool:
-    """DM the payment button. False when the user has blocked the bot or never started it."""
+    """DM the payment button. False when the user has blocked the bot or never started it.
+
+    With a ``session``, the outcome is **recorded**: an `audit_log` row either way, and
+    `users.is_blocked_bot` set on a refusal. Without that, "was this member ever actually sent an
+    invoice?" cannot be answered from the database — a `payments` row proves an order was created
+    at the gateway, not that anybody received the link. The question came up on 2026-11-01 about
+    members holding a timed-out order and nothing else.
+    """
     # The invoice's amount, not the base price: that is what the member will actually be charged.
     amount = texts.money(payment.amount, payment.currency)
-    text = message or texts.PAY_PROMPT.format(club=texts.CLUB_NAME, amount=amount)
+    text = (message or texts.PAY_PROMPT.format(club=texts.CLUB_NAME, amount=amount)) + (
+        pay_link_note()
+    )
+    delivered = True
+    reason: str | None = None
     try:
         await bot.send_message(
             subscription.user_id,
@@ -407,8 +458,33 @@ async def send_payment_link(
         log.warning(
             "Cannot DM %s: they have not started the bot, or blocked it", subscription.user_id
         )
-        return False
-    return True
+        delivered, reason = False, "forbidden"
+    except Exception as exc:  # noqa: BLE001 - recorded, and the job carries on
+        log.exception("Could not DM a payment link to %s", subscription.user_id)
+        delivered, reason = False, type(exc).__name__
+
+    if session is not None:
+        try:
+            if not delivered and reason == "forbidden":
+                await users.mark_blocked_bot(session, subscription.user_id, blocked=True)
+            await record_action(
+                session,
+                actor_id=subscription.user_id,
+                action=Action.PAYMENT_LINK_SENT,
+                target_user_id=subscription.user_id,
+                details={
+                    "order_reference": payment.order_reference,
+                    "amount": str(payment.amount),
+                    "currency": payment.currency,
+                    "delivered": delivered,
+                    "reason": reason,
+                },
+                now=now or utcnow(),
+            )
+        except Exception:
+            log.exception("Could not record the payment link sent to %s", subscription.user_id)
+
+    return delivered
 
 
 async def notify_admins(bot: Bot, admin_ids: frozenset[int], text: str) -> int:
@@ -571,7 +647,7 @@ async def poll_open_payments(
     this twice grants nothing twice (A.11, A.20).
     """
     now = now or utcnow()
-    counts = {"checked": 0, "completed": 0, "failed": 0, "abandoned": 0}
+    counts = {"checked": 0, "waiting": 0, "completed": 0, "failed": 0, "abandoned": 0}
 
     async with session_factory() as session:
         open_rows = (
@@ -598,6 +674,10 @@ async def poll_open_payments(
                 # Never paid within the window. Terminal, so it stops being polled.
                 payment.status = PaymentStatus.CANCELED
                 counts["abandoned"] += 1
+                continue
+
+            if not _due_for_poll(payment, now=now):
+                counts["waiting"] += 1
                 continue
 
             counts["checked"] += 1
@@ -662,7 +742,11 @@ MAX_CHARGE_ATTEMPTS = 2
 
 #: How long before expiry the member is warned that a charge is coming. One day, because the copy
 #: says «Завтра відбудеться автоматичне списання».
-REMINDER_LEAD = timedelta(days=1)
+REMINDER_DAYS = (3, 1)
+
+#: How far ahead the first reminder goes out. Also the query window: a subscription further away
+#: than this is not yet anybody's business.
+REMINDER_LEAD = timedelta(days=max(REMINDER_DAYS))
 
 
 async def attempt_charge(
@@ -833,6 +917,23 @@ async def attempt_charge(
     return False
 
 
+def _reminder_slot(subscription: Subscription, *, now: datetime) -> int | None:
+    """Which reminder is owed — 3 days out, 1 day out — or None if none is.
+
+    Slots are checked from the closest deadline outwards, so a job that misses a day sends the
+    most relevant warning rather than a stale one. A slot counts as already used when
+    ``last_reminder_at`` falls at or after the moment that slot opened.
+    """
+    for days in sorted(REMINDER_DAYS):
+        opens = subscription.expires_at - timedelta(days=days)
+        if now < opens:
+            continue
+        if subscription.last_reminder_at is not None and subscription.last_reminder_at >= opens:
+            continue
+        return days
+    return None
+
+
 async def send_renewal_reminders(
     session_factory: async_sessionmaker,
     client: WayForPayClient | None,
@@ -874,14 +975,15 @@ async def send_renewal_reminders(
         )
 
         for subscription in upcoming:
-            # Already warned about *this* period? `last_reminder_at` is reset whenever the period
-            # moves, so a stamp inside the current window means the member has been told.
-            # Inclusive on purpose: a reminder sent at the exact instant the window opened — the
-            # ordinary case when the job and the window line up — belongs to this period.
-            if (
-                subscription.last_reminder_at is not None
-                and subscription.last_reminder_at >= subscription.expires_at - REMINDER_LEAD
-            ):
+            # Which warning is due? One per **slot**: three days out, then one day out. A slot
+            # opens at `expires_at - days` and the stamp from an earlier slot is older than the
+            # next slot's opening, so each fires exactly once and the member gets two dated
+            # warnings instead of one — the owner's policy of 2026-11-04.
+            #
+            # `last_reminder_at` alone carries this: it is reset whenever the period moves, so a
+            # stamp at or after the newest open slot means this member has already had that one.
+            slot = _reminder_slot(subscription, now=now)
+            if slot is None:
                 counts["skipped"] += 1
                 continue
 
@@ -894,7 +996,15 @@ async def send_renewal_reminders(
             )
 
             if renews_automatically(subscription):
-                delivered = await _tell(bot, subscription.user_id, texts.RENEWAL_REMINDER)
+                # The last slot says "tomorrow"; an earlier one has to name the day instead.
+                text = (
+                    texts.RENEWAL_REMINDER
+                    if slot == min(REMINDER_DAYS)
+                    else texts.RENEWAL_REMINDER_EARLY.format(
+                        days=texts.days_phrase(slot), until=texts.day(subscription.expires_at)
+                    )
+                )
+                delivered = await _tell(bot, subscription.user_id, text)
                 counts["automatic"] += delivered
             else:
                 # The link is issued now rather than described, so the reminder is actionable.
@@ -918,10 +1028,14 @@ async def send_renewal_reminders(
                             )
                             payment = None
 
-                text = texts.RENEWAL_MANUAL_DUE.format(
-                    club=texts.CLUB_NAME,
-                    amount=texts.money(amount, currency),
-                    period=subscription.period_days,
+                text = (
+                    texts.RENEWAL_MANUAL_DUE.format(
+                        club=texts.CLUB_NAME,
+                        amount=texts.money(amount, currency),
+                        period=subscription.period_days,
+                    )
+                    + texts.RENEWAL_DEADLINE.format(until=texts.day(subscription.expires_at))
+                    + pay_link_note(config.invoice_timeout)
                 )
                 delivered = await _tell(
                     bot,
@@ -1010,6 +1124,7 @@ async def process_due_subscriptions(
     now = now or utcnow()
     counts = {
         "invoiced": 0,
+        "already_linked": 0,
         "renewed": 0,
         "scheduled": 0,
         "charge_failed": 0,
@@ -1109,6 +1224,24 @@ async def process_due_subscriptions(
                     counts["free"] += 1
                     continue
 
+                # **One link per period, then silence.** The owner's policy of 2026-11-04: a
+                # reminder a few days ahead, one payment link when the period ends, and after
+                # that a new link only by hand — from `/subscription`, or an admin sending one.
+                #
+                # Without this guard the sweep re-linked daily for ever: a link dies after two
+                # hours, so every morning found no open invoice and minted another. That is both
+                # a drip of identical messages and, for the 155 members nobody is chasing, the
+                # reason the "don't keep notifying them" instruction needed a second mechanism.
+                #
+                # `last_reminder_at >= expires_at` is the marker, and it clears itself: a payment
+                # resets it to None and moves `expires_at`, so the next period starts fresh.
+                if (
+                    subscription.last_reminder_at is not None
+                    and subscription.last_reminder_at >= subscription.expires_at
+                ):
+                    counts["already_linked"] += 1
+                    continue
+
                 existing = await subs.open_payment(session, subscription.id)
                 if existing is None:
                     try:
@@ -1124,7 +1257,11 @@ async def process_due_subscriptions(
                         continue
 
                     delivered = await send_payment_link(
-                        bot, subscription=subscription, payment=payment
+                        bot,
+                        subscription=subscription,
+                        payment=payment,
+                        session=session,
+                        now=now,
                     )
                     counts["invoiced"] += 1
                     if not delivered:
@@ -1159,6 +1296,60 @@ async def process_due_subscriptions(
 # --- job 5: take lapsed members out of the channel ------------------------------------------
 
 
+async def _removal_reason(
+    session: AsyncSession, *, subscription: Subscription, now: datetime
+) -> tuple[str, str]:
+    """``(handle, why)`` for one member being removed, from what the database already knows.
+
+    The admin report names people and says what happened, because "id 123 removed" answers
+    nothing: the questions that follow are always *who was that*, *had they ever paid*, and *were
+    they actually warned*. All three are on hand here, so they go in the line rather than needing
+    three queries afterwards.
+    """
+    user = await session.get(User, subscription.user_id)
+    handle = f"@{user.username}" if user and user.username else f"id {subscription.user_id}"
+
+    overdue = now - subscription.expires_at
+    parts = [
+        texts.ADMIN_REMOVED_UNTIL.format(until=texts.day(subscription.expires_at)),
+        texts.ADMIN_REMOVED_OVERDUE.format(overdue=texts.days_phrase(max(1, overdue.days))),
+    ]
+
+    last_paid = await session.scalar(
+        select(func.max(Payment.settled_at)).where(
+            Payment.user_id == subscription.user_id,
+            Payment.status == PaymentStatus.COMPLETE,
+        )
+    )
+    parts.append(
+        texts.ADMIN_REMOVED_LAST_PAID.format(when=texts.day(last_paid))
+        if last_paid is not None
+        else texts.ADMIN_REMOVED_NEVER_PAID
+    )
+
+    # Warnings that actually arrived, not warnings attempted: `last_reminder_at` is stamped
+    # either way, so it cannot answer this. Recorded per send since 2026-11-01.
+    notices = list(
+        await session.scalars(
+            select(AuditLog.details).where(
+                AuditLog.target_user_id == subscription.user_id,
+                AuditLog.action == Action.PAYMENT_LINK_SENT,
+                AuditLog.created_at >= subscription.expires_at - REMINDER_LEAD,
+            )
+        )
+    )
+    delivered = sum(1 for detail in notices if (detail or {}).get("delivered"))
+    parts.append(
+        texts.ADMIN_REMOVED_WARNED.format(count=delivered)
+        if delivered
+        else texts.ADMIN_REMOVED_NOT_WARNED
+    )
+    if user is not None and user.is_blocked_bot:
+        parts.append(texts.ADMIN_REMOVED_BLOCKED)
+
+    return handle, " · ".join(parts)
+
+
 async def remove_lapsed_members(
     session_factory: async_sessionmaker,
     bot: Bot,
@@ -1187,6 +1378,7 @@ async def remove_lapsed_members(
     """
     now = now or utcnow()
     counts = {"lapsed": 0, "removed": 0, "failed": 0, "skipped_admin": 0, "would_remove": 0}
+    removed_now: list[tuple[str, int, str]] = []
 
     if not channel_id:
         log.error("remove_lapsed_members: CHANNEL_ID is not set; nobody can be removed.")
@@ -1271,10 +1463,30 @@ async def remove_lapsed_members(
             )
             counts["removed"] += 1
 
+            handle, why = await _removal_reason(session, subscription=subscription, now=now)
+
             # Told why, and told they can come back — the message is not a punishment.
-            await _tell(bot, subscription.user_id, texts.ACCESS_SUSPENDED)
+            reached = await _tell(bot, subscription.user_id, texts.ACCESS_SUSPENDED)
+            if not reached:
+                why += texts.ADMIN_REMOVED_UNREACHABLE
+            removed_now.append((handle, subscription.user_id, why))
 
         await session.commit()
+
+    # **Admins are told who went.** Removal is the one job whose effect a member feels and no
+    # admin could see: it messaged the member, wrote an audit row, and sent nothing to anybody
+    # who could answer the question "why did I lose access?". A member we could not even reach is
+    # marked, because being removed in silence is the case worth a second look.
+    if removed_now:
+        lines = "".join(
+            texts.ADMIN_REMOVED_LINE.format(handle=handle, user_id=user_id, reason=why)
+            for handle, user_id, why in removed_now[:REPORT_LIMIT]
+        )
+        await notify_admins(
+            bot,
+            admin_ids,
+            texts.ADMIN_REMOVED_REPORT.format(count=len(removed_now), members=lines),
+        )
 
     log.info("remove_lapsed_members(enabled=%s): %s", enabled, counts)
     return counts
@@ -2695,6 +2907,7 @@ async def purge_blocked_users(
     bot: Bot,
     *,
     admin_ids: frozenset[int],
+    channel_id: str | None = None,
     probe: bool = False,
     dry_run: bool = False,
     now: datetime | None = None,
@@ -2756,7 +2969,13 @@ async def purge_blocked_users(
 
             counts["blocked"] += 1
             async with session_factory() as session:
-                reason = await _keep_reason(session, telegram_id)
+                reason = await _keep_reason(
+                    session,
+                    telegram_id,
+                    bot=bot,
+                    channel_id=channel_id,
+                    now=now,
+                )
                 if reason is not None:
                     counts["kept_paid"] += 1
                     kept.append(
@@ -2822,13 +3041,33 @@ async def purge_blocked_users(
     return counts
 
 
-async def _keep_reason(session, telegram_id: int) -> str | None:
+async def _keep_reason(
+    session,
+    telegram_id: int,
+    *,
+    bot: Bot | None = None,
+    channel_id: str | None = None,
+    now: datetime | None = None,
+) -> str | None:
     """Why this blocked member must not be deleted, or None if nothing stops it.
 
-    A ``complete`` payment is the main one: those rows are the only record reconcilable against
-    WayForPay (rule 6). Owning a promo campaign is the other — the code outlives whoever typed it,
-    and other members' redemptions point at it.
+    Four reasons, and the last two are about not making somebody invisible:
+
+    * a ``complete`` payment — those rows are the only record reconcilable against WayForPay
+      (rule 6);
+    * owning a promo campaign — the code outlives whoever typed it, and other members'
+      redemptions point at it;
+    * **holding access right now.** A trial or a gifted month has no payment behind it, so the
+      first rule does not catch it. Deleting that row takes away the only thing that knows the
+      member's access should end — and leaves them in the channel for ever;
+    * **being in the channel.** Same failure from the other side: the row is the only record that
+      this person should be removed, and `remove_lapsed_members` works from it. Delete it and they
+      keep the access they blocked the bot to avoid paying for.
+
+    The membership check costs one API call per candidate and is skipped when there is no channel
+    configured.
     """
+    now = now or utcnow()
     paid = await session.scalar(
         select(Payment.id)
         .where(Payment.user_id == telegram_id, Payment.status == PaymentStatus.COMPLETE)
@@ -2841,6 +3080,23 @@ async def _keep_reason(session, telegram_id: int) -> str | None:
     )
     if authored is not None:
         return texts.ADMIN_PURGE_KEPT_PROMO
+
+    expires_at = await session.scalar(
+        select(Subscription.expires_at).where(Subscription.user_id == telegram_id)
+    )
+    if expires_at is not None and expires_at > now:
+        return texts.ADMIN_PURGE_KEPT_ACCESS
+
+    if bot is not None and channel_id:
+        status, error = await _channel_status(bot, channel_id, telegram_id)
+        if error is not None:
+            # Unreadable means kept: a wrong "not a member" here deletes the only record that
+            # somebody should be taken out of the channel.
+            log.warning("Could not check %s's membership (%s); keeping them", telegram_id, error)
+            return texts.ADMIN_PURGE_KEPT_UNKNOWN
+        if status in IN_CHANNEL:
+            return texts.ADMIN_PURGE_KEPT_IN_CHANNEL
+
     return None
 
 

@@ -130,6 +130,7 @@ async def _run(job: str, apply: bool = False, probe: bool = False) -> int:
                 factory,
                 bot,
                 admin_ids=settings.admin_id_set,
+                channel_id=config.channel_id,
                 probe=probe,
                 dry_run=not apply,
             )

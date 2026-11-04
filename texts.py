@@ -58,6 +58,21 @@ def day(value: date | datetime) -> str:
     return value.strftime("%d.%m.%Y")
 
 
+def days_phrase(count: int) -> str:
+    """``3`` -> ``"3 дні"``. Accusative, as required after «через».
+
+    Ukrainian agrees the noun with the numeral, so one hard-coded form is wrong for most values:
+    «через 3 днів» and «через 1 дні» both read as broken software. Same rule as `hours_phrase`.
+    """
+    tail = count % 10
+    teens = 11 <= count % 100 <= 14
+    if tail == 1 and not teens:
+        return f"{count} день"
+    if tail in (2, 3, 4) and not teens:
+        return f"{count} дні"
+    return f"{count} днів"
+
+
 def hours_phrase(count: int) -> str:
     """``24`` -> ``"24 години"``. Accusative, as required after «через».
 
@@ -157,6 +172,16 @@ WELCOME_BACK = "Ви вже зареєстровані. Підписка діє 
 PAY_PROMPT = (
     "Час продовжити підписку на {club}: <b>{amount}</b>.\n\nНатисніть кнопку нижче, щоб оплатити."
 )
+
+#: Appended to every message that carries a pay button. A payment page does not live for ever, and
+#: since 2026-11-04 the bot sends **one** link per period — so a member who opens the message late
+#: needs to know both that the link can go stale and exactly where a fresh one comes from.
+#: Built from `billing.INVOICE_TIMEOUT` (see `billing.pay_link_note`), never written out by hand,
+#: so the promise cannot drift from the `orderTimeout` the gateway was given.
+PAY_LINK_NOTE = (
+    "\n\n<i>Посилання діє {hours}. Якщо воно перестало працювати — надішліть /subscription "
+    "і натисніть «{button}».</i>"
+)
 #: Uses {club} rather than the literal name so the button follows CLUB_NAME if it ever changes.
 #: The sum is not on the button: it is in the message directly above it, and Telegram truncates
 #: long button labels on narrow screens.
@@ -183,6 +208,17 @@ PAYMENT_FIRST_CONFIRMED = (
 )
 
 #: SPEC — reminder one day before the automatic charge.
+#: The earlier of the two warnings: far enough ahead to act on, so it names the date rather than
+#: saying "tomorrow". Policy of 2026-11-04 — reminders a few days before, then one payment link.
+RENEWAL_REMINDER_EARLY = (
+    "Вітаю! Через <b>{days}</b> спливає ваша підписка у Клубі — {until}.\n\n"
+    "Нічого робити не потрібно: списання відбудеться автоматично. "
+    "Перевірте, будь ласка, щоб на картці були кошти."
+)
+
+#: Appended to the manual-payment reminder, so the member knows the deadline and not only the sum.
+RENEWAL_DEADLINE = "\n\nОплатити потрібно до <b>{until}</b>, інакше доступ до каналу закриється."
+
 RENEWAL_REMINDER = (
     "Вітаю! Завтра відбудеться автоматичне списання за продовження вашої підписки у Клубі. "
     "Перевірте, щоб платіжна картка мала достатньо коштів для автоплатежу"
@@ -938,6 +974,24 @@ CANCEL_PENDING_MANUAL = (
     "якщо виникнуть питання, напишіть нам."
 )
 
+#: Who the daily sweep took out of the channel. Removal used to tell the member and nobody else,
+#: so an admin asked "why did I lose access?" with no way to answer.
+ADMIN_REMOVED_REPORT = (
+    "🚪 <b>Доступ закрито</b>\n\nУчасників: {count}\n\n{members}\n"
+    "Усі вони можуть повернутися через /start після оплати."
+)
+#: One line per removed member: who they are, and why. Two lines on screen, because an id alone
+#: answers nothing — the questions that follow are always who, had they paid, were they warned.
+ADMIN_REMOVED_LINE = "• {handle} · id <code>{user_id}</code>\n   {reason}\n"
+ADMIN_REMOVED_UNTIL = "доступ до {until}"
+ADMIN_REMOVED_OVERDUE = "прострочено {overdue}"
+ADMIN_REMOVED_LAST_PAID = "остання оплата {when}"
+ADMIN_REMOVED_NEVER_PAID = "ніколи не платив"
+ADMIN_REMOVED_WARNED = "попереджень доставлено: {count}"
+ADMIN_REMOVED_NOT_WARNED = "⚠️ попередження не доставлені"
+ADMIN_REMOVED_BLOCKED = "бот заблокований"
+ADMIN_REMOVED_UNREACHABLE = " · повідомлення про закриття не доставлено"
+
 # --- the gateway-side monthly schedule -------------------------------------------------------
 
 #: An admin is told when the price WayForPay charges on a schedule stops matching the price this
@@ -1005,16 +1059,20 @@ ADMIN_PURGE_REPORT = (
     "🧹 <b>Щомісячне прибирання</b>\n\n"
     "Заблокували бота: {blocked}\n"
     "Видалено з бази: {purged}\n"
-    "Залишено (мають оплату): {kept}{extra}"
+    "Залишено: {kept}{extra}"
 )
 ADMIN_PURGE_DRY_RUN = "\n\n<i>Пробний запуск — нічого не видалено.</i>"
 ADMIN_PURGE_FAILED = "\n⚠️ Не вдалося опрацювати: {failed}"
 ADMIN_PURGE_KEPT_LINE = "• {handle} · id <code>{user_id}</code> — {reason}\n"
 ADMIN_PURGE_KEPT_PAID = "є підтверджена оплата"
 ADMIN_PURGE_KEPT_PROMO = "створював промокоди"
+ADMIN_PURGE_KEPT_ACCESS = "має активний доступ"
+ADMIN_PURGE_KEPT_IN_CHANNEL = "є в каналі"
+ADMIN_PURGE_KEPT_UNKNOWN = "не вдалося перевірити канал"
 ADMIN_PURGE_KEPT_NOTE = (
-    "\nЦих не видалено: їхні платежі — це єдиний звіт, який можна зіставити з WayForPay. "
-    "Видаліть вручну, якщо вони точно не потрібні."
+    "\nЦих не видалено — причина поруч з кожним. Платежі потрібні для звірки з WayForPay, "
+    "а запис про учасника з доступом або в каналі — це єдине, що знає, коли доступ має "
+    "закінчитися."
 )
 
 # --- the report an admin gets from the daily access sweep ------------------------------------

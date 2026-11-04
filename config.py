@@ -90,8 +90,10 @@ class Settings(BaseSettings):
     subscription_price: Decimal = Decimal("0")
     subscription_currency: str = "UAH"
     subscription_period_days: int = 30
-    #: Days after the due date before an admin is alerted.
-    subscription_grace_days: int = 3
+    #: Days after the due date before access is closed and an admin is alerted. **1** since
+    #: 2026-11-04, the owner's policy: reminders a few days ahead, one payment link when the
+    #: period ends, and the channel closed 24 hours later if nothing was paid.
+    subscription_grace_days: int = 1
 
     # --- Phase 2A: WayForPay ---
     wayforpay_merchant_account: str | None = None
