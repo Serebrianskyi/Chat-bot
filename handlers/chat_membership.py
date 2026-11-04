@@ -19,9 +19,11 @@ import logging
 
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatMemberStatus, ChatType
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import ChatMemberUpdated, Message
 
 import texts
+from config import Settings
 from services import users
 from services.billing import notify_admins
 
@@ -155,10 +157,44 @@ async def handle_channel_post(message: Message, bot: Bot, admin_ids: frozenset[i
 _reported: set[int] = set()
 
 
+async def tidy_membership_notice(message: Message, bot: Bot, settings: Settings) -> None:
+    """Delete Telegram's own «X вилучено / X приєднався» notice from the community chat.
+
+    Removal works by banning and immediately unbanning (a channel has no kick), and in a
+    supergroup each of those posts a service message — so a morning's sweep leaves a column of
+    "removed" notices in the chat everybody reads. The members' own business, announced to the
+    whole club by the platform rather than by us.
+
+    Only in the configured community chat, and only for messages that are **nothing but** a
+    membership notice: the filter requires `left_chat_member` or `new_chat_member`, so no post
+    anybody wrote can match. Needs the bot's *Delete messages* right; without it Telegram refuses
+    and the notice simply stays, which is logged and nothing more.
+
+    A broadcast channel does not generate these at all, so this is inert there — it costs nothing
+    and covers the case where the community is (or becomes) a supergroup.
+    """
+    if not settings.channel_id or str(message.chat.id) != str(settings.channel_id):
+        return
+    try:
+        await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
+    except TelegramBadRequest as exc:
+        # Older than 48 hours, already gone, or no delete right. Not worth an admin alert: the
+        # notice is noise, and failing to remove noise is not a failure anybody must act on.
+        log.warning("Could not delete the membership notice in %s: %s", message.chat.id, exc)
+    except Exception:
+        log.exception("Could not delete the membership notice in %s", message.chat.id)
+
+
 def build_router() -> Router:
     router = Router(name="chat-membership")
     router.my_chat_member.register(handle_my_chat_member)
     # A forward carries forward_origin; F.forward_origin keeps ordinary DMs out of this handler.
     router.message.register(handle_forwarded_from_chat, F.forward_origin)
     router.channel_post.register(handle_channel_post)
+
+    # Service messages only — `left_chat_member` / `new_chat_member` are present on nothing else.
+    # Registered for both update kinds because the community may be a supergroup or a channel.
+    notice = F.left_chat_member | F.new_chat_member
+    router.message.register(tidy_membership_notice, notice)
+    router.channel_post.register(tidy_membership_notice, notice)
     return router

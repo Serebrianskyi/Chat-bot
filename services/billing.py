@@ -51,6 +51,12 @@ log = logging.getLogger(__name__)
 #: How long an unpaid invoice stays worth polling before it is written off as abandoned.
 INVOICE_TIMEOUT = timedelta(hours=24)
 
+#: The shortest believable gap between two charges of one subscription. A monthly schedule cannot
+#: bill twice inside a period, so a "second charge" arriving sooner is a repeat notification —
+#: whatever its `authCode` says. Deliberately well under a period, so a member who pays early and
+#: then renews is not refused.
+MIN_GAP_BETWEEN_CHARGES = timedelta(days=20)
+
 #: How long a fresh order is asked about on **every** poll run. Somebody who is going to pay does
 #: it within minutes of tapping the button, and those minutes are when a fast answer matters: the
 #: member is still looking at their phone waiting for the channel link.
@@ -680,6 +686,23 @@ async def poll_open_payments(
                 counts["waiting"] += 1
                 continue
 
+            # **Lock the row and look again.** The callback and this job answer the same question
+            # about the same money, and on 2026-11-04 they answered it at the same moment: both
+            # read one payment as unpaid, both extended the period, both marked it complete. One
+            # receipt, two periods (member 468623791, expires_at pushed to 31.12). The
+            # `status is COMPLETE` guard cannot help, because neither transaction had committed
+            # when the other read the row. `FOR UPDATE` makes the second one wait and then see
+            # the truth. SQLite has no row locks and ignores this, which is why the suite cannot
+            # reproduce the race — PostgreSQL is what runs in production.
+            await session.refresh(payment, with_for_update=True)
+            if payment.status is PaymentStatus.COMPLETE:
+                log.info(
+                    "Order %s was settled by the callback while this run was in flight",
+                    payment.order_reference,
+                )
+                counts["waiting"] += 1
+                continue
+
             counts["checked"] += 1
             try:
                 result = await client.check_status(order_reference=gateway_reference(payment))
@@ -709,6 +732,7 @@ async def poll_open_payments(
                 reason_code=result.reason_code,
                 rec_token=result.rec_token,
                 raw=result.raw,
+                charge_key=result.charge_key,
                 now=now,
             )
 
@@ -1598,6 +1622,7 @@ async def reconcile_written_off(
                 reason_code=result.reason_code,
                 rec_token=result.rec_token,
                 raw=result.raw,
+                charge_key=result.charge_key,
                 now=now,
             )
             if not extended:
@@ -2259,6 +2284,10 @@ async def process_callback(
             session, result=result, admin_ids=admin_ids, bot=bot, now=now
         )
         if payment is None:
+            # Committed even though nothing is being applied: the resolver may have backfilled a
+            # charge identity onto the settled row, which is what makes the *next* notification
+            # recognisable. Dropping it would leave the same hole open for ever.
+            await session.commit()
             return False
 
         # Keep the gateway's own order number on the row even for a first payment: a schedule
@@ -2281,6 +2310,7 @@ async def process_callback(
             rec_token=result.rec_token,
             reason_code=result.reason_code,
             raw=result.raw,
+            charge_key=result.charge_key,
             now=now,
         )
         if extended:
@@ -2722,8 +2752,11 @@ async def _payment_for_callback(
     Anything else is reported to an admin rather than dropped: a signed notification about money
     we cannot place is exactly the thing that must not pass quietly.
     """
+    # `with_for_update`: the poller may be holding this same row in another transaction, and
+    # whoever gets here second must see the other's result rather than a stale "unpaid" (see
+    # `poll_open_payments`).
     existing = await session.scalar(
-        select(Payment).where(Payment.order_reference == result.order_reference)
+        select(Payment).where(Payment.order_reference == result.order_reference).with_for_update()
     )
     if existing is None:
         existing = await session.scalar(
@@ -2752,6 +2785,36 @@ async def _payment_for_callback(
         )
         if already is not None:
             log.info("Callback repeats charge %s, already stored", result.charge_key)
+            return None
+
+        # **An unknown identity is not a different charge.** A settled row with no `charge_key`
+        # predates the column or was settled by a path that did not record one, and the far more
+        # likely reading of a notification about it is "the same money, told to us twice" — which
+        # is what WayForPay does until the callback is acknowledged. Reading it as next month's
+        # charge credited two periods for one receipt (2026-11-04). The key is backfilled so the
+        # next notification is recognised properly.
+        if existing.charge_key is None:
+            log.warning(
+                "Callback for settled order %s carried charge %s and the row had none; "
+                "treating it as the same charge and recording the key",
+                result.order_reference,
+                result.charge_key,
+            )
+            existing.charge_key = result.charge_key
+            return None
+
+        # **A schedule cannot charge the same subscription twice inside one period.** Anything
+        # sooner is a repeat however the identities compare, and crediting it would hand out a
+        # period nobody paid for.
+        settled = existing.settled_at or existing.created_at
+        if now - settled < MIN_GAP_BETWEEN_CHARGES:
+            log.error(
+                "Refusing a second charge for %s only %s after the last one (%s): too soon to be "
+                "a renewal",
+                result.order_reference,
+                now - settled,
+                result.charge_key,
+            )
             return None
         log.warning(
             "Order %s reports a second charge (%s): the schedule reuses the original "

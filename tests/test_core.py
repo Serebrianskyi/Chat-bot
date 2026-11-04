@@ -644,7 +644,7 @@ class FakeGateway:
         return self.charge_result
 
 
-def approved(order_ref, amount=REGULAR_PRICE, currency=CURRENCY):
+def approved(order_ref, amount=REGULAR_PRICE, currency=CURRENCY, charge_key=None):
     from services.wayforpay import TransactionStatus
 
     return TransactionStatus(
@@ -655,6 +655,10 @@ def approved(order_ref, amount=REGULAR_PRICE, currency=CURRENCY):
         currency=currency,
         reason_code="1100",
         rec_token="tok",  # noqa: S106
+        # Defaults to None, which is the shape a CHECK_STATUS answer had before 2026-11-04 — the
+        # row it settled carried no charge identity, and a later callback misread that as a
+        # different charge.
+        charge_key=charge_key,
         raw={"transactionStatus": "Approved"},
     )
 
@@ -4434,3 +4438,208 @@ async def test_an_old_unpaid_order_is_polled_less_often(session_factory, bot, co
     # Hours old and not checked for eleven minutes: asked again.
     assert (await poll(timedelta(hours=4), timedelta(minutes=11)))["checked"] == 1
     assert POLL_EAGER_FOR == timedelta(minutes=15)
+
+
+async def test_the_poller_and_the_callback_cannot_both_credit_one_charge(
+    session_factory, bot, config, in_community
+):
+    """Found in production on 2026-11-04: a member paid once on 01.11 and held access to 31.12.
+
+    The poller answers first — within a minute — and used to settle the row without recording the
+    charge's identity. The gateway's callback for the **same** money then arrived, found a settled
+    row whose `charge_key` was NULL, compared it with the real `authCode`, concluded this was next
+    month's charge under the same order reference, and extended the period a second time. One
+    receipt at WayForPay, two periods in the database.
+    """
+    from services.billing import poll_open_payments, process_callback
+    from services.wayforpay import TransactionStatus, charge_key, map_status
+
+    class Client:
+        def read_callback(self, payload):
+            return TransactionStatus(
+                order_reference=payload["orderReference"],
+                status=map_status(payload["transactionStatus"]),
+                gateway_status=payload["transactionStatus"],
+                amount=Decimal(payload["amount"]),
+                currency=payload["currency"],
+                reason_code="1100",
+                rec_token=None,
+                charge_key=charge_key(payload),
+                raw=payload,
+            )
+
+    await seed_due(session_factory)
+    in_community()
+    gw = FakeGateway()
+    await process_due_subscriptions(
+        session_factory, gw, bot, admin_ids=frozenset({ADMIN_ID}), config=config, now=NOW
+    )
+    reference = (await one_payment(session_factory)).order_reference
+
+    # 1. The poller gets there first, as it does in production.
+    gw.status_result = approved(reference)
+    await poll_open_payments(
+        session_factory, gw, bot, config=config, admin_ids=frozenset({ADMIN_ID}), now=NOW
+    )
+    after_poll = (await load_sub(session_factory)).expires_at
+
+    # 2. The callback for that same payment lands a moment later.
+    granted = await process_callback(
+        session_factory,
+        bot,
+        client=Client(),
+        payload={
+            "orderReference": reference,
+            "transactionStatus": "Approved",
+            "amount": str(REGULAR_PRICE),
+            "currency": CURRENCY,
+            "authCode": "740620",
+            "processingDate": "1793531425",
+        },
+        admin_ids=frozenset({ADMIN_ID}),
+        config=config,
+        now=NOW + timedelta(seconds=30),
+    )
+
+    assert granted is False, "one receipt must not buy two periods"
+    assert (await load_sub(session_factory)).expires_at == after_poll
+    async with session_factory() as session:
+        rows = list(await session.scalars(select(Payment).where(Payment.user_id == USER_ID)))
+    assert len(rows) == 1, "a repeat notification must not mint a second payment row"
+    # And the identity is recorded now, so the next notification is recognised on its own terms.
+    assert rows[0].charge_key == "740620"
+
+    # 3. A notification with a **different** code, half a minute later. The keys now differ
+    # honestly, so only the gap guard stands between one receipt and a free period: a monthly
+    # schedule cannot bill the same subscription twice inside a period.
+    assert (
+        await process_callback(
+            session_factory,
+            bot,
+            client=Client(),
+            payload={
+                "orderReference": reference,
+                "transactionStatus": "Approved",
+                "amount": str(REGULAR_PRICE),
+                "currency": CURRENCY,
+                "authCode": "999999",
+                "processingDate": "1793531999",
+            },
+            admin_ids=frozenset({ADMIN_ID}),
+            config=config,
+            now=NOW + timedelta(minutes=1),
+        )
+        is False
+    )
+    assert (await load_sub(session_factory)).expires_at == after_poll
+
+    # 4. And the poller records the identity itself from CHECK_STATUS, which is what stops this
+    # happening to the next member: the row it settles no longer has a NULL key for a callback
+    # to misread.
+    async with session_factory() as session:
+        sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
+        session.add(
+            Payment(
+                user_id=USER_ID,
+                subscription_id=sub.id,
+                order_reference="sub-second-period",
+                amount=REGULAR_PRICE,
+                currency=CURRENCY,
+                status=PaymentStatus.PENDING_PAYMENT,
+                created_at=NOW + timedelta(days=30),
+            )
+        )
+        await session.commit()
+    gw.status_result = approved("sub-second-period", charge_key="poll-740621")
+    await poll_open_payments(
+        session_factory,
+        gw,
+        bot,
+        config=config,
+        admin_ids=frozenset({ADMIN_ID}),
+        now=NOW + timedelta(days=30),
+    )
+    async with session_factory() as session:
+        settled = await session.scalar(
+            select(Payment).where(Payment.order_reference == "sub-second-period")
+        )
+    assert settled.charge_key == "poll-740621", "a poller-settled row must carry its identity"
+
+
+def test_the_payment_row_is_locked_before_it_is_settled():
+    """2026-11-04: the callback and the poller settled one payment simultaneously — both read it
+    as unpaid, both extended the period, both marked it complete. One receipt, two periods.
+
+    SQLite has no row locks, so the race itself cannot be reproduced here. What can be checked is
+    that the statement really asks PostgreSQL for one: the fix is a single `FOR UPDATE` and a
+    silent regression would be invisible otherwise.
+    """
+    from sqlalchemy.dialects import postgresql
+
+    from db.models import Payment
+
+    locked = (select(Payment).where(Payment.order_reference == "x").with_for_update()).compile(
+        dialect=postgresql.dialect()
+    )
+    assert "FOR UPDATE" in str(locked)
+
+    # And the lookup in the callback path is built that way — compiled from the source, so
+    # deleting `.with_for_update()` there fails this.
+    import inspect
+
+    from services import billing
+
+    source = inspect.getsource(billing._payment_for_callback)
+    assert ".with_for_update()" in source, "the callback must lock the row it found"
+    assert "with_for_update=True" in inspect.getsource(billing.poll_open_payments), (
+        "the poller must re-read the row under a lock"
+    )
+
+
+async def test_the_bot_tidies_its_own_removal_notices(dispatcher, bot, recording_session):
+    """Removal bans then immediately unbans (a channel has no kick), and in a supergroup each of
+    those posts a service message — so a morning's sweep leaves a column of «X вилучено» notices
+    in the chat everybody reads.
+
+    Only in the configured community chat, and only for messages that are nothing but a membership
+    notice: a post somebody wrote can never match.
+    """
+    from aiogram.methods import DeleteMessage
+    from aiogram.types import Chat, Message, Update
+
+    def notice(chat_id, update_id):
+        return Update(
+            update_id=update_id,
+            message=Message(
+                message_id=update_id,
+                date=utcnow_for_test(),
+                chat=Chat(id=int(chat_id), type="supergroup"),
+                left_chat_member=make_user(USER_ID, username="gone"),
+            ),
+        )
+
+    await dispatcher.feed_update(bot, notice(CHANNEL_ID, 1))
+    deleted = [c for c in recording_session.calls if isinstance(c, DeleteMessage)]
+    assert len(deleted) == 1
+    assert deleted[0].message_id == 1
+
+    # Another chat's notices are none of our business.
+    await dispatcher.feed_update(bot, notice(-100999, 2))
+    assert len(
+        [c for c in recording_session.calls if isinstance(c, DeleteMessage)]
+    ) == 1, "only the community chat is tidied"
+
+    # And an ordinary post is never touched.
+    await dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=3,
+            channel_post=Message(
+                message_id=3,
+                date=utcnow_for_test(),
+                chat=Chat(id=int(CHANNEL_ID), type="channel"),
+                text="Привіт, клуб!",
+            ),
+        ),
+    )
+    assert len([c for c in recording_session.calls if isinstance(c, DeleteMessage)]) == 1

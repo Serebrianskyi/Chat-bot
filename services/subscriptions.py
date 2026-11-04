@@ -161,6 +161,7 @@ async def apply_payment_result(
     rec_token: str | None,
     raw: dict,
     now: datetime,
+    charge_key: str | None = None,
 ) -> bool:
     """Record a gateway result and extend access if it is a confirmed payment.
 
@@ -177,6 +178,14 @@ async def apply_payment_result(
     payment.wayforpay_status = gateway_status
     payment.reason_code = reason_code
     payment.raw_response = raw
+
+    # **The charge identity is stored on every path, not only the callback.** `CHECK_STATUS`
+    # carries the same `authCode`, and the poller usually answers first — so a row settled by the
+    # poller used to keep `charge_key = NULL`. A later callback about that same charge then
+    # compared NULL against the real code, decided they differed, and credited a second period
+    # for one receipt (found 2026-11-04: a member paid on 01.11 and held access to 31.12).
+    if charge_key and payment.charge_key is None:
+        payment.charge_key = charge_key
 
     # Captured from **any** body that carries one, before every other decision. It used to be
     # stored only on the transition to COMPLETE, which threw the token away if it arrived in a
