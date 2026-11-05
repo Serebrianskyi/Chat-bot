@@ -114,6 +114,19 @@ class User(Base):
         default=UserRole.USER,
     )
     is_blocked_bot: Mapped[bool] = mapped_column(default=False)
+
+    # --- Meta Ads attribution (services/meta.py) ---------------------------------------------
+    #
+    # `fbclid` is what Meta appends to an ad's deep link; the bot reads it from the `/start`
+    # payload. Kept with the moment it arrived, because Meta's `fbc` parameter is
+    # "fb.1.<click time in ms>.<fbclid>" and a Purchase reported a month later must still carry
+    # the original click, not the clock at send time.
+    fb_click_id: Mapped[str | None] = mapped_column(String(255), default=None)
+    fb_clicked_at: Mapped[datetime | None] = mapped_column(UtcDateTime, default=None)
+    #: When a `Lead` was reported for them, so a second `/start` does not report it twice. Meta
+    #: deduplicates on `event_id` as well; this saves the request.
+    fb_lead_sent_at: Mapped[datetime | None] = mapped_column(UtcDateTime, default=None)
+
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
 
     def __repr__(self) -> str:

@@ -142,6 +142,22 @@ class Settings(BaseSettings):
     # Give it an offset. Without one it is read as UTC, which in Kyiv winter is two hours early.
     free_period_until: datetime | None = None
 
+    # --- Meta Ads conversions (services/meta.py) ---
+    #
+    # Both are needed or the feature is off: `build_meta_client` returns None and nothing is
+    # reported. A Pixel cannot work inside Telegram — there is no browser — so ad optimisation
+    # depends on these server-side events.
+    #
+    # Dataset (Pixel) ID and a Conversions API token from Meta Events Manager → Settings.
+    meta_pixel_id: str | None = None
+    #: SecretStr for the same reason as the others: it posts on behalf of the ad account.
+    meta_access_token: SecretStr | None = None
+
+    # Events Manager → Test Events → the code shown there. While it is set, events land in that
+    # tab within seconds and are kept **out of** the dataset's real numbers — which is how this
+    # gets verified without polluting a live campaign. Unset it once you have seen them arrive.
+    meta_test_event_code: str | None = None
+
     # Display time zone. Storage is always UTC — see CLAUDE.md rule 1.
     display_timezone: str = "Europe/Kyiv"
 

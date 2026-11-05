@@ -290,6 +290,9 @@ All of these live in `.env` locally and in platform environment variables in pro
 | `WAYFORPAY_MERCHANT_PASSWORD` | optional | 32-char credential from WayForPay (sales@wayforpay.com) for `regularApi`. Without it a monthly schedule cannot be cancelled from the bot |
 | `ENABLE_HOURLY_JOBS` | optional | Run the due-date sweep and renewal reminder hourly instead of daily at 09:00/09:30, to watch the messages without waiting a day. Removal and the purge are unaffected |
 | `AUTO_RENEW_ENABLED` | optional | Payment links also set up a monthly schedule at WayForPay. **Defaults to true**; inert unless `MODE=webhook` with a `BASE_URL` |
+| `META_PIXEL_ID` | optional | Meta Dataset/Pixel ID for ad conversion reporting. Off when unset |
+| `META_ACCESS_TOKEN` | optional | Conversions API token from Meta Events Manager. Never logged |
+| `META_TEST_EVENT_CODE` | optional | Events Manager → Test Events code. While set, events are visible there in seconds and kept out of the real figures |
 | `MODE` | Phase 4 | `polling` (dev) or `webhook` (prod) |
 | `BASE_URL` | Phase 4 | Public HTTPS base used to register the webhook |
 | `WEBHOOK_SECRET` | Phase 4 | Matched against `X-Telegram-Bot-Api-Secret-Token` |

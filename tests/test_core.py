@@ -4625,9 +4625,9 @@ async def test_the_bot_tidies_its_own_removal_notices(dispatcher, bot, recording
 
     # Another chat's notices are none of our business.
     await dispatcher.feed_update(bot, notice(-100999, 2))
-    assert len(
-        [c for c in recording_session.calls if isinstance(c, DeleteMessage)]
-    ) == 1, "only the community chat is tidied"
+    assert len([c for c in recording_session.calls if isinstance(c, DeleteMessage)]) == 1, (
+        "only the community chat is tidied"
+    )
 
     # And an ordinary post is never touched.
     await dispatcher.feed_update(
@@ -4643,3 +4643,131 @@ async def test_the_bot_tidies_its_own_removal_notices(dispatcher, bot, recording
         ),
     )
     assert len([c for c in recording_session.calls if isinstance(c, DeleteMessage)]) == 1
+
+
+async def test_an_ad_click_is_captured_and_reported_to_meta(session_factory, bot, dispatcher):
+    """Meta Ads appends `fbclid` to the ad's deep link and Telegram hands it over as the /start
+    payload. Without storing it, a payment weeks later cannot be attributed to the campaign that
+    paid for it — and a Pixel cannot help, because there is no browser inside Telegram.
+    """
+    from db.models import User
+    from services.meta import MetaConversions, click_id, hashed
+
+    sent: list[dict] = []
+
+    class Recorder(MetaConversions):
+        async def send(self, **kwargs):
+            sent.append(kwargs)
+            return True
+
+    recorder = Recorder(pixel_id="PX", access_token="tok")  # noqa: S106
+    dispatcher.workflow_data["meta"] = recorder
+
+    user = make_user(USER_ID, username="fromads")
+    await dispatcher.feed_update(bot, make_message(user, "/start fbclid_IwAR0123456789abcdef", 1))
+
+    async with session_factory() as session:
+        row = await session.get(User, USER_ID)
+    assert row.fb_click_id == "IwAR0123456789abcdef"
+    assert row.fb_clicked_at is not None
+    assert row.fb_lead_sent_at is not None, "a reported lead must be remembered"
+
+    assert len(sent) == 1
+    lead = sent[0]
+    assert lead["event_name"] == "Lead"
+    assert lead["event_id"] == f"lead-{USER_ID}"
+    assert lead["fbc"] == click_id(
+        "IwAR0123456789abcdef", clicked_at_ms=int(row.fb_clicked_at.timestamp() * 1000)
+    )
+
+    # A second /start reports nothing: one lead per member, whatever they tap.
+    await dispatcher.feed_update(bot, make_message(user, "/start", 2))
+    assert len(sent) == 1
+
+    # The payload hashes the id and never carries it in the clear.
+    body = recorder.payload(event_name="Lead", telegram_id=USER_ID, event_time=1, event_id="lead-1")
+    assert body["data"][0]["user_data"]["external_id"] == [hashed(str(USER_ID))]
+    assert str(USER_ID) not in str(body["data"][0]["user_data"])
+
+    # No test code unless one is configured: a stray one would silently keep every real
+    # conversion out of the dataset's figures — a feature that fails by being invisible.
+    assert "test_event_code" not in body
+    checking = MetaConversions(
+        pixel_id="PX",
+        access_token="tok",  # noqa: S106
+        test_event_code="TEST12345",
+    )
+    probe = checking.payload(
+        event_name="Lead", telegram_id=USER_ID, event_time=1, event_id="lead-1"
+    )
+    assert probe["test_event_code"] == "TEST12345"
+
+
+async def test_a_confirmed_payment_reports_its_real_value(session_factory, bot, config):
+    """Every payment — first or renewal — is a `Purchase` with the sum actually charged, which is
+    what makes a campaign's return measurable past the first month.
+
+    `event_id` is the order reference, so the callback and the poller confirming the same money
+    cannot count it twice.
+    """
+    from db.models import Payment, PaymentStatus, utcnow
+    from services.billing import announce_confirmed_payment
+    from services.meta import MetaConversions
+
+    sent: list[dict] = []
+
+    class Recorder(MetaConversions):
+        async def send(self, **kwargs):
+            sent.append(kwargs)
+            return True
+
+    await seed_member(session_factory)
+    async with session_factory() as session:
+        sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
+        payment = Payment(
+            user_id=USER_ID,
+            subscription_id=sub.id,
+            order_reference="sub-meta-1",
+            amount=Decimal("8.40"),
+            currency="EUR",
+            status=PaymentStatus.COMPLETE,
+            created_at=utcnow(),
+            settled_at=utcnow(),
+        )
+        session.add(payment)
+        await session.commit()
+        await announce_confirmed_payment(
+            session,
+            bot,
+            payment=payment,
+            admin_ids=frozenset({ADMIN_ID}),
+            config=config,
+            now=utcnow(),
+            meta=Recorder(pixel_id="PX", access_token="tok"),  # noqa: S106
+        )
+
+    assert len(sent) == 1
+    purchase = sent[0]
+    assert purchase["event_name"] == "Purchase"
+    assert purchase["event_id"] == "purchase-sub-meta-1"
+    assert purchase["value"] == Decimal("8.40")
+    assert purchase["currency"] == "EUR"
+
+    # A Meta outage cannot touch the member: the announcement still ran.
+    class Broken(MetaConversions):
+        async def send(self, **kwargs):
+            raise RuntimeError("Meta is down")
+
+    async with session_factory() as session:
+        payment = await session.scalar(
+            select(Payment).where(Payment.order_reference == "sub-meta-1")
+        )
+        await announce_confirmed_payment(
+            session,
+            bot,
+            payment=payment,
+            admin_ids=frozenset({ADMIN_ID}),
+            config=config,
+            now=utcnow(),
+            meta=Broken(pixel_id="PX", access_token="tok"),  # noqa: S106
+        )

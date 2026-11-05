@@ -17,7 +17,7 @@ import logging
 
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatMemberStatus
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandObject, CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -27,7 +27,9 @@ from db.models import utcnow
 from handlers import admin, subscription
 from services import billing
 from services import discounts as discount_service
+from services import meta as meta_service
 from services.billing import BillingConfig
+from services.meta import MetaConversions
 from services.subscriptions import ensure_subscription
 from services.users import upsert_user
 from services.wayforpay import WayForPayClient
@@ -128,8 +130,10 @@ async def handle_start(
     session: AsyncSession,
     settings: Settings,
     admin_ids: frozenset[int],
+    command: CommandObject | None = None,
     wayforpay: WayForPayClient | None = None,
     billing_config: BillingConfig | None = None,
+    meta: MetaConversions | None = None,
 ) -> None:
     """Register the sender, price them, and tell them what they owe.
 
@@ -150,6 +154,21 @@ async def handle_start(
         first_name=message.from_user.first_name,
         is_admin=telegram_id in admin_ids,
     )
+
+    # Meta Ads appends `fbclid` to the ad's deep link — t.me/bot?start=fbclid_XXXX — and Telegram
+    # hands it over as the /start payload. Read before anything else can fail, stored once, and
+    # reported as a `Lead`. Wrapped because ad reporting must never be the reason onboarding
+    # breaks: the member is here to join a club, not to be measured.
+    try:
+        await meta_service.report_lead(
+            session,
+            meta,
+            telegram_id=telegram_id,
+            fbclid=_ad_click(command),
+            now=now,
+        )
+    except Exception:
+        log.exception("Could not report the lead for %s", telegram_id)
 
     in_community = await is_in_community(bot, settings.channel_id, telegram_id)
 
@@ -274,6 +293,23 @@ async def handle_start(
         reply_markup=member_keyboard(is_admin, pay_url=payment.invoice_url),
     )
     log.info("Invoiced %s at /start: %s %s", telegram_id, payment.amount, payment.currency)
+
+
+def _ad_click(command: CommandObject | None) -> str | None:
+    """The `fbclid` out of a `/start` payload, or None.
+
+    Meta's own links read `?start=fbclid_IwAR0...`, so the prefix is stripped when present; a bare
+    payload is taken as the id itself, because a campaign can be set up either way. Anything that
+    is plainly not a click id — a referral code, a promo — is ignored rather than stored as one.
+    """
+    payload = (command.args or "").strip() if command else ""
+    if not payload:
+        return None
+    for prefix in ("fbclid_", "fbclid-", "fbclid="):
+        if payload.lower().startswith(prefix):
+            return payload[len(prefix) :] or None
+    # Meta's click ids are long and opaque; a short human-typed payload is something else.
+    return payload if len(payload) >= 20 else None
 
 
 def build_router() -> Router:

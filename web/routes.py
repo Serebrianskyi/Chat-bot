@@ -36,6 +36,7 @@ from config import Settings
 from db.models import utcnow
 from services import billing
 from services.billing import BillingConfig
+from services.meta import MetaConversions
 from services.wayforpay import SignatureMismatch, WayForPayClient, callback_reply
 
 log = logging.getLogger(__name__)
@@ -59,6 +60,7 @@ def create_app(
     session_factory: async_sessionmaker,
     wayforpay: WayForPayClient | None,
     billing_config: BillingConfig,
+    meta: "MetaConversions | None" = None,
 ) -> FastAPI:
     """Build the app. Everything it needs is passed in, nothing is looked up.
 
@@ -135,6 +137,9 @@ def create_app(
                 payload=payload,
                 admin_ids=settings.admin_id_set,
                 config=billing_config,
+                # Ad conversions. None unless Meta is configured; a failure there is logged and
+                # never reaches the acknowledgement the gateway is waiting for.
+                meta=meta,
             )
         except SignatureMismatch:
             log.error("Payment callback failed signature verification; refusing it")

@@ -40,9 +40,11 @@ from db.models import (
     utcnow,
 )
 from services import discounts as discount_service
+from services import meta as meta_service
 from services import promos, users
 from services import subscriptions as subs
 from services.audit import Action, record_action
+from services.meta import MetaConversions
 from services.pricing import extend
 from services.wayforpay import RegularPayment, WayForPayClient, WayForPayError
 
@@ -592,6 +594,7 @@ async def announce_confirmed_payment(
     config: BillingConfig,
     now: datetime,
     send_invite: bool = True,
+    meta: "MetaConversions | None" = None,
 ) -> None:
     """Tell a member their payment landed, and get them into the channel.
 
@@ -625,6 +628,22 @@ async def announce_confirmed_payment(
         except TelegramForbiddenError:
             log.warning("Paid but unreachable: %s", subscription.user_id)
 
+        # Ad attribution, after the member has been told and before the invite: a Meta outage
+        # must not sit between a payment and the channel link. Every renewal counts as a purchase,
+        # which is what makes a campaign's return measurable past the first month.
+        try:
+            await meta_service.report_purchase(
+                session,
+                meta,
+                telegram_id=subscription.user_id,
+                order_reference=payment.order_reference,
+                amount=payment.amount,
+                currency=payment.currency,
+                now=now,
+            )
+        except Exception:
+            log.exception("Could not report the purchase for %s", payment.order_reference)
+
         if send_invite:
             await deliver_invite(
                 session,
@@ -645,6 +664,7 @@ async def poll_open_payments(
     *,
     config: BillingConfig,
     admin_ids: frozenset[int] = frozenset(),
+    meta: MetaConversions | None = None,
     now: datetime | None = None,
 ) -> dict[str, int]:
     """Ask WayForPay about every invoice that has not settled yet.
@@ -745,6 +765,7 @@ async def poll_open_payments(
                     admin_ids=admin_ids,
                     config=config,
                     now=now,
+                    meta=meta,
                 )
             elif payment.status is PaymentStatus.DENIED:
                 counts["failed"] += 1
@@ -2256,6 +2277,7 @@ async def process_callback(
     payload: dict,
     admin_ids: frozenset[int],
     config: BillingConfig,
+    meta: MetaConversions | None = None,
     now: datetime | None = None,
 ) -> bool:
     """Apply a ``serviceUrl`` notification. True when it granted a period.
@@ -2324,6 +2346,7 @@ async def process_callback(
                 admin_ids=admin_ids,
                 config=config,
                 now=now,
+                meta=meta,
                 send_invite=await _needs_invite(
                     bot, payment=payment, config=config, subscription_id=payment.subscription_id
                 ),

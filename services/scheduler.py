@@ -120,6 +120,29 @@ def _warn_if_renewal_is_inert(settings: Settings) -> None:
         )
 
 
+def build_meta_client(settings: Settings):
+    """The Meta Conversions client, or None when it is not configured.
+
+    None rather than raising, like the payment client: ad reporting is the least important thing
+    this bot does and must never be a reason it cannot start.
+    """
+    if not settings.meta_pixel_id or settings.meta_access_token is None:
+        return None
+    from services.meta import MetaConversions
+
+    if settings.meta_test_event_code:
+        log.warning(
+            "META_TEST_EVENT_CODE is set: conversions go to Events Manager → Test Events and are "
+            "NOT counted in the dataset. Unset it when the check is done."
+        )
+    return MetaConversions(
+        pixel_id=settings.meta_pixel_id,
+        # Unwrapped at the single point of use and never stored anywhere else.
+        access_token=settings.meta_access_token.get_secret_value(),
+        test_event_code=settings.meta_test_event_code,
+    )
+
+
 def build_billing_config(settings: Settings) -> BillingConfig:
     from datetime import timedelta
 
@@ -179,6 +202,8 @@ def start_scheduler(
     admin_ids = settings.admin_id_set
     scheduler = AsyncIOScheduler(timezone=settings.display_timezone)
 
+    meta = build_meta_client(settings)
+
     scheduler.add_job(
         poll_open_payments,
         "interval",
@@ -188,6 +213,9 @@ def start_scheduler(
             "session_factory": session_factory,
             "client": client,
             "bot": bot,
+            # Ad conversions, reported from wherever a payment is confirmed. None when Meta is
+            # not configured, which is the ordinary case.
+            "meta": meta,
             "config": config,
             # Needed so an invite failure can be escalated rather than lost.
             "admin_ids": admin_ids,

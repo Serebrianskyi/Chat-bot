@@ -28,6 +28,7 @@ from services.commands import register_commands
 from services.scheduler import (
     build_billing_config,
     build_client,
+    build_meta_client,
     start_scheduler,
 )
 from services.wayforpay import WayForPayClient
@@ -64,6 +65,9 @@ def build_dispatcher(
         admin_ids=settings.admin_id_set,
         settings=settings,
         wayforpay=wayforpay,
+        # Ad conversions: handlers report `Lead` from /start. None unless Meta is configured, and
+        # every call site treats None as "do not report" rather than an error.
+        meta=build_meta_client(settings),
         billing_config=billing_config or build_billing_config(settings),
         # A broadcast outlives the one-session-per-update contract: it opens a session per
         # recipient so one failed invoice cannot roll back the others. It therefore needs the
@@ -209,6 +213,7 @@ async def run_webhook(settings: Settings, engine: AsyncEngine) -> None:
             session_factory=session_factory,
             wayforpay=wayforpay,
             billing_config=billing_config,
+            meta=build_meta_client(settings),
         )
         scheduler = start_scheduler(settings=settings, session_factory=session_factory, bot=bot)
         try:
