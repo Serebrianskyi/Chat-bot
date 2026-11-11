@@ -157,13 +157,7 @@ def pay_link_note(timeout: timedelta = INVOICE_TIMEOUT) -> str:
 
 def _pay_keyboard(invoice_url: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=texts.PAY_BUTTON.format(club=texts.CLUB_NAME), url=invoice_url
-                )
-            ]
-        ]
+        inline_keyboard=[[InlineKeyboardButton(text=texts.PAY_BUTTON, url=invoice_url)]]
     )
 
 

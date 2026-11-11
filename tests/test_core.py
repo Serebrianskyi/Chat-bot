@@ -233,17 +233,27 @@ async def test_start_registers_once_and_invoices_a_paying_joiner(
     assert fake_wayforpay.purchase_calls[0]["recurring"] is True
     assert fake_wayforpay.purchase_calls[0]["regular_amount"] == REGULAR_PRICE
 
-    # The first /start sends two messages, not three: the club pitch, then the tariff carrying
-    # the pay button. The button used to arrive in a message of its own headed "time to renew",
-    # which made no sense for somebody who had just joined. The second /start adds one more
-    # message: the tariff again, with a live button, because they still owe money. It used to
-    # be a bare "already registered" greeting with no price and no way to pay.
+    # **One message** per /start since 2026-11-11: the owner's welcome carries the price itself,
+    # so there is nothing left to split off. It used to be two — the pitch, then the tariff with
+    # the pay button — because the pitch had no buttons of its own. The second /start adds one
+    # more: the price again with a live button, because they still owe money, where it once sent
+    # a bare "already registered" with no price and no way to pay.
     sent = recording_session.of_type("SendMessage")
-    assert len(sent) == 3
-    buttons = [b for row in sent[1].reply_markup.inline_keyboard for b in row]
-    assert buttons[0].text == texts.PAY_BUTTON.format(club=texts.CLUB_NAME)
+    assert len(sent) == 2
+    assert sent[0].text == texts.WELCOME_INTRO
+
+    # The two buttons the spec names, in that order and in the owner's own lowercase.
+    buttons = [b for row in sent[0].reply_markup.inline_keyboard for b in row]
+    assert buttons[0].text == "💳 стати учасником your story club"
+    assert buttons[0].text == texts.PAY_BUTTON
     assert "secure.wayforpay.com" in buttons[0].url
+    assert buttons[1].text == "📚 бібліотека клубу"
+    assert buttons[1].url == texts.LIBRARY_URL
+    assert "notion" in buttons[1].url
     assert texts.MENU_MY_SUBSCRIPTION in [b.text for b in buttons]
+
+    # No link preview: the welcome is a text message, not a card for whatever it mentions.
+    assert sent[0].link_preview_options.is_disabled is True
 
 
 async def test_a_hundred_percent_discount_grants_the_period_and_the_channel_link(
@@ -4872,3 +4882,36 @@ async def test_a_failed_send_records_the_block_so_the_purge_can_see_it(session_f
     # Without a session the send still degrades quietly — callers outside a unit of work exist.
     recording.failures.pop("SendMessage")
     assert await _tell(bot, USER_ID, "Привіт") == 1
+
+
+async def test_a_member_on_a_special_price_is_not_quoted_the_list_price(
+    dispatcher, bot, session_factory, fake_wayforpay, recording_session
+):
+    """The welcome is the owner's own text and says «Вартість підписки — €10 на місяць».
+
+    That is the club's list price. A founding member pays 8, somebody with a discount or a live
+    promo pays less again — and the one thing this message must not do is quote a sum the gateway
+    will not charge. So their own price follows in its own line, and the SPEC text is left alone.
+    """
+    from db.models import Discount, DiscountKind
+
+    async with session_factory() as session:
+        session.add(
+            Discount(
+                username="newcomer",
+                kind=DiscountKind.FIXED_PRICE,
+                fixed_price=Decimal("8"),
+                currency=CURRENCY,
+            )
+        )
+        await session.commit()
+
+    joiner = make_user(USER_ID, username="newcomer")
+    await dispatcher.feed_update(bot, make_message(joiner, "/start"))
+
+    sent = recording_session.of_type("SendMessage")
+    assert sent[0].text == texts.WELCOME_INTRO, "the owner's copy is sent verbatim"
+    assert len(sent) == 2
+    assert texts.money(Decimal("8"), CURRENCY) in sent[1].text
+    # And the button charges that, not the €10 in the text above it.
+    assert fake_wayforpay.purchase_calls[-1]["amount"] == Decimal("8.00")

@@ -18,7 +18,13 @@ import logging
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatMemberStatus
 from aiogram.filters import CommandObject, CommandStart
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    LinkPreviewOptions,
+    Message,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import texts
@@ -72,6 +78,11 @@ async def is_in_community(bot: Bot, chat_id: str | None, user_id: int) -> bool:
         return False
 
 
+def _welcome_keyboard(is_admin: bool, *, pay_url: str | None = None) -> InlineKeyboardMarkup:
+    """Alias kept for readability at the call sites that greet somebody."""
+    return member_keyboard(is_admin, pay_url=pay_url)
+
+
 def member_keyboard(is_admin: bool, *, pay_url: str | None = None) -> InlineKeyboardMarkup:
     """What a member can reach from the welcome.
 
@@ -80,14 +91,18 @@ def member_keyboard(is_admin: bool, *, pay_url: str | None = None) -> InlineKeyb
     the link was in a different bubble entirely, under a heading about renewing a subscription the
     person had never had.
 
+    Two of these are the owner's spec of 2026-11-11 — «💳 стати учасником your story club» and
+    «📚 бібліотека клубу», in that order and in that case.
+
     Buttons for features that do not exist yet are deliberately absent — a button that answers
     "later" is worse than no button.
     """
     rows: list[list[InlineKeyboardButton]] = []
     if pay_url:
-        rows.append(
-            [InlineKeyboardButton(text=texts.PAY_BUTTON.format(club=texts.CLUB_NAME), url=pay_url)]
-        )
+        rows.append([InlineKeyboardButton(text=texts.PAY_BUTTON, url=pay_url)])
+    # The knowledge base, which lives in Notion until the bot grows its own (plan Phase 2). Shown
+    # to everybody: the welcome promises it, and a promise with no button is a dead end.
+    rows.append([InlineKeyboardButton(text=texts.LIBRARY_BUTTON, url=texts.LIBRARY_URL)])
     rows.append(
         [InlineKeyboardButton(text=texts.MENU_MY_SUBSCRIPTION, callback_data="menu:subscription")]
     )
@@ -222,23 +237,25 @@ async def handle_start(
         )
         return
 
-    if created:
-        # The club pitch first, then the tariff as its own message. One combined wall of text
-        # would bury the price and the pay button at the bottom of a long read.
-        await message.answer(texts.WELCOME_INTRO)
-
-        if free_period:
-            await message.answer(
-                texts.WELCOME_FREE.format(
-                    club=texts.CLUB_NAME,
-                    until=until,
-                    amount=amount,
-                    period=period_days,
-                ),
-                reply_markup=member_keyboard(is_admin),
+    if created and free_period:
+        # A free first period is not what the welcome describes — it quotes a price and says the
+        # library opens "одразу після підписки" — so the gift gets its own message after the
+        # pitch, and there is no pay button because there is nothing to pay.
+        await message.answer(
+            texts.WELCOME_INTRO,
+            reply_markup=_welcome_keyboard(is_admin),
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+        )
+        await message.answer(
+            texts.WELCOME_FREE.format(
+                club=texts.CLUB_NAME,
+                until=until,
+                amount=amount,
+                period=period_days,
             )
-            log.info("Onboarded %s with a free first period", telegram_id)
-            return
+        )
+        log.info("Onboarded %s with a free first period", telegram_id)
+        return
 
     # `owed` may be nothing at all — a 100% discount lands here.
     if owed <= 0:
@@ -278,20 +295,41 @@ async def handle_start(
             await session.rollback()
             payment = None
 
-    if payment is None:
+    # **One message** for a joiner, as specified on 2026-11-11: the owner's welcome with the two
+    # buttons on it — pay, and the library. It used to be two bubbles, the pitch and then the
+    # tariff, because the pitch had no buttons and the price would have been buried at the end of
+    # a long read. The new welcome carries the price itself, so there is nothing left to split.
+    if created:
         await message.answer(
-            texts.WELCOME_PAY_LATER.format(club=texts.CLUB_NAME, amount=amount, period=period_days)
+            texts.WELCOME_INTRO,
+            reply_markup=_welcome_keyboard(
+                is_admin, pay_url=payment.invoice_url if payment else None
+            ),
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
         )
+        # The welcome quotes the club's list price. Anybody on a different one — a founding
+        # member, a discount, a live promo — is told theirs, rather than the SPEC text being
+        # rewritten per member.
+        if payment is not None and payment.amount != settings.subscription_price:
+            await message.answer(
+                texts.WELCOME_YOUR_PRICE.format(
+                    amount=texts.money(payment.amount, payment.currency), period=period_days
+                )
+            )
+    else:
+        # A returning member whose access has run out: no pitch, just the price and a live button.
+        quoted = amount if payment is None else texts.money(payment.amount, payment.currency)
+        template = texts.WELCOME_PAY if payment is not None else texts.WELCOME_PAY_LATER
+        await message.answer(
+            template.format(club=texts.CLUB_NAME, amount=quoted, period=period_days),
+            reply_markup=_welcome_keyboard(
+                is_admin, pay_url=payment.invoice_url if payment else None
+            ),
+        )
+
+    if payment is None:
         log.warning("No invoice for %s at /start; the daily job will retry", telegram_id)
         return
-
-    # One message: the tariff and the button that acts on it. Splitting them produced a second
-    # bubble headed "time to renew" for someone who had just arrived.
-    quoted = texts.money(payment.amount, payment.currency)
-    await message.answer(
-        texts.WELCOME_PAY.format(club=texts.CLUB_NAME, amount=quoted, period=period_days),
-        reply_markup=member_keyboard(is_admin, pay_url=payment.invoice_url),
-    )
     log.info("Invoiced %s at /start: %s %s", telegram_id, payment.amount, payment.currency)
 
 

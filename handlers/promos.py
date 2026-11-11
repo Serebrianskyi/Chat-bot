@@ -172,7 +172,7 @@ async def receive_code(
                 inline_keyboard=[
                     [
                         InlineKeyboardButton(
-                            text=texts.PAY_BUTTON.format(club=texts.CLUB_NAME),
+                            text=texts.PAY_BUTTON,
                             url=payment.invoice_url,
                         )
                     ]

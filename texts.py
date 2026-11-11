@@ -116,32 +116,54 @@ def months_phrase(count: int) -> str:
 #:
 #: Owner's copy, verbatim. Note "Q&amp;A": messages go out with parse_mode=HTML, where a bare
 #: "&" is invalid and Telegram rejects the whole send.
+#: SPEC — the owner's own welcome, rewritten 2026-11-11 and quoted verbatim. Do not "improve" it;
+#: raise a copy question instead (rule 14).
+#:
+#: The price line says €10, which is the club's **list** price. A member whose own price differs —
+#: a founding member on 8, anybody with a discount or a live promo — is told so in its own line
+#: (`WELCOME_YOUR_PRICE`), because the one thing this message must not do is quote a sum the
+#: gateway will not charge.
 WELCOME_INTRO = (
-    "Вітаю тебе у боті Your Story Club — блогінг ком’юніті для тих, "
-    "кому потрібна підтримка у розвитку власного особистого бренду♥️\n"
+    "<b>Вітаю тебе у Your Story Club!</b> ♥️\n"
     "\n"
-    "Клуб для тебе, якщо ти\n"
-    "• розвиваєш власний блог\n"
-    "• лише починаєш у блогінгу\n"
-    "• ведеш соцмережі бізнесу\n"
+    "Це клуб для тих, кому набридло бути з блогом сам на сам. Якщо ти будуєш свій особистий "
+    "бренд, розвиваєш соцмережі та створюєш контент для себе чи клієнтів — "
+    "<b>ця спільнота для тебе!</b>\n"
     "\n"
-    "Що всередині?\n"
-    "🤎 телеграм канал із зручною структурою\n"
-    "🤎 інформативні лекції від мене по блогінгу — конкретні інструменти та практики, "
-    "які дають результати. Будемо покроково вчитись розвивати власний особистий бренд "
-    "та монетизувати блог (власна бібліотека знань клубу)\n"
-    "🤎 зустрічі з експертами не лише з блогінгу — цікаві та сильні особистості "
-    "з різних сфер\n"
-    "🤎 how to — воркшопи та інструменти для роботи з соцмережами\n"
-    "🤎 міні-курси та воркшопи по соцмережам і не тільки\n"
-    "🤎 спільні зідзвони, мастермайнди, пратики, розбори та Q&amp;A\n"
-    "🤎 неформальна онлайн-кава та зустрічі-обговорення (книжки, інфоприводи)\n"
-    "🤎 дописи з ідеями для контенту, натхненням та практичними порадами по блогінгу\n"
-    "🤎 подарунки для найактивніших учасників\n"
+    "Клуб побудований за <b>системою тематичних місяців</b>. Щомісяця ми обираємо фокусну тему "
+    "й присвячуємо їй події всередині спільноти:\n"
     "\n"
-    "Усе це в одному місці — щоб завжди бути на зв’язку🫂 "
-    "Чекаю тебе у Your Story Club."
+    "— зустрічі та контент від гостей з різних сфер\n"
+    "— додаткові матеріали (шаблони, інструкції, чек-листи)\n"
+    "\n"
+    "<b>Окрім цього щомісяця ти отримуватимеш:</b>\n"
+    "🎯 <b>Ексклюзивні лекції та how-to воркшопи від Олі</b> з конкретними блогінг "
+    "інструментами, техніками та практиками\n"
+    "💡 <b>Банк ідей для блогу:</b> добірки контент-ідей та трендів, які легко втілити у своєму "
+    "блозі (лайфстайл та експертні ідеї)\n"
+    "🚀 <b>Практичні інтерактиви:</b> мастермайнди, розбори профілів, спільні зідзвони та "
+    "Q&amp;A-сесії\n"
+    "🫂 <b>Підтримку від мене та ком’юніті:</b> у нас можна і потрібно писати усе, що турбує, "
+    "щоб отримати відповіді від мене або почути досвід учасників\n"
+    "\n"
+    "<b>Обирай свій формат:</b> включайся в усі інтерактиви на повну, задавай питання в чаті хоч "
+    "щодня, або просто переглядай матеріали, коли тобі зручно.\n"
+    "\n"
+    "Усі події записуються й зберігаються в <b>Бібліотеці знань Клубу</b>. Доступ до неї "
+    "відкривається одразу після підписки.\n"
+    "\n"
+    "<b>Окрім навчального контенту, у нас проходять затишні неформальні зустрічі:</b>\n"
+    "- ☕️ <b>Онлайн-кава</b> — простір для відновлення ресурсу, обговорень та підтримки\n"
+    "- 📚 <b>Книжковий клуб</b> — де ми разом читаємо і обговорюємо книжки\n"
+    "\n"
+    "Буду рада бачити тебе в Клубі!\n"
+    "\n"
+    "<b>Вартість підписки — €10 на місяць</b> <i>(скасувати можна будь-коли)</i> ✨"
 )
+
+#: Only for somebody whose price is not the €10 the welcome quotes. Its own line rather than a
+#: rewritten welcome: the SPEC text is the owner's and is not edited per member.
+WELCOME_YOUR_PRICE = "Для вас діє спеціальна ціна: <b>{amount}</b> за {period} днів."
 
 WELCOME_FREE = (
     "Вітаємо у {club}! 🎉\n\n"
@@ -189,7 +211,17 @@ PAY_LINK_NOTE = (
 #: Deliberately **not** the same wording as ``JOIN_CLUB_BUTTON`` — owner's decision, 2026-10-09:
 #: a first-time invitation and a win-back nudge are different approaches and are worded
 #: differently on purpose. Do not unify them.
-PAY_BUTTON = "Стати учасником {club}"
+#: SPEC — the owner's wording and the owner's capitalisation, 2026-11-11. Lowercase on purpose;
+#: `{club}` is gone because the label names the club in lowercase too.
+PAY_BUTTON = "💳 стати учасником your story club"
+
+#: The knowledge base lives in Notion for now (plan Phase 2 would bring it into the bot). A URL
+#: button rather than a callback: there is nothing for the bot to do but hand over the link.
+LIBRARY_BUTTON = "📚 бібліотека клубу"
+LIBRARY_URL = (
+    "https://app.notion.com/p/"
+    "Create-Your-Story-Club-3e965767b18080b2914df045e8135f75?source=copy_link"
+)
 
 #: SPEC — «Дякуємо! Підписку успішно продовжено»
 PAYMENT_RENEWED = "Дякуємо! Підписку успішно продовжено.\n\nДоступ діє до <b>{until}</b>."
