@@ -53,8 +53,12 @@ MENU_ITEMS: tuple[tuple[str, str], ...] = (
     (texts.ADMIN_MENU_CREATE_PROMO, "create_promo"),  # live
     (texts.ADMIN_MENU_CHANNEL_POST, "channel_post"),  # live
     (texts.ADMIN_MENU_KNOWLEDGE_BASE, "materials"),  # TODO(phase-2)
-    (texts.ADMIN_MENU_ADD_SUBSCRIBER, "add_subscriber"),  # TODO(phase-3)
 )
+
+# ➕ Додати учасника is deliberately **absent**. Removed on 2026-11-11 at the owner's request: a
+# member cannot be added by an admin in any meaningful sense — access comes from a payment, a
+# discount, or 🎁 Подарувати місяць, and all three already have a screen. A button that could only
+# ever answer "буде додано на наступному етапі" is a promise nobody intends to keep.
 
 #: Actions that have a real screen. The placeholder handler must not swallow these, and the
 #: denial router must still refuse them for a non-admin.

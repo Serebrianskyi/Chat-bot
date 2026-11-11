@@ -13,7 +13,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 
 import texts
 from config import ConfigError, Settings, get_settings
@@ -1681,6 +1681,10 @@ async def test_a_member_who_never_paid_is_not_chased_again(
         sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
         sub.free_period_granted = False
         sub.last_reminder_at = None
+        # A real payment moves `expires_at` past the asks of the previous period, which is what
+        # empties the two-link budget. The suite runs on a fixed clock, so the rows are cleared
+        # instead of waiting for a date to pass.
+        await session.execute(delete(AuditLog).where(AuditLog.action == "payment.link_sent"))
         session.add(
             Payment(
                 user_id=USER_ID,
@@ -3370,9 +3374,13 @@ class ProbeBot:
 async def test_the_purge_spares_a_payer_and_an_admin_and_deletes_the_rest(session_factory):
     """Deleting a member is irreversible, so the exemptions and the FK list are what is tested.
 
-    A blocked member who never paid goes, with every row that references them. A blocked member
-    with a `complete` payment stays — their payments are the only thing reconcilable against
-    WayForPay (rule 6) — and an admin is never touched however they left.
+    Whoever has blocked the bot does not stay in the database. **One** exception: a `complete`
+    payment, because those rows are the only record reconcilable against the WayForPay dashboard
+    (standing rule 6) — a deleted payment is a sum the gateway reports and this database cannot
+    explain. Admins are never touched either, for the same reason removal spares them.
+
+    Taking somebody out of the **channel** is a different job (`remove_lapsed_members`) and is
+    deliberately not mixed in: that one is about unpaid access, this one is about rows.
     """
     from db.models import Base, Payment, PaymentStatus, Subscription, User, utcnow
     from services.billing import _purge_statements, purge_blocked_users
@@ -3388,19 +3396,14 @@ async def test_the_purge_spares_a_payer_and_an_admin_and_deletes_the_rest(sessio
     handled = {statement.table.name for statement in _purge_statements(1)}
     assert not referencing - handled, f"{referencing - handled} reference users and are not purged"
 
-    payer, quitter, on_trial, inside = (777_000_001, 777_000_002, 777_000_003, 777_000_004)
+    payer, quitter = 777_000_001, 777_000_002
 
     async with session_factory() as session:
-        for telegram_id, username, blocked, days_left in (
-            (ADMIN_ID, "boss", True, 5),
-            (payer, "paid", True, -1),
-            # Lapsed and blocked and never paid: the only shape that may be deleted.
-            (quitter, "gone", True, -1),
-            # A trial has no payment behind it, so only the access check spares them.
-            (on_trial, "trial", True, 5),
-            # Lapsed, but still sitting in the channel — the row is the only record saying so.
-            (inside, "inchannel", True, -1),
-            (USER_ID, "staying", False, 5),
+        for telegram_id, username, blocked in (
+            (ADMIN_ID, "boss", True),
+            (payer, "paid", True),
+            (quitter, "gone", True),
+            (USER_ID, "staying", False),
         ):
             session.add(User(telegram_id=telegram_id, username=username, is_blocked_bot=blocked))
             session.add(
@@ -3412,7 +3415,7 @@ async def test_the_purge_spares_a_payer_and_an_admin_and_deletes_the_rest(sessio
                     price_tier=PriceTier.REGULAR,
                     period_days=PERIOD_DAYS,
                     started_at=utcnow() - timedelta(days=PERIOD_DAYS),
-                    expires_at=utcnow() + timedelta(days=days_left),
+                    expires_at=utcnow() + timedelta(days=5),
                 )
             )
         session.add(
@@ -3426,28 +3429,16 @@ async def test_the_purge_spares_a_payer_and_an_admin_and_deletes_the_rest(sessio
         )
         await session.commit()
 
-    bot = ProbeBot(blocked={ADMIN_ID, payer, quitter, on_trial, inside}, in_channel={inside})
+    bot = ProbeBot(blocked={ADMIN_ID, payer, quitter})
     counts = await purge_blocked_users(
-        session_factory,
-        bot,
-        admin_ids=frozenset({ADMIN_ID}),
-        channel_id=CHANNEL_ID,
-        now=utcnow(),
+        session_factory, bot, admin_ids=frozenset({ADMIN_ID}), now=utcnow()
     )
 
     assert bot.probed == [], "the scheduled job reads the flag and probes nobody"
-    assert counts == {"checked": 4, "blocked": 4, "purged": 1, "kept_paid": 3, "failed": 0}
+    assert counts == {"checked": 2, "blocked": 2, "purged": 1, "kept_paid": 1, "failed": 0}
 
     async with session_factory() as session:
-        # Only the lapsed, unpaid, out-of-channel member is gone. Deleting any of the others
-        # would erase the only record that their access should ever end.
-        assert set(await session.scalars(select(User.telegram_id))) == {
-            ADMIN_ID,
-            payer,
-            on_trial,
-            inside,
-            USER_ID,
-        }
+        assert set(await session.scalars(select(User.telegram_id))) == {ADMIN_ID, payer, USER_ID}
         assert (
             await session.scalar(select(Subscription.id).where(Subscription.user_id == quitter))
             is None
@@ -3455,11 +3446,9 @@ async def test_the_purge_spares_a_payer_and_an_admin_and_deletes_the_rest(sessio
         assert await session.scalar(select(Payment.id).where(Payment.user_id == payer)) is not None
 
     report = bot.said[0]
-    assert "Заблокували бота: 4" in report
+    assert "Заблокували бота: 2" in report
     assert "Видалено з бази: 1" in report
-    # Each kept member is named with the reason, so an admin can act on the ones that need it.
-    assert texts.ADMIN_PURGE_KEPT_ACCESS in report
-    assert texts.ADMIN_PURGE_KEPT_IN_CHANNEL in report
+    assert texts.ADMIN_PURGE_KEPT_PAID in report, "the kept payer is named with the reason"
 
 
 async def test_a_dry_run_purge_deletes_nothing(session_factory):
@@ -4255,12 +4244,12 @@ async def test_a_broadcast_records_who_has_blocked_the_bot(session_factory, bot,
         assert (await session.get(User, reachable)).is_blocked_bot is False
 
 
-async def test_two_dated_reminders_go_out_before_a_period_ends(session_factory, bot, config):
-    """Owner's policy, 2026-11-04: reminders a few days before the next payment, not one the
-    night before.
+async def test_exactly_one_reminder_goes_out_before_a_period_ends(session_factory, bot, config):
+    """Owner's policy, revised 2026-11-11: **one** reminder before the date, not two.
 
-    Two slots — three days out, then one day out — and each fires once. Before this the job sent
-    a single reminder at T−1 and the member's first real warning was the day their access ended.
+    It briefly sent two — three days out and one day out — and that, with a link on the due date
+    and another the day after, was more messages than anybody wanted. One warning, then the asking
+    is the due sweep's job.
     """
     from services.billing import REMINDER_DAYS, send_renewal_reminders
 
@@ -4277,27 +4266,20 @@ async def test_two_dated_reminders_go_out_before_a_period_ends(session_factory, 
     async def run(at):
         return await send_renewal_reminders(session_factory, gw, bot, config=config, now=at)
 
-    # Too early: five days out is nobody's business yet.
-    assert (await run(ends - timedelta(days=5)))["automatic"] == 0
+    # Too early: three days out is nobody's business now.
+    assert (await run(ends - timedelta(days=3)))["automatic"] == 0
 
-    # Three days out — the first warning, which names the date.
-    first = await run(ends - timedelta(days=3))
-    assert first["automatic"] == 1
+    # One day out — the warning.
+    assert (await run(ends - timedelta(days=1)))["automatic"] == 1
 
-    # Still three days out, a day later: the slot is used up, nothing is resent.
-    assert (await run(ends - timedelta(days=2)))["skipped"] == 1
-
-    # One day out — the second warning.
-    second = await run(ends - timedelta(days=1))
-    assert second["automatic"] == 1
-
-    # And no third.
+    # And no second, however often the job runs before the date.
+    assert (await run(ends - timedelta(hours=12)))["skipped"] == 1
     assert (await run(ends - timedelta(hours=2)))["skipped"] == 1
 
     said = [c.text for c in bot.session.calls if getattr(c, "chat_id", None) == USER_ID]
-    assert len(said) == 2
-    assert texts.days_phrase(max(REMINDER_DAYS)) in said[0], "the early one must name the date"
-    assert said[1] == texts.RENEWAL_REMINDER, "the last one is the «завтра» wording"
+    assert len(said) == 1
+    assert said[0] == texts.RENEWAL_REMINDER
+    assert REMINDER_DAYS == (1,), "one slot, the day before"
 
 
 async def test_access_closes_24_hours_after_the_period_ends(session_factory, bot, in_community):
@@ -4771,3 +4753,122 @@ async def test_a_confirmed_payment_reports_its_real_value(session_factory, bot, 
             now=utcnow(),
             meta=Broken(pixel_id="PX", access_token="tok"),  # noqa: S106
         )
+
+
+async def test_an_unpaid_member_is_asked_twice_and_then_left_alone(session_factory, bot, config):
+    """Admin's report, 2026-11-11: unpaid members were getting a payment link **every day**.
+
+    Owner's policy the same day: one reminder before the date, a link on the day, one more link the
+    day after in case the first went unpaid — and then silence. Counted over a week of sweeps,
+    including two in one day, which is what a redeploy or a manual run looks like.
+    """
+    from services.billing import LINKS_PER_PERIOD, process_due_subscriptions
+
+    await seed_due(session_factory, overdue_days=0)
+    gw = FakeGateway()
+    due = NOW
+
+    async def sweep(at) -> int:
+        counts = await process_due_subscriptions(
+            session_factory, gw, bot, admin_ids=frozenset({ADMIN_ID}), config=config, now=at
+        )
+        return counts["invoiced"]
+
+    # The due date: the first ask.
+    assert await sweep(due) == 1
+    # Four hours later — a redeploy, a manual run, hourly jobs. Not a second ask.
+    assert await sweep(due + timedelta(hours=4)) == 0
+    # The next day: the second and last ask, in case the first went unpaid.
+    assert await sweep(due + timedelta(days=1)) == 1
+    # And nothing for the rest of the week.
+    assert [await sweep(due + timedelta(days=day)) for day in range(2, 7)] == [0, 0, 0, 0, 0]
+
+    # The member hears from the bot twice, not seven times.
+    sent = [c for c in bot.session.calls if getattr(c, "chat_id", None) == USER_ID]
+    assert len(sent) == LINKS_PER_PERIOD
+
+
+async def test_somebody_who_never_had_access_is_not_removed_or_messaged(
+    session_factory, bot, config
+):
+    """2026-11-11, in production: the sweep removed **190** members, every one «ніколи не платив»,
+    and told each of them «Ваш доступ до ком'юніті призупинено».
+
+    An unpaid joiner's `expires_at` **is** their `started_at` — `first_expiry` returns now for
+    somebody with no free period — so from the minute they run `/start` they look lapsed and past
+    grace. The removals were no-ops, because banning somebody who is not in a channel does
+    nothing. The message was the damage, and messaging people who have not paid is exactly what
+    the owner's standing instruction forbids.
+    """
+    from services.billing import remove_lapsed_members
+
+    # Never paid, no free period, never invited: out of scope entirely.
+    await seed_due(session_factory, overdue_days=30, free_period_granted=False)
+    counts = await remove_lapsed_members(
+        session_factory,
+        bot,
+        client=FakeGateway(),
+        channel_id=CHANNEL_ID,
+        admin_ids=frozenset({ADMIN_ID}),
+        config=config,
+        now=NOW,
+        enabled=True,
+    )
+
+    assert counts["never_had_access"] == 1
+    assert counts["removed"] == 0
+    assert [c for c in bot.session.calls if getattr(c, "chat_id", None) == USER_ID] == [], (
+        "a member who never had access must hear nothing"
+    )
+    async with session_factory() as session:
+        sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
+    assert sub.status is not SubscriptionStatus.EXPIRED
+
+    # A trial that ran out **is** in scope: they were given a period and let into the channel.
+    async with session_factory() as session:
+        sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
+        sub.free_period_granted = True
+        await session.commit()
+    counts = await remove_lapsed_members(
+        session_factory,
+        bot,
+        client=FakeGateway(),
+        channel_id=CHANNEL_ID,
+        admin_ids=frozenset({ADMIN_ID}),
+        config=config,
+        now=NOW,
+        enabled=True,
+    )
+    assert counts["removed"] == 1
+    assert counts["never_had_access"] == 0
+
+
+async def test_a_failed_send_records_the_block_so_the_purge_can_see_it(session_factory, bot):
+    """The removal report of 2026-11-11 was full of «повідомлення про закриття не доставлено» for
+    members nothing had flagged — so they sat in the database waiting for a purge that could not
+    see them.
+
+    Every path that reaches a member is a chance to learn this. A refusal now records it.
+    """
+    from aiogram.exceptions import TelegramForbiddenError
+    from aiogram.methods import SendMessage
+
+    from db.models import User
+    from services.billing import _tell
+
+    await seed_member(session_factory)
+    recording = bot.session
+    recording.failures["SendMessage"] = TelegramForbiddenError(
+        method=SendMessage(chat_id=USER_ID, text="x"), message="bot was blocked by the user"
+    )
+
+    async with session_factory() as session:
+        assert await _tell(bot, USER_ID, "Привіт", session=session) == 0
+        await session.commit()
+
+    async with session_factory() as session:
+        assert (await session.get(User, USER_ID)).is_blocked_bot is True
+
+    # Without a session the send still degrades quietly — callers outside a unit of work exist.
+    recording.failures.pop("SendMessage")
+    assert await _tell(bot, USER_ID, "Привіт") == 1

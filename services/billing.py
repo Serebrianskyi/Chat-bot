@@ -32,7 +32,6 @@ from db.models import (
     Discount,
     Payment,
     PaymentStatus,
-    PromoCode,
     PromoRedemption,
     Subscription,
     SubscriptionStatus,
@@ -52,6 +51,15 @@ log = logging.getLogger(__name__)
 
 #: How long an unpaid invoice stays worth polling before it is written off as abandoned.
 INVOICE_TIMEOUT = timedelta(hours=24)
+
+#: How many payment links one period may produce: the one on the due date, and one more the day
+#: after in case the first went unpaid. Owner's policy, 2026-11-11, after an admin reported that
+#: unpaid members were being messaged **every day** — the sweep runs daily and a link dies after
+#: 24 hours, so without a count every morning found nothing open and sent another.
+LINKS_PER_PERIOD = 2
+
+#: And no sooner than this, so two runs on one day cannot spend both links at once.
+RELINK_AFTER = timedelta(hours=20)
 
 #: The shortest believable gap between two charges of one subscription. A monthly schedule cannot
 #: bill twice inside a period, so a "second charge" arriving sooner is a repeat notification —
@@ -413,6 +421,7 @@ async def settle_without_payment(
         texts.FREE_BY_DISCOUNT.format(
             club=texts.CLUB_NAME, until=texts.day(subscription.expires_at)
         ),
+        session=session,
     )
     await deliver_invite(
         session,
@@ -787,7 +796,7 @@ MAX_CHARGE_ATTEMPTS = 2
 
 #: How long before expiry the member is warned that a charge is coming. One day, because the copy
 #: says «Завтра відбудеться автоматичне списання».
-REMINDER_DAYS = (3, 1)
+REMINDER_DAYS = (1,)
 
 #: How far ahead the first reminder goes out. Also the query window: a subscription further away
 #: than this is not yet anybody's business.
@@ -1049,7 +1058,7 @@ async def send_renewal_reminders(
                         days=texts.days_phrase(slot), until=texts.day(subscription.expires_at)
                     )
                 )
-                delivered = await _tell(bot, subscription.user_id, text)
+                delivered = await _tell(bot, subscription.user_id, text, session=session)
                 counts["automatic"] += delivered
             else:
                 # The link is issued now rather than described, so the reminder is actionable.
@@ -1087,6 +1096,7 @@ async def send_renewal_reminders(
                     subscription.user_id,
                     text,
                     reply_markup=_pay_keyboard(payment.invoice_url or "") if payment else None,
+                    session=session,
                 )
                 counts["manual"] += delivered
 
@@ -1100,13 +1110,32 @@ async def send_renewal_reminders(
     return counts
 
 
-async def _tell(bot: Bot, chat_id: int, text: str, *, reply_markup=None) -> int:
-    """Send one message, returning 1 if it arrived. Unreachable is counted, never raised."""
+async def _tell(
+    bot: Bot,
+    chat_id: int,
+    text: str,
+    *,
+    reply_markup=None,
+    session: AsyncSession | None = None,
+) -> int:
+    """Send one message, returning 1 if it arrived. Unreachable is counted, never raised.
+
+    With a ``session``, a refusal **records the block** (`users.is_blocked_bot`), which is what
+    the monthly purge reads. Every path that reaches a member is a chance to learn this, and the
+    removal report of 2026-11-11 was full of «повідомлення про закриття не доставлено» for members
+    nothing had flagged — so they stayed in the database waiting for a purge that could not see
+    them.
+    """
     try:
         extra = {"reply_markup": reply_markup} if reply_markup else {}
         await bot.send_message(chat_id, text, **extra)
     except TelegramForbiddenError:
         log.warning("Cannot reach %s", chat_id)
+        if session is not None:
+            try:
+                await users.mark_blocked_bot(session, chat_id, blocked=True)
+            except Exception:
+                log.exception("Could not record that %s has blocked the bot", chat_id)
         return 0
     except Exception:
         log.exception("Could not message %s", chat_id)
@@ -1147,6 +1176,29 @@ async def _should_chase(session: AsyncSession, *, subscription: Subscription) ->
         .limit(1)
     )
     return paid_before is not None
+
+
+async def _links_this_period(
+    session: AsyncSession, subscription: Subscription
+) -> tuple[int, datetime | None]:
+    """``(how many payment links this period, when the last one went out)``.
+
+    Read from `audit_log`: `payment.link_sent` is written for every attempt, delivered or not.
+    Counting attempts rather than deliveries is deliberate — somebody who has blocked the bot
+    cannot be reached by asking a third time either.
+    """
+    rows = list(
+        await session.scalars(
+            select(AuditLog.created_at)
+            .where(
+                AuditLog.target_user_id == subscription.user_id,
+                AuditLog.action == Action.PAYMENT_LINK_SENT,
+                AuditLog.created_at >= subscription.expires_at,
+            )
+            .order_by(AuditLog.created_at.desc())
+        )
+    )
+    return len(rows), rows[0] if rows else None
 
 
 async def process_due_subscriptions(
@@ -1269,26 +1321,41 @@ async def process_due_subscriptions(
                     counts["free"] += 1
                     continue
 
-                # **One link per period, then silence.** The owner's policy of 2026-11-04: a
-                # reminder a few days ahead, one payment link when the period ends, and after
-                # that a new link only by hand — from `/subscription`, or an admin sending one.
+                # **Two links a period, then silence.** One on the due date, one the day after
+                # in case the first went unpaid — the owner's policy of 2026-11-11, after an
+                # admin reported unpaid members being messaged every morning.
                 #
-                # Without this guard the sweep re-linked daily for ever: a link dies after two
-                # hours, so every morning found no open invoice and minted another. That is both
-                # a drip of identical messages and, for the 155 members nobody is chasing, the
-                # reason the "don't keep notifying them" instruction needed a second mechanism.
+                # Counted from the `payment.link_sent` audit rows rather than from a flag,
+                # because "how many times have we asked this person, this period" is exactly
+                # what those rows record — and a flag could only ever say "at least once". The
+                # window starts at `expires_at`, so the reminder sent *before* the date is not
+                # counted against the two.
                 #
-                # `last_reminder_at >= expires_at` is the marker, and it clears itself: a payment
-                # resets it to None and moves `expires_at`, so the next period starts fresh.
-                if (
-                    subscription.last_reminder_at is not None
-                    and subscription.last_reminder_at >= subscription.expires_at
-                ):
+                # It clears itself: a payment moves `expires_at`, so the next period's window is
+                # empty and the member is asked again.
+                asked, last_asked = await _links_this_period(session, subscription)
+                if asked >= LINKS_PER_PERIOD:
+                    counts["already_linked"] += 1
+                    continue
+                if last_asked is not None and now - last_asked < RELINK_AFTER:
+                    # Two sweeps in one day — a redeploy, a manual run, hourly jobs — must not
+                    # spend both links within an hour of each other.
                     counts["already_linked"] += 1
                     continue
 
+                # The second ask reuses the link the member already has when it is still alive —
+                # a page is good for `invoice_timeout`, so the day-after message is the same link
+                # again rather than a new order. One less Purchase against an endpoint that
+                # rate-limits, and one less order for the poller to chase.
                 existing = await subs.open_payment(session, subscription.id)
-                if existing is None:
+                payment = None
+                if (
+                    existing is not None
+                    and existing.invoice_url
+                    and now - existing.created_at < config.invoice_timeout
+                ):
+                    payment = existing
+                else:
                     try:
                         payment = await issue_invoice(
                             session,
@@ -1301,17 +1368,17 @@ async def process_due_subscriptions(
                         log.exception("Could not invoice %s", subscription.user_id)
                         continue
 
-                    delivered = await send_payment_link(
-                        bot,
-                        subscription=subscription,
-                        payment=payment,
-                        session=session,
-                        now=now,
-                    )
-                    counts["invoiced"] += 1
-                    if not delivered:
-                        counts["unreachable"] += 1
-                    subscription.last_reminder_at = now
+                delivered = await send_payment_link(
+                    bot,
+                    subscription=subscription,
+                    payment=payment,
+                    session=session,
+                    now=now,
+                )
+                counts["invoiced"] += 1
+                if not delivered:
+                    counts["unreachable"] += 1
+                subscription.last_reminder_at = now
 
             # Grace exhausted and still unpaid. Recorded, not reported: see `mark_overdue` for
             # why an admin is no longer DMed about it. The member is not removed either.
@@ -1339,6 +1406,37 @@ async def process_due_subscriptions(
 
 
 # --- job 5: take lapsed members out of the channel ------------------------------------------
+
+
+async def _ever_had_access(session: AsyncSession, subscription: Subscription) -> bool:
+    """Whether this member ever actually had access to take away.
+
+    Three ways: a completed payment, a free period they were granted, or a channel invite that
+    was sent to them. Anyone with none of the three has never been inside the channel, so there is
+    nothing to remove — and nothing truthful to say to them either.
+
+    **This is the scope `remove_lapsed_members` was missing.** An unpaid joiner's `expires_at` is
+    their `started_at` — `first_expiry` returns *now* for somebody with no free period — so the
+    moment they run `/start` they are, arithmetically, "lapsed and past grace". On 2026-11-11 the
+    sweep acted on all of them at once: 190 members, every one «ніколи не платив», each told
+    «Ваш доступ до ком'юніті призупинено» about access they never had. The removals themselves
+    were no-ops (banning somebody who is not in a channel does nothing) — the message was the
+    damage, and it is the one thing the owner's standing instruction forbids: people who have not
+    paid are not to be messaged until the discount campaign reaches them.
+    """
+    if subscription.free_period_granted:
+        return True
+    paid = await session.scalar(
+        select(Payment.id)
+        .where(
+            Payment.user_id == subscription.user_id,
+            Payment.status == PaymentStatus.COMPLETE,
+        )
+        .limit(1)
+    )
+    if paid is not None:
+        return True
+    return await _has_action(session, subscription.user_id, Action.INVITE_SENT)
 
 
 async def _removal_reason(
@@ -1422,7 +1520,14 @@ async def remove_lapsed_members(
     likely and mortifying, and no subscription state should be able to cause it.
     """
     now = now or utcnow()
-    counts = {"lapsed": 0, "removed": 0, "failed": 0, "skipped_admin": 0, "would_remove": 0}
+    counts = {
+        "lapsed": 0,
+        "never_had_access": 0,
+        "removed": 0,
+        "failed": 0,
+        "skipped_admin": 0,
+        "would_remove": 0,
+    }
     removed_now: list[tuple[str, int, str]] = []
 
     if not channel_id:
@@ -1451,6 +1556,13 @@ async def remove_lapsed_members(
         for subscription in lapsed:
             if subscription.user_id in admin_ids:
                 counts["skipped_admin"] += 1
+                continue
+
+            # Never had access, so there is nothing to close and nobody to tell. Counted rather
+            # than silently skipped: "how many are simply not in scope" is the number that makes
+            # the rest of the report readable.
+            if not await _ever_had_access(session, subscription):
+                counts["never_had_access"] += 1
                 continue
 
             counts["lapsed"] += 1
@@ -1511,7 +1623,9 @@ async def remove_lapsed_members(
             handle, why = await _removal_reason(session, subscription=subscription, now=now)
 
             # Told why, and told they can come back — the message is not a punishment.
-            reached = await _tell(bot, subscription.user_id, texts.ACCESS_SUSPENDED)
+            reached = await _tell(
+                bot, subscription.user_id, texts.ACCESS_SUSPENDED, session=session
+            )
             if not reached:
                 why += texts.ADMIN_REMOVED_UNREACHABLE
             removed_now.append((handle, subscription.user_id, why))
@@ -2993,7 +3107,6 @@ async def purge_blocked_users(
     bot: Bot,
     *,
     admin_ids: frozenset[int],
-    channel_id: str | None = None,
     probe: bool = False,
     dry_run: bool = False,
     now: datetime | None = None,
@@ -3010,14 +3123,12 @@ async def purge_blocked_users(
     the bot appear to start typing to everyone who has *not* blocked it (``users.has_blocked_bot``
     explains why), which is acceptable as a deliberate one-off and not as a monthly surprise.
 
-    **Two groups are never deleted:**
+    **Two groups are never deleted:** admins, for the same reason removal spares them, and anyone
+    with a ``complete`` payment — their rows are the only record reconcilable against WayForPay
+    (standing rule 6). Everyone else flagged as having blocked the bot is deleted outright.
 
-    * **admins**, for the same reason removal spares them — no amount of subscription state
-      should be able to erase the owner's own row;
-    * **anyone with a ``complete`` payment.** Their ``payments`` rows are the only record that
-      can be reconciled against WayForPay (standing rule 6), and a deleted payment is a figure
-      the gateway reports and this database cannot explain. They are listed for an admin to
-      decide about by hand.
+    Removing somebody from the **channel** is a different job entirely (``remove_lapsed_members``)
+    and deliberately not mixed in here: that one is about unpaid access, this one is about rows.
 
     Deleting a member also deletes the ``audit_log`` rows naming them, including records of admin
     actions *taken on* them — a gifted month disappears with its recipient. That is a knowing
@@ -3055,13 +3166,7 @@ async def purge_blocked_users(
 
             counts["blocked"] += 1
             async with session_factory() as session:
-                reason = await _keep_reason(
-                    session,
-                    telegram_id,
-                    bot=bot,
-                    channel_id=channel_id,
-                    now=now,
-                )
+                reason = await _keep_reason(session, telegram_id)
                 if reason is not None:
                     counts["kept_paid"] += 1
                     kept.append(
@@ -3127,63 +3232,23 @@ async def purge_blocked_users(
     return counts
 
 
-async def _keep_reason(
-    session,
-    telegram_id: int,
-    *,
-    bot: Bot | None = None,
-    channel_id: str | None = None,
-    now: datetime | None = None,
-) -> str | None:
+async def _keep_reason(session, telegram_id: int) -> str | None:
     """Why this blocked member must not be deleted, or None if nothing stops it.
 
-    Four reasons, and the last two are about not making somebody invisible:
+    **One reason only: a ``complete`` payment.** Those rows are the only record that can be
+    reconciled against the WayForPay dashboard (standing rule 6), and a deleted payment is a sum
+    the gateway reports and this database cannot explain. They are named in the report instead.
 
-    * a ``complete`` payment — those rows are the only record reconcilable against WayForPay
-      (rule 6);
-    * owning a promo campaign — the code outlives whoever typed it, and other members'
-      redemptions point at it;
-    * **holding access right now.** A trial or a gifted month has no payment behind it, so the
-      first rule does not catch it. Deleting that row takes away the only thing that knows the
-      member's access should end — and leaves them in the channel for ever;
-    * **being in the channel.** Same failure from the other side: the row is the only record that
-      this person should be removed, and `remove_lapsed_members` works from it. Delete it and they
-      keep the access they blocked the bot to avoid paying for.
-
-    The membership check costs one API call per candidate and is skipped when there is no channel
-    configured.
+    Everything else about a blocked member goes. Deliberately simple — the requirement is that
+    somebody who has blocked the bot does not stay in the database, and the one exception has a
+    hard reason behind it rather than a cautious one.
     """
-    now = now or utcnow()
     paid = await session.scalar(
         select(Payment.id)
         .where(Payment.user_id == telegram_id, Payment.status == PaymentStatus.COMPLETE)
         .limit(1)
     )
-    if paid is not None:
-        return texts.ADMIN_PURGE_KEPT_PAID
-    authored = await session.scalar(
-        select(PromoCode.id).where(PromoCode.created_by == telegram_id).limit(1)
-    )
-    if authored is not None:
-        return texts.ADMIN_PURGE_KEPT_PROMO
-
-    expires_at = await session.scalar(
-        select(Subscription.expires_at).where(Subscription.user_id == telegram_id)
-    )
-    if expires_at is not None and expires_at > now:
-        return texts.ADMIN_PURGE_KEPT_ACCESS
-
-    if bot is not None and channel_id:
-        status, error = await _channel_status(bot, channel_id, telegram_id)
-        if error is not None:
-            # Unreadable means kept: a wrong "not a member" here deletes the only record that
-            # somebody should be taken out of the channel.
-            log.warning("Could not check %s's membership (%s); keeping them", telegram_id, error)
-            return texts.ADMIN_PURGE_KEPT_UNKNOWN
-        if status in IN_CHANNEL:
-            return texts.ADMIN_PURGE_KEPT_IN_CHANNEL
-
-    return None
+    return texts.ADMIN_PURGE_KEPT_PAID if paid is not None else None
 
 
 async def _probe_once(bot: Bot, telegram_id: int) -> bool:

@@ -300,10 +300,12 @@ def start_scheduler(
         max_instances=1,
     )
 
-    # Monthly, on the 1st: delete members who have blocked the bot, read from `is_blocked_bot`,
-    # which the my_chat_member handler keeps current. No API calls and no probing — nothing about
-    # this needs to be prompt, a blocked member costing nothing but a row.
-    # Fifteen minutes after the recovery sweep so the two reports do not arrive together.
+    # Monthly, on the 1st — the requirement as asked for: whoever has blocked the bot should not
+    # stay in the database, checked once a month and no more often. It reads `is_blocked_bot`,
+    # which the membership handler and every failed send keep current, so the job makes no API
+    # calls of its own.
+    #
+    # Fifteen minutes after the recovery sweep so two reports do not arrive together.
     scheduler.add_job(
         purge_blocked_users,
         "cron",
@@ -316,9 +318,6 @@ def start_scheduler(
             "session_factory": session_factory,
             "bot": bot,
             "admin_ids": admin_ids,
-            # Needed to spare anybody still sitting in the channel: their row is the only record
-            # saying they should ever be taken out of it.
-            "channel_id": config.channel_id,
         },
         coalesce=True,
         max_instances=1,

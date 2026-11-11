@@ -390,7 +390,6 @@ ADMIN_MENU_STATISTICS = "📊 Статистика"
 ADMIN_MENU_BROADCAST = "📣 Розсилка учасникам"
 ADMIN_MENU_USERS = "👥 Учасники"
 ADMIN_MENU_KNOWLEDGE_BASE = "📚 База знань"
-ADMIN_MENU_ADD_SUBSCRIBER = "➕ Додати учасника"
 ADMIN_MENU_DISCOUNTS = "🎟 Знижки"
 ADMIN_MENU_GRANT_DISCOUNT = "🎁 Надати знижку"
 ADMIN_MENU_SEND_INVITE = "🔗 Надіслати запрошення"
@@ -988,7 +987,9 @@ ADMIN_REMOVED_OVERDUE = "прострочено {overdue}"
 ADMIN_REMOVED_LAST_PAID = "остання оплата {when}"
 ADMIN_REMOVED_NEVER_PAID = "ніколи не платив"
 ADMIN_REMOVED_WARNED = "попереджень доставлено: {count}"
-ADMIN_REMOVED_NOT_WARNED = "⚠️ попередження не доставлені"
+#: Deliberately "not recorded" rather than "not delivered": delivery has only been written down
+#: since 2026-11-04, so an ask made before that leaves no row and must not be reported as silence.
+ADMIN_REMOVED_NOT_WARNED = "⚠️ попереджень не зафіксовано"
 ADMIN_REMOVED_BLOCKED = "бот заблокований"
 ADMIN_REMOVED_UNREACHABLE = " · повідомлення про закриття не доставлено"
 
@@ -1065,14 +1066,9 @@ ADMIN_PURGE_DRY_RUN = "\n\n<i>Пробний запуск — нічого не 
 ADMIN_PURGE_FAILED = "\n⚠️ Не вдалося опрацювати: {failed}"
 ADMIN_PURGE_KEPT_LINE = "• {handle} · id <code>{user_id}</code> — {reason}\n"
 ADMIN_PURGE_KEPT_PAID = "є підтверджена оплата"
-ADMIN_PURGE_KEPT_PROMO = "створював промокоди"
-ADMIN_PURGE_KEPT_ACCESS = "має активний доступ"
-ADMIN_PURGE_KEPT_IN_CHANNEL = "є в каналі"
-ADMIN_PURGE_KEPT_UNKNOWN = "не вдалося перевірити канал"
 ADMIN_PURGE_KEPT_NOTE = (
-    "\nЦих не видалено — причина поруч з кожним. Платежі потрібні для звірки з WayForPay, "
-    "а запис про учасника з доступом або в каналі — це єдине, що знає, коли доступ має "
-    "закінчитися."
+    "\nЦих не видалено: їхні платежі — єдиний звіт, який можна зіставити з WayForPay. "
+    "Видаліть вручну, якщо вони точно не потрібні."
 )
 
 # --- the report an admin gets from the daily access sweep ------------------------------------
