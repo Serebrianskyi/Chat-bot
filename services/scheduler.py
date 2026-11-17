@@ -13,6 +13,7 @@ a job that is already slow because it is talking to WayForPay.
 """
 
 import logging
+from datetime import timedelta
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot
@@ -20,6 +21,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from config import Settings
+from db.models import utcnow
+from services import campaigns
 from services.billing import (
     BillingConfig,
     poll_open_payments,
@@ -322,6 +325,37 @@ def start_scheduler(
         coalesce=True,
         max_instances=1,
     )
+
+    # 🖤 Black Friday 2026 — three waves, at the times the spec names, in Kyiv. `date` triggers
+    # rather than cron: these fire once each and then the campaign is over. A deploy after a time
+    # has passed simply misses that wave, which is correct — `send_wave` refuses to send outside
+    # the window anyway, and a launch announcement arriving on 1 December is worse than none.
+    for wave, when in (
+        ("launch", settings.black_friday_start + timedelta(hours=9)),
+        ("reminder", settings.black_friday_start + timedelta(days=2, hours=12)),
+        ("final", settings.black_friday_start + timedelta(days=3, hours=18)),
+    ):
+        if when <= utcnow():
+            log.info("Campaign wave %r was due at %s; not scheduling it", wave, when.isoformat())
+            continue
+        scheduler.add_job(
+            campaigns.send_wave,
+            "date",
+            run_date=when,
+            id=f"black_friday_{wave}",
+            kwargs={
+                "session_factory": session_factory,
+                "bot": bot,
+                "wave": wave,
+                "settings": settings,
+                "wayforpay": client,
+                "billing_config": config,
+                "admin_ids": admin_ids,
+            },
+            coalesce=True,
+            max_instances=1,
+        )
+        log.info("Campaign wave %r scheduled for %s", wave, when.isoformat())
 
     scheduler.start()
     if settings.enable_hourly_jobs:

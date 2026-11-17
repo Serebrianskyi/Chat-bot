@@ -142,6 +142,16 @@ class Settings(BaseSettings):
     # Give it an offset. Without one it is read as UTC, which in Kyiv winter is two hours early.
     free_period_until: datetime | None = None
 
+    # --- Black Friday 2026 (services/campaigns.py) ---
+    #
+    # The window, inclusive of both ends. Configurable rather than hard-coded because "extend the
+    # sale by a day" is a thing that gets asked on the last afternoon, and it should be a variable
+    # change rather than a deploy. Give the offset: without one these are read as UTC, which in
+    # Kyiv is two hours out.
+    #: 27.11.2026 00:00 Kyiv (EET, UTC+2) .. 30.11.2026 23:59:59 Kyiv.
+    black_friday_start: datetime = datetime(2026, 11, 26, 22, 0, tzinfo=UTC)
+    black_friday_end: datetime = datetime(2026, 11, 30, 21, 59, 59, tzinfo=UTC)
+
     # --- Meta Ads conversions (services/meta.py) ---
     #
     # Both are needed or the feature is off: `build_meta_client` returns None and nothing is

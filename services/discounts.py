@@ -124,6 +124,23 @@ async def effective_price(
     return amount, currency, discount
 
 
+async def standing_price(
+    session: AsyncSession, *, subscription: Subscription, username: str | None, now: datetime
+) -> tuple[Decimal, str]:
+    """Their own monthly price, **promos excluded**: the tariff they return to.
+
+    This is `effective_price` minus the promo layer. A campaign bundle is priced from it on
+    purpose — doubling a promo price would let one discount be taken twice — and a schedule's
+    `regularAmount` comes from it for the same reason.
+    """
+    discount = await find_active(
+        session, telegram_id=subscription.user_id, username=username, now=now
+    )
+    if discount is None:
+        return subscription.price, subscription.currency
+    return apply_to(subscription.price, subscription.currency, discount)
+
+
 async def recurring_price(
     session: AsyncSession, *, subscription: Subscription, username: str | None, now: datetime
 ) -> tuple[Decimal, str]:

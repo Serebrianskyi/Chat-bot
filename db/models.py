@@ -305,6 +305,14 @@ class Payment(Base):
     #: True for a charge WayForPay made on its own schedule, false for one the member initiated.
     is_recurring: Mapped[bool] = mapped_column(default=False)
 
+    #: How many billing periods this payment buys. **1 for everything except a campaign bundle.**
+    #: Access is extended by `periods × period_days`, so a three-month offer grants ninety days
+    #: rather than thirty — without this the member is charged for three months and gets one.
+    periods: Mapped[int] = mapped_column(default=1)
+    #: Which campaign sold it, e.g. `bf2026`. NULL for an ordinary payment. Answers both "how many
+    #: did we sell" and "has this member already claimed a one-per-person offer".
+    campaign: Mapped[str | None] = mapped_column(String(32), default=None, index=True)
+
     invoice_url: Mapped[str | None] = mapped_column(String(512), default=None)
 
     # Verbatim gateway fields, kept for reconciliation (A.15, plan G5.13).

@@ -21,7 +21,15 @@ from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from config import ConfigError, Settings, get_settings
 from db.session import create_engine, create_session_factory
-from handlers import admin, chat_membership, errors, promos, start, subscription
+from handlers import (
+    admin,
+    blackfriday,
+    chat_membership,
+    errors,
+    promos,
+    start,
+    subscription,
+)
 from middlewares.session import DbSessionMiddleware
 from services.billing import BillingConfig
 from services.commands import register_commands
@@ -79,6 +87,8 @@ def build_dispatcher(
     dispatcher.update.outer_middleware(DbSessionMiddleware(session_factory))
 
     dispatcher.include_router(chat_membership.build_router())
+    # Before start: the campaign owns `bf:*` callbacks and nothing else should see them.
+    dispatcher.include_router(blackfriday.build_router())
     dispatcher.include_router(start.build_router())
     dispatcher.include_router(subscription.build_router())
     dispatcher.include_router(promos.build_member_router())

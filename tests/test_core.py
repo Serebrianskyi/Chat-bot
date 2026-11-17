@@ -654,6 +654,13 @@ class FakeGateway:
         return self.charge_result
 
 
+def utcnow_at(stamp: str):
+    """A UTC instant from "YYYY-MM-DD HH:MM:SS", for window boundaries."""
+    from datetime import UTC, datetime
+
+    return datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+
+
 def approved(order_ref, amount=REGULAR_PRICE, currency=CURRENCY, charge_key=None):
     from services.wayforpay import TransactionStatus
 
@@ -3319,6 +3326,8 @@ def test_every_member_facing_message_is_ukrainian_and_formats_cleanly():
         "members": "• id 1\n",
         "hours": "24 години",
         "when": "01.10.2026",
+        "wave": "launch",
+        "no_link": 0,
         "overdue": "2 дні",
         "kept": "",
         "invoiced": 48,
@@ -4915,3 +4924,368 @@ async def test_a_member_on_a_special_price_is_not_quoted_the_list_price(
     assert texts.money(Decimal("8"), CURRENCY) in sent[1].text
     # And the button charges that, not the €10 in the text above it.
     assert fake_wayforpay.purchase_calls[-1]["amount"] == Decimal("8.00")
+
+
+async def test_a_removed_member_is_not_removed_again_tomorrow(
+    session_factory, bot, config, in_community
+):
+    """Reported 2026-11-17: the same six members were removed, messaged and reported **every
+    morning**.
+
+    Two jobs undoing each other. The 09:00 due sweep had `expired` in its scope and then set any
+    non-`past_due` status to `past_due`, erasing the one mark that says "already taken out"; the
+    09:45 removal then did it all again. Each job was right on its own, which is why neither
+    looked wrong.
+    """
+    from services.billing import process_due_subscriptions, remove_lapsed_members
+
+    in_community()
+    await seed_due(session_factory, overdue_days=10)
+    gw = FakeGateway()
+
+    async def morning(at) -> tuple[int, int]:
+        """The two jobs, in the order the scheduler runs them. Returns (invoiced, removed)."""
+        due = await process_due_subscriptions(
+            session_factory, gw, bot, admin_ids=frozenset({ADMIN_ID}), config=config, now=at
+        )
+        removal = await remove_lapsed_members(
+            session_factory,
+            bot,
+            client=gw,
+            channel_id=CHANNEL_ID,
+            admin_ids=frozenset({ADMIN_ID}),
+            config=config,
+            now=at,
+            enabled=True,
+        )
+        return due["invoiced"], removal["removed"]
+
+    assert (await morning(NOW))[1] == 1, "the first morning closes their access"
+    # The next morning spends the second of the two payment asks — that is the policy — but
+    # removes nobody. Every morning after that: nothing at all.
+    assert [await morning(NOW + timedelta(days=day)) for day in (1, 2, 3)] == [
+        (1, 0),
+        (0, 0),
+        (0, 0),
+    ]
+
+    to_member = [c.text for c in bot.session.calls if getattr(c, "chat_id", None) == USER_ID]
+    assert to_member.count(texts.ACCESS_SUSPENDED) == 1, "told once, not every day"
+    to_admin = [c.text for c in bot.session.calls if getattr(c, "chat_id", None) == ADMIN_ID]
+    assert len([t for t in to_admin if "Доступ закрито" in t]) == 1, "reported once"
+
+
+# ======================================================================================
+# Black Friday 2026 — a bundle, which is the first payment to buy more than one period
+# ======================================================================================
+
+
+async def test_a_bundle_grants_three_periods_for_the_price_of_two(session_factory, bot, config):
+    """BF1–BF4. The spec: €20 instead of €30, and €16 for the legacy €8 tier.
+
+    The arithmetic is the whole feature. Before `payments.periods` a €20 payment extended access
+    by thirty days — the member charged for three months and given one.
+    """
+    from db.models import PaymentStatus
+    from services import campaigns
+    from services.billing import issue_invoice
+    from services.subscriptions import apply_payment_result
+
+    await seed_member(session_factory, days_left=10)
+    gw = FakeGateway()
+
+    async with session_factory() as session:
+        sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
+        held = sub.expires_at
+        offer = await campaigns.offer_for(session, subscription=sub, username="member", now=NOW)
+        # BF4 by arithmetic: two months of their own tariff, whatever that tariff is.
+        assert offer.amount == REGULAR_PRICE * 2
+        assert offer.periods == 3
+        assert offer.recurring_amount == REGULAR_PRICE
+
+        payment = await issue_invoice(
+            session, gw, subscription=sub, config=config, now=NOW, offer=offer
+        )
+        await session.commit()
+        assert payment.amount == REGULAR_PRICE * 2
+        assert payment.periods == 3
+        assert payment.campaign == campaigns.BLACK_FRIDAY
+
+    # The schedule is dated to the end of the bundle and priced at their own tariff, so nothing
+    # has to "revert" afterwards (BF6).
+    call = gw.purchase_calls[-1]
+    assert call["date_next"] == texts.day(held + timedelta(days=3 * PERIOD_DAYS))
+    assert call["regular_amount"] == REGULAR_PRICE
+
+    # BF2: ninety days **added** to the date they already hold, losing no day.
+    async with session_factory() as session:
+        payment = await session.scalar(select(Payment))
+        granted = await apply_payment_result(
+            session,
+            payment=payment,
+            status=PaymentStatus.COMPLETE,
+            gateway_status="Approved",
+            amount=payment.amount,
+            currency=payment.currency,
+            reason_code="1100",
+            rec_token=None,
+            raw={},
+            now=NOW,
+        )
+        await session.commit()
+        sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
+        assert granted is True
+        assert sub.expires_at == held + timedelta(days=90)
+
+    # BF9: one per member, «разова пропозиція».
+    async with session_factory() as session:
+        assert await campaigns.already_claimed(session, user_id=USER_ID) is True
+
+    # BF10: the window is closed outside 27–30.11, whatever a member taps.
+    from config import Settings
+
+    settings = Settings(_env_file=None, bot_token="1:x", admin_ids="1")  # noqa: S106
+    window = {
+        "starts_at": settings.black_friday_start,
+        "ends_at": settings.black_friday_end,
+    }
+    assert campaigns.is_open(utcnow_at("2026-11-26 21:59:59"), **window) is False
+    assert campaigns.is_open(utcnow_at("2026-11-26 22:00:00"), **window) is True
+    assert campaigns.is_open(utcnow_at("2026-11-30 21:59:59"), **window) is True
+    assert campaigns.is_open(utcnow_at("2026-11-30 22:00:00"), **window) is False
+
+
+async def test_the_legacy_tier_pays_sixteen_and_returns_to_eight(session_factory, config):
+    """BF4/BF5/BF6. €8 members pay €16, and the figure is derived — it appears in no string.
+
+    Priced off their **standing** tariff, promos excluded: doubling a promo price would hand the
+    same discount over twice.
+    """
+    from db.models import PromoCode, utcnow
+    from services import campaigns, promos
+
+    await seed_member(session_factory, standing=Decimal("8"))
+
+    async with session_factory() as session:
+        sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
+        offer = await campaigns.offer_for(session, subscription=sub, username="member", now=NOW)
+    assert offer.amount == Decimal("16.00")
+    assert offer.recurring_amount == Decimal("8.00")
+    assert offer.saving == Decimal("8.00")
+
+    # Now give them a live 50% promo. The bundle price must not move.
+    async with session_factory() as session:
+        promo = await promos.create(
+            session,
+            actor_id=ADMIN_ID,
+            code="half",
+            kind=DiscountKind.PERCENT,
+            percent_off=50,
+            currency=CURRENCY,
+            window_months=1,
+            discount_months=3,
+            new_members_only=False,
+            now=utcnow(),
+        )
+        await session.commit()
+        promo = await session.get(PromoCode, promo.id)
+        await promos.redeem(session, promo=promo, user_id=USER_ID, now=utcnow())
+        await session.commit()
+
+        sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
+        with_promo = await campaigns.offer_for(
+            session, subscription=sub, username="member", now=utcnow()
+        )
+    assert with_promo.amount == Decimal("16.00"), "a promo must not discount the bundle as well"
+
+    # And the schedule the bundle leaves behind charges **8**, not the 16 they paid once. This is
+    # the shape of the bug of 2026-10-31, when a one-off discounted amount was sent as
+    # `regularAmount` and became the monthly price for ever.
+    from services.billing import issue_invoice
+
+    gw = FakeGateway()
+    async with session_factory() as session:
+        sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
+        held = sub.expires_at
+        offer = await campaigns.offer_for(session, subscription=sub, username="member", now=NOW)
+        await issue_invoice(session, gw, subscription=sub, config=config, now=NOW, offer=offer)
+        await session.commit()
+    call = gw.purchase_calls[-1]
+    assert call["amount"] == Decimal("16.00"), "paid once"
+    assert call["regular_amount"] == Decimal("8.00"), "charged monthly afterwards"
+    assert call["date_next"] == texts.day(held + timedelta(days=90)), "and not before then"
+
+
+async def test_a_bundle_replaces_a_monthly_schedule_instead_of_joining_it(session_factory, config):
+    """BF7. An active member buying the bundle while WayForPay still charges them €10 a month is
+    being billed twice, and the second charge is invisible until it lands.
+
+    So the old schedule is stopped and a new one — dated to the end of the bundle, at their own
+    tariff — goes out with this payment.
+    """
+    from services import campaigns
+    from services.billing import SCHEDULE_ACTIVE, SCHEDULE_REQUESTED, issue_invoice
+
+    await seed_member(session_factory, days_left=20)
+    async with session_factory() as session:
+        sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
+        sub.regular_status = SCHEDULE_ACTIVE
+        sub.regular_order_reference = "sub-222222222-monthly"
+        await session.commit()
+
+    gw = FakeGateway()
+    async with session_factory() as session:
+        sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
+        offer = await campaigns.offer_for(session, subscription=sub, username="member", now=NOW)
+        await issue_invoice(session, gw, subscription=sub, config=config, now=NOW, offer=offer)
+        await session.commit()
+        status = sub.regular_status
+
+    assert gw.remove_calls == ["sub-222222222-monthly"], "the monthly schedule must be stopped"
+    assert status == SCHEDULE_REQUESTED, "replaced by the bundle's own schedule"
+    call = gw.purchase_calls[-1]
+    assert call["recurring"] is True, "the bundle carries the replacement schedule"
+    assert call["regular_amount"] == REGULAR_PRICE
+    assert call["amount"] == REGULAR_PRICE * 2
+
+    # If the old one cannot be stopped, the bundle goes out as a one-off rather than risking two.
+    async with session_factory() as session:
+        sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
+        sub.regular_status = SCHEDULE_ACTIVE
+        sub.regular_order_reference = "sub-222222222-monthly"
+        await session.commit()
+    stubborn = FakeGateway()
+    stubborn.remove_result = {"reasonCode": 1113, "reason": "Invalid signature"}
+    async with session_factory() as session:
+        sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
+        offer = await campaigns.offer_for(session, subscription=sub, username="member", now=NOW)
+        await issue_invoice(
+            session, stubborn, subscription=sub, config=config, now=NOW, offer=offer
+        )
+        await session.commit()
+    assert stubborn.purchase_calls[-1]["recurring"] is False
+
+
+async def test_the_campaign_wave_picks_the_right_variant_for_each_member(
+    session_factory, bot, config, settings, fake_wayforpay, recording_session
+):
+    """BF12/BF13/BF14. Two audiences, split by `expires_at > now`; each sees their own date; and
+    the €16 legacy figure appears in no broadcast text.
+    """
+    from db.models import PriceTier, SubscriptionStatus, User
+    from services import campaigns
+
+    inside = campaigns_now = settings.black_friday_start + timedelta(hours=9)
+    active_id, lapsed_id = 601, 602
+
+    async with session_factory() as session:
+        for user_id, days in ((active_id, 20), (lapsed_id, -5)):
+            session.add(User(telegram_id=user_id, username=f"u{user_id}"))
+            session.add(
+                Subscription(
+                    user_id=user_id,
+                    status=SubscriptionStatus.ACTIVE,
+                    # The legacy tier, so the bundle is 16 — a figure no copy may contain.
+                    price=Decimal("8"),
+                    currency="EUR",
+                    price_tier=PriceTier.DISCOUNTED,
+                    period_days=PERIOD_DAYS,
+                    started_at=inside - timedelta(days=40),
+                    expires_at=inside + timedelta(days=days),
+                )
+            )
+        await session.commit()
+
+    counts = await campaigns.send_wave(
+        session_factory,
+        bot,
+        wave="launch",
+        settings=settings,
+        wayforpay=fake_wayforpay,
+        billing_config=config,
+        admin_ids=frozenset({ADMIN_ID}),
+        now=campaigns_now,
+    )
+    assert counts["sent"] == 2
+
+    said = {
+        c.chat_id: c
+        for c in recording_session.of_type("SendMessage")
+        if c.chat_id in (active_id, lapsed_id)
+    }
+    # BF13: each is told their own date, in Kyiv.
+    assert texts.day(inside + timedelta(days=20)) in said[active_id].text
+    assert "подарунок" in said[active_id].text, "the active variant"
+    assert said[lapsed_id].text == texts.BF_OFFER_NEW, "the new/lapsed variant, verbatim"
+    # The spec gives each variant its own buttons: three for a new or lapsed member, one for an
+    # active one. A broadcast must not be a worse version of the offer screen.
+    lapsed_buttons = [b.text for row in said[lapsed_id].reply_markup.inline_keyboard for b in row]
+    assert lapsed_buttons == [
+        texts.BF_PAY_BUTTON_NEW,
+        texts.BF_MORE_BUTTON,
+        texts.BF_BACK_BUTTON,
+    ]
+    active_buttons = [b.text for row in said[active_id].reply_markup.inline_keyboard for b in row]
+    assert active_buttons == [texts.BF_PAY_BUTTON_ACTIVE, texts.BF_BACK_BUTTON]
+    # BF14: the legacy price is never written out.
+    for message in said.values():
+        assert "16" not in message.text
+    # ...but it is what the button charges.
+    assert fake_wayforpay.purchase_calls[-1]["amount"] == Decimal("16.00")
+
+    # Outside the window the wave refuses to send at all (BF10).
+    nothing = await campaigns.send_wave(
+        session_factory,
+        bot,
+        wave="launch",
+        settings=settings,
+        wayforpay=fake_wayforpay,
+        billing_config=config,
+        now=settings.black_friday_end + timedelta(minutes=1),
+    )
+    assert nothing["sent"] == 0
+
+
+async def test_the_campaign_button_appears_only_while_the_campaign_runs(
+    dispatcher, bot, session_factory, recording_session, settings, monkeypatch
+):
+    """BF10/BF11. The button is drawn from the window, not from a flag somebody has to remember
+    to turn off — and every screen re-checks it, because a button from yesterday is still a
+    button.
+    """
+    from handlers import blackfriday
+
+    user = make_user(USER_ID, username="joiner")
+
+    # Outside the window: no promo button on the welcome, and the callback refuses.
+    await dispatcher.feed_update(bot, make_message(user, "/start", update_id=1))
+    labels = [
+        b.text
+        for c in recording_session.of_type("SendMessage")
+        if c.reply_markup
+        for row in c.reply_markup.inline_keyboard
+        for b in row
+    ]
+    assert texts.BF_MENU_BUTTON not in labels
+
+    await dispatcher.feed_update(bot, make_callback(user, blackfriday.OFFER, update_id=2))
+    assert any(c.text == texts.BF_CLOSED for c in recording_session.of_type("SendMessage")), (
+        "a stale button must answer honestly, not sell"
+    )
+
+    # Inside it: the button is there, and the offer carries a live link.
+    monkeypatch.setattr(
+        "db.models.utcnow", lambda: settings.black_friday_start + timedelta(hours=9)
+    )
+    monkeypatch.setattr(
+        "handlers.blackfriday.utcnow", lambda: settings.black_friday_start + timedelta(hours=9)
+    )
+    recording_session.calls.clear()
+    await dispatcher.feed_update(bot, make_callback(user, blackfriday.OFFER, update_id=3))
+    sent = recording_session.of_type("SendMessage")[-1]
+    assert sent.text == texts.BF_OFFER_NEW
+    buttons = [b for row in sent.reply_markup.inline_keyboard for b in row]
+    assert buttons[0].text == texts.BF_PAY_BUTTON_NEW
+    assert "secure.wayforpay.com" in buttons[0].url
+    assert buttons[1].text == texts.BF_MORE_BUTTON
+    assert buttons[2].text == texts.BF_BACK_BUTTON

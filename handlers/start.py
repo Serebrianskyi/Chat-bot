@@ -30,8 +30,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import texts
 from config import Settings
 from db.models import utcnow
-from handlers import admin, subscription
-from services import billing
+from handlers import admin, blackfriday, subscription
+from services import billing, campaigns
 from services import discounts as discount_service
 from services import meta as meta_service
 from services.billing import BillingConfig
@@ -78,12 +78,16 @@ async def is_in_community(bot: Bot, chat_id: str | None, user_id: int) -> bool:
         return False
 
 
-def _welcome_keyboard(is_admin: bool, *, pay_url: str | None = None) -> InlineKeyboardMarkup:
+def _welcome_keyboard(
+    is_admin: bool, *, pay_url: str | None = None, campaign_open: bool = False
+) -> InlineKeyboardMarkup:
     """Alias kept for readability at the call sites that greet somebody."""
-    return member_keyboard(is_admin, pay_url=pay_url)
+    return member_keyboard(is_admin, pay_url=pay_url, campaign_open=campaign_open)
 
 
-def member_keyboard(is_admin: bool, *, pay_url: str | None = None) -> InlineKeyboardMarkup:
+def member_keyboard(
+    is_admin: bool, *, pay_url: str | None = None, campaign_open: bool = False
+) -> InlineKeyboardMarkup:
     """What a member can reach from the welcome.
 
     When there is something to pay, the pay button goes **first and on this same message**. It used
@@ -98,6 +102,10 @@ def member_keyboard(is_admin: bool, *, pay_url: str | None = None) -> InlineKeyb
     "later" is worse than no button.
     """
     rows: list[list[InlineKeyboardButton]] = []
+    # 🏷️ Black Friday sits above everything while it runs, and vanishes the moment it does not —
+    # drawn from the window rather than from a flag somebody has to remember to turn off.
+    if campaign_open:
+        rows.append([blackfriday.menu_button()])
     if pay_url:
         rows.append([InlineKeyboardButton(text=texts.PAY_BUTTON, url=pay_url)])
     # The knowledge base, which lives in Notion until the bot grows its own (plan Phase 2). Shown
@@ -226,6 +234,9 @@ async def handle_start(
     free_period = subscription.free_period_granted
 
     is_admin = telegram_id in admin_ids
+    campaign_open = campaigns.is_open(
+        now, starts_at=settings.black_friday_start, ends_at=settings.black_friday_end
+    )
 
     # A returning member who is paid up just gets the greeting. One whose access has run out
     # falls through to the paying path below, because the greeting alone left them with no price
@@ -233,7 +244,8 @@ async def handle_start(
     # could neither pay nor see why they did not need to.
     if not created and subscription.expires_at > now:
         await message.answer(
-            texts.WELCOME_BACK.format(until=until), reply_markup=member_keyboard(is_admin)
+            texts.WELCOME_BACK.format(until=until),
+            reply_markup=member_keyboard(is_admin, campaign_open=campaign_open),
         )
         return
 
@@ -243,7 +255,7 @@ async def handle_start(
         # pitch, and there is no pay button because there is nothing to pay.
         await message.answer(
             texts.WELCOME_INTRO,
-            reply_markup=_welcome_keyboard(is_admin),
+            reply_markup=_welcome_keyboard(is_admin, campaign_open=campaign_open),
             link_preview_options=LinkPreviewOptions(is_disabled=True),
         )
         await message.answer(
@@ -303,7 +315,9 @@ async def handle_start(
         await message.answer(
             texts.WELCOME_INTRO,
             reply_markup=_welcome_keyboard(
-                is_admin, pay_url=payment.invoice_url if payment else None
+                is_admin,
+                pay_url=payment.invoice_url if payment else None,
+                campaign_open=campaign_open,
             ),
             link_preview_options=LinkPreviewOptions(is_disabled=True),
         )
@@ -323,7 +337,9 @@ async def handle_start(
         await message.answer(
             template.format(club=texts.CLUB_NAME, amount=quoted, period=period_days),
             reply_markup=_welcome_keyboard(
-                is_admin, pay_url=payment.invoice_url if payment else None
+                is_admin,
+                pay_url=payment.invoice_url if payment else None,
+                campaign_open=campaign_open,
             ),
         )
 

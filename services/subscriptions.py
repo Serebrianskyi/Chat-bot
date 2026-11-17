@@ -238,8 +238,13 @@ async def apply_payment_result(
         log.error("Order %s references a subscription that is gone", payment.order_reference)
         return False
 
+    # **`periods`, not one.** A campaign bundle buys three months in one payment, and extending
+    # by a single period would charge for three and grant one. Ordinary payments carry
+    # `periods = 1`, so this is the old behaviour for everything that is not a bundle.
     subscription.expires_at = extend(
-        subscription.expires_at, now=now, period_days=subscription.period_days
+        subscription.expires_at,
+        now=now,
+        period_days=subscription.period_days * max(1, payment.periods),
     )
     subscription.status = SubscriptionStatus.ACTIVE
     subscription.grace_until = None

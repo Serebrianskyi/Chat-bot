@@ -43,6 +43,7 @@ from services import meta as meta_service
 from services import promos, users
 from services import subscriptions as subs
 from services.audit import Action, record_action
+from services.campaigns import Offer
 from services.meta import MetaConversions
 from services.pricing import extend
 from services.wayforpay import RegularPayment, WayForPayClient, WayForPayError
@@ -187,6 +188,7 @@ async def issue_invoice(
     config: BillingConfig,
     now: datetime,
     recurring: bool | None = None,
+    offer: "Offer | None" = None,
 ) -> Payment:
     """Create an invoice for one subscription and persist it.
 
@@ -215,6 +217,11 @@ async def issue_invoice(
         username=user.username if user else None,
         now=now,
     )
+    # A campaign bundle replaces the per-period price entirely: one payment, several periods, and
+    # a figure derived from the member's own standing tariff (see `services.campaigns`).
+    periods = 1
+    if offer is not None:
+        amount, currency, periods = offer.amount, offer.currency, offer.periods
     # What the **gateway** should charge from next period on, which is not what is being paid now:
     # a one-month offer sent as `regularAmount` would become that price for ever (2026-10-31).
     recurring_amount, recurring_currency = await discount_service.recurring_price(
@@ -262,6 +269,8 @@ async def issue_invoice(
         currency=currency,
         status=PaymentStatus.PENDING_PAYMENT,
         created_at=now,
+        periods=periods,
+        campaign=offer.campaign if offer is not None else None,
     )
     session.add(payment)
 
@@ -280,7 +289,25 @@ async def issue_invoice(
     # payment, so they could never get a schedule again. That is exactly how "every link from now
     # on renews" would fail, silently, for anyone who does not pay on the first try.
     schedule = config.auto_renew if recurring is None else recurring
-    if schedule and subscription.regular_status in (SCHEDULE_ACTIVE, SCHEDULE_UNVERIFIED):
+
+    if offer is not None and subscription.regular_status in LIVE_SCHEDULE_STATUSES:
+        # **A bundle must replace a monthly schedule, not sit beside one.** Somebody paying €20
+        # for three months while WayForPay still charges them €10 a month is being billed twice,
+        # and the second charge is invisible to them until it lands. So the old schedule is
+        # stopped here and a new one — dated to the end of the bundle, at their own tariff — is
+        # created with this payment.
+        #
+        # If it cannot be stopped, the bundle goes out as a **one-off**: better that renewal needs
+        # a person afterwards than that two schedules charge one member.
+        stopped, why = await stop_schedule(session, client, subscription=subscription, now=now)
+        if not stopped:
+            log.error(
+                "Not scheduling a renewal for %s: their old schedule could not be stopped (%s)",
+                subscription.user_id,
+                why,
+            )
+            schedule = False
+    elif schedule and subscription.regular_status in (SCHEDULE_ACTIVE, SCHEDULE_UNVERIFIED):
         # ACTIVE: the gateway is charging them, a second schedule would take the money twice.
         # UNVERIFIED: we do not know whether it is, and a one-off link is the only answer that is
         # wrong in neither direction — it cannot double-charge and it cannot leave them unpaid.
@@ -290,7 +317,13 @@ async def issue_invoice(
     # member holds now — which for anybody past due is in the past, and the gateway refuses a date
     # that is not in the future. The same `extend` the payment itself will apply, so the gateway's
     # schedule and `expires_at` agree by construction.
-    next_at = subs.extend(subscription.expires_at, now=now, period_days=subscription.period_days)
+    next_at = subs.extend(
+        subscription.expires_at, now=now, period_days=subscription.period_days * periods
+    )
+    if offer is not None:
+        # The schedule charges their own tariff from the end of the bundle: the spec's "reverts to
+        # the baseline" with no job and no second decision.
+        recurring_amount, recurring_currency = offer.recurring_amount, offer.currency
 
     try:
         page = await client.purchase(
@@ -617,12 +650,14 @@ async def announce_confirmed_payment(
             return
 
         # A first payment and a renewal read differently to the member: one is a welcome, the
-        # other a receipt. free_period_granted tells them apart.
-        template = (
-            texts.PAYMENT_RENEWED
-            if subscription.free_period_granted
-            else texts.PAYMENT_FIRST_CONFIRMED
-        )
+        # other a receipt. free_period_granted tells them apart — and a campaign bundle is a third
+        # thing again, with its own SPEC wording naming the new date.
+        if payment.campaign:
+            template = texts.BF_CONFIRMED
+        elif subscription.free_period_granted:
+            template = texts.PAYMENT_RENEWED
+        else:
+            template = texts.PAYMENT_FIRST_CONFIRMED
         try:
             await bot.send_message(
                 subscription.user_id,
@@ -1249,7 +1284,13 @@ async def process_due_subscriptions(
         for subscription in due:
             if subscription.grace_until is None:
                 subscription.grace_until = subscription.expires_at + config.grace
-            if subscription.status is not SubscriptionStatus.PAST_DUE:
+            # Only a **live** subscription falls to `past_due`. `expired` must never be walked
+            # back: it is the mark `remove_lapsed_members` reads to know somebody has already
+            # been taken out, and this line used to erase it every morning at 09:00 — so the
+            # 09:45 sweep removed the same people again, messaged them «доступ призупинено»
+            # again, and sent an identical report. Six members had that happen daily until
+            # 2026-11-17. Two jobs undoing each other, each correct on its own.
+            if subscription.status in (SubscriptionStatus.TRIAL, SubscriptionStatus.ACTIVE):
                 subscription.status = SubscriptionStatus.PAST_DUE
 
             # Somebody who has never paid and never had a free period has already had their
