@@ -131,6 +131,19 @@ async def cmd_access(check_channel: bool) -> int:
             print("\n== CONFIRMED PAYMENT ==")
             if not paid:
                 print("  Nobody. No payment has ever reached `complete`.")
+            # Whoever this bot removed from the channel itself. Their `left` status is explained
+            # and must not be read as a member ignoring an invite.
+            removed_by_us = {
+                row
+                for row in (
+                    await session.scalars(
+                        select(AuditLog.target_user_id).where(
+                            AuditLog.action == Action.SUBSCRIPTION_EXPIRED
+                        )
+                    )
+                )
+            }
+
             verdicts: Counter[str] = Counter()
             for uid in paid:
                 user = users.get(uid)
@@ -145,6 +158,12 @@ async def cmd_access(check_channel: bool) -> int:
                     verdict = "BOT FAILED THEM: paid, no invite ever sent"
                 elif status is None:
                     verdict = "invite sent; membership unchecked (use --channel)"
+                elif uid in removed_by_us:
+                    # **The bot took them out itself.** Removal is a ban followed immediately by
+                    # an unban, which leaves exactly the `left` status an unused invite leaves —
+                    # so without this branch the report blamed the member for the bot's own
+                    # action. Reported 2026-11-19 about somebody the 17.11 sweep had removed.
+                    verdict = "removed by the bot: re-invite them if they have paid again"
                 else:
                     # A link was delivered and they are not in. Single-use links also expire
                     # after INVITE_VALID_DAYS, so an old one may simply have run out.

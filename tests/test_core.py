@@ -622,6 +622,11 @@ class FakeGateway:
         self.purchase_calls = []
         self.remove_calls = []
         self.remove_result = {"reasonCode": 4100, "reason": "Ok"}
+        self.suspend_calls = []
+        #: What the gateway says the schedule charges, for the re-pricing check.
+        self.schedule_amount = REGULAR_PRICE
+        #: What STATUS reports. "Removed" models a member who unticked «Регулярне списання».
+        self.schedule_state = "Active"
 
     #: The real client exposes these; the schedule paths read them before deciding anything.
     service_url = "https://example.test/payments/wayforpay"
@@ -642,6 +647,25 @@ class FakeGateway:
     async def regular_remove(self, *, order_reference):
         self.remove_calls.append(order_reference)
         return self.remove_result
+
+    async def regular_suspend(self, *, order_reference):
+        self.suspend_calls.append(order_reference)
+        return self.remove_result
+
+    async def regular_status(self, *, order_reference):
+        from services.wayforpay import RegularPayment
+
+        return RegularPayment(
+            order_reference=order_reference,
+            status=self.schedule_state,
+            mode="monthly",
+            amount=self.schedule_amount,
+            currency=CURRENCY,
+            next_payment_date=None,
+            last_payed_date=None,
+            last_payed_status=None,
+            reason_code="4100",
+        )
 
     async def check_status(self, *, order_reference):
         self.status_calls.append(order_reference)
@@ -5116,15 +5140,24 @@ async def test_the_legacy_tier_pays_sixteen_and_returns_to_eight(session_factory
     assert call["date_next"] == texts.day(held + timedelta(days=90)), "and not before then"
 
 
-async def test_a_bundle_replaces_a_monthly_schedule_instead_of_joining_it(session_factory, config):
-    """BF7. An active member buying the bundle while WayForPay still charges them €10 a month is
-    being billed twice, and the second charge is invisible until it lands.
+async def test_a_bundle_replaces_a_monthly_schedule_only_once_it_is_paid(
+    session_factory, bot, config
+):
+    """BF7, and the incident of 2026-11-27.
 
-    So the old schedule is stopped and a new one — dated to the end of the bundle, at their own
-    tariff — goes out with this payment.
+    A bundle must replace a monthly schedule rather than sit beside one — nobody should pay €20
+    for three months while WayForPay still takes €10 a month. But the replacement belongs to the
+    **payment**, not to the offer: it used to happen when the invoice was created, so the launch
+    broadcast — which creates an invoice for every member so each gets a working button —
+    cancelled every live schedule at 09:00, for people who had not paid and mostly never would.
+    WayForPay then emailed about each one.
+
+    Issuing an invoice must change nothing at the gateway. An offer nobody accepted leaves the
+    member exactly as they were.
     """
+    from db.models import PaymentStatus
     from services import campaigns
-    from services.billing import SCHEDULE_ACTIVE, SCHEDULE_REQUESTED, issue_invoice
+    from services.billing import SCHEDULE_ACTIVE, _confirm_schedule, issue_invoice
 
     await seed_member(session_factory, days_left=20)
     async with session_factory() as session:
@@ -5137,33 +5170,46 @@ async def test_a_bundle_replaces_a_monthly_schedule_instead_of_joining_it(sessio
     async with session_factory() as session:
         sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
         offer = await campaigns.offer_for(session, subscription=sub, username="member", now=NOW)
-        await issue_invoice(session, gw, subscription=sub, config=config, now=NOW, offer=offer)
-        await session.commit()
-        status = sub.regular_status
-
-    assert gw.remove_calls == ["sub-222222222-monthly"], "the monthly schedule must be stopped"
-    assert status == SCHEDULE_REQUESTED, "replaced by the bundle's own schedule"
-    call = gw.purchase_calls[-1]
-    assert call["recurring"] is True, "the bundle carries the replacement schedule"
-    assert call["regular_amount"] == REGULAR_PRICE
-    assert call["amount"] == REGULAR_PRICE * 2
-
-    # If the old one cannot be stopped, the bundle goes out as a one-off rather than risking two.
-    async with session_factory() as session:
-        sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
-        sub.regular_status = SCHEDULE_ACTIVE
-        sub.regular_order_reference = "sub-222222222-monthly"
-        await session.commit()
-    stubborn = FakeGateway()
-    stubborn.remove_result = {"reasonCode": 1113, "reason": "Invalid signature"}
-    async with session_factory() as session:
-        sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
-        offer = await campaigns.offer_for(session, subscription=sub, username="member", now=NOW)
-        await issue_invoice(
-            session, stubborn, subscription=sub, config=config, now=NOW, offer=offer
+        payment = await issue_invoice(
+            session, gw, subscription=sub, config=config, now=NOW, offer=offer
         )
         await session.commit()
-    assert stubborn.purchase_calls[-1]["recurring"] is False
+        bundle_order = payment.order_reference
+
+    # **Nothing at the gateway was touched**, and the member still holds the schedule they had.
+    assert gw.remove_calls == [], "an unpaid offer must not cancel anybody's renewal"
+    async with session_factory() as session:
+        sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
+        assert sub.regular_order_reference == "sub-222222222-monthly"
+        assert sub.regular_status == SCHEDULE_ACTIVE
+
+    # The bundle still asks for its own schedule, dated past the ninety days at their own tariff.
+    call = gw.purchase_calls[-1]
+    assert call["recurring"] is True
+    assert call["amount"] == REGULAR_PRICE * 2
+    assert call["regular_amount"] == REGULAR_PRICE
+
+    # Now the money arrives. *This* is when the old schedule goes.
+    async with session_factory() as session:
+        payment = await session.scalar(
+            select(Payment).where(Payment.order_reference == bundle_order)
+        )
+        payment.status = PaymentStatus.COMPLETE
+        await _confirm_schedule(
+            session,
+            bot,
+            payment=payment,
+            admin_ids=frozenset({ADMIN_ID}),
+            now=NOW,
+            client=gw,
+        )
+        await session.commit()
+        sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
+        reference, status = sub.regular_order_reference, sub.regular_status
+
+    assert gw.remove_calls == ["sub-222222222-monthly"], "the old schedule goes when paid"
+    assert reference == bundle_order, "and the bundle's own takes its place"
+    assert status == SCHEDULE_ACTIVE
 
 
 async def test_the_campaign_wave_picks_the_right_variant_for_each_member(
@@ -5289,3 +5335,62 @@ async def test_the_campaign_button_appears_only_while_the_campaign_runs(
     assert "secure.wayforpay.com" in buttons[0].url
     assert buttons[1].text == texts.BF_MORE_BUTTON
     assert buttons[2].text == texts.BF_BACK_BUTTON
+
+
+async def test_an_unregistered_bundle_schedule_holds_the_old_one_instead_of_ending_it(
+    session_factory, bot, config
+):
+    """Asked on 2026-11-27: can a schedule be *held* rather than terminated? `regularApi` has
+    SUSPEND, and this is the case that needs it.
+
+    The bundle's own schedule exists only if the member left «Регулярне списання» ticked. If it
+    did not register, ending their previous one would take away a renewal they still want — so it
+    is suspended instead: no charges while the bundle runs, and a RESUME brings it back, card and
+    price intact.
+    """
+    from db.models import PaymentStatus
+    from services import campaigns
+    from services.billing import (
+        SCHEDULE_ACTIVE,
+        SCHEDULE_SUSPENDED,
+        _confirm_schedule,
+        issue_invoice,
+    )
+
+    await seed_member(session_factory, days_left=20)
+    async with session_factory() as session:
+        sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
+        sub.regular_status = SCHEDULE_ACTIVE
+        sub.regular_order_reference = "sub-222222222-monthly"
+        await session.commit()
+
+    gw = FakeGateway()
+    # The gateway registered nothing for the new order: the switch was off, or a wallet was used.
+    gw.schedule_state = "Removed"
+
+    async with session_factory() as session:
+        sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
+        offer = await campaigns.offer_for(session, subscription=sub, username="member", now=NOW)
+        payment = await issue_invoice(
+            session, gw, subscription=sub, config=config, now=NOW, offer=offer
+        )
+        payment.status = PaymentStatus.COMPLETE
+        await _confirm_schedule(
+            session,
+            bot,
+            payment=payment,
+            admin_ids=frozenset({ADMIN_ID}),
+            now=NOW,
+            client=gw,
+        )
+        await session.commit()
+        sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
+        status, reference = sub.regular_status, sub.regular_order_reference
+
+    assert gw.suspend_calls == ["sub-222222222-monthly"], "held, not ended"
+    assert gw.remove_calls == [], "nothing is removed when there is no replacement"
+    assert status == SCHEDULE_SUSPENDED
+    assert reference == "sub-222222222-monthly", "the rule to resume later is still named"
+
+    to_admin = [c.text for c in bot.session.calls if getattr(c, "chat_id", None) == ADMIN_ID]
+    assert any("паузі" in text for text in to_admin), "somebody has to know to resume it"

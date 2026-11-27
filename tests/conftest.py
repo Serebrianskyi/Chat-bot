@@ -168,6 +168,11 @@ def settings() -> Settings:
         # Production's shape since 2026-10-29: webhook mode, so every payment link is a Purchase
         # carrying a monthly schedule. `build_billing_config` reads `service_url` off these two,
         # and with them unset the suite would quietly exercise one-off links that renew nothing.
+        # A campaign window far from any real clock. Tests that need it open monkeypatch the
+        # time into it; everything else must behave the same whatever today happens to be — on
+        # 2026-11-27 the suite started failing because the live window had opened for real.
+        black_friday_start=datetime(2030, 11, 29, 0, 0, tzinfo=UTC),
+        black_friday_end=datetime(2030, 12, 2, 23, 59, 59, tzinfo=UTC),
         mode="webhook",
         base_url="https://example.test",
         webhook_secret="hook-secret",  # noqa: S106

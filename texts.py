@@ -117,7 +117,7 @@ def months_phrase(count: int) -> str:
 #: Owner's copy, verbatim. Note "Q&amp;A": messages go out with parse_mode=HTML, where a bare
 #: "&" is invalid and Telegram rejects the whole send.
 #: SPEC — the owner's own welcome, rewritten 2026-11-11 and quoted verbatim. Do not "improve" it;
-#: raise a copy question instead (rule 14).
+#: raise a copy question instead (rule 16).
 #:
 #: The price line says €10, which is the club's **list** price. A member whose own price differs —
 #: a founding member on 8, anybody with a discount or a live promo — is told so in its own line
@@ -1068,6 +1068,17 @@ ADMIN_SCHEDULE_MISSING = (
     "Оплата пройшла, автопродовження — ні. Учасник платитиме вручну."
 )
 
+#: A bundle was paid but registered no schedule of its own, so the member's previous one is held
+#: rather than ended — nothing is charged while the bundle runs and the renewal is recoverable.
+ADMIN_SCHEDULE_PAUSED = (
+    "⏸ <b>Автопродовження на паузі</b>\n\n"
+    "Учасник: <code>{user_id}</code>\n"
+    "Регулярний платіж: <code>{order}</code>\n"
+    "Доступ оплачено до: {until}\n\n"
+    "Акція не створила нового регулярного платежу, тому старий поставлено на паузу — "
+    "списань не буде. Щоб відновити його після закінчення акції, напишіть мені."
+)
+
 ADMIN_SCHEDULE_CANCEL_FAILED = (
     "⚠️ <b>Не вдалося скасувати автопродовження</b>\n\n"
     "Учасник: <code>{user_id}</code>\n"
@@ -1176,7 +1187,7 @@ PROFILE_PUBLISH_BUTTON = "Опублікувати мій профіль"  # SPE
 
 # --- 🖤 Black Friday 2026 (services/campaigns.py, handlers/blackfriday.py) -------------------
 #
-# All SPEC: the owner's own copy of 2026-11-17, quoted verbatim (rule 14). Sums are written out
+# All SPEC: the owner's own copy of 2026-11-17, quoted verbatim (rule 16). Sums are written out
 # here because the owner wrote them out — €30/€20 is the club's list price and its bundle. The
 # **€16 legacy figure appears in none of it**, by explicit instruction: that member sees their own
 # price only on the button and in the invoice.

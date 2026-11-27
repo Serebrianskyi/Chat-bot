@@ -290,23 +290,16 @@ async def issue_invoice(
     # on renews" would fail, silently, for anyone who does not pay on the first try.
     schedule = config.auto_renew if recurring is None else recurring
 
-    if offer is not None and subscription.regular_status in LIVE_SCHEDULE_STATUSES:
-        # **A bundle must replace a monthly schedule, not sit beside one.** Somebody paying €20
-        # for three months while WayForPay still charges them €10 a month is being billed twice,
-        # and the second charge is invisible to them until it lands. So the old schedule is
-        # stopped here and a new one — dated to the end of the bundle, at their own tariff — is
-        # created with this payment.
-        #
-        # If it cannot be stopped, the bundle goes out as a **one-off**: better that renewal needs
-        # a person afterwards than that two schedules charge one member.
-        stopped, why = await stop_schedule(session, client, subscription=subscription, now=now)
-        if not stopped:
-            log.error(
-                "Not scheduling a renewal for %s: their old schedule could not be stopped (%s)",
-                subscription.user_id,
-                why,
-            )
-            schedule = False
+    # **A bundle replaces a monthly schedule, but only once it is paid.** The replacement happens
+    # in `_confirm_schedule`, not here.
+    #
+    # It was here, and on 2026-11-27 the launch broadcast created a bundle invoice for every
+    # member — which cancelled every live schedule at 09:00, for people who had not paid and
+    # mostly never would. WayForPay then emailed about each one. **Issuing an invoice must never
+    # change anything at the gateway**: a link is an offer, and an offer nobody accepted must
+    # leave the member exactly as they were.
+    if offer is not None:
+        pass
     elif schedule and subscription.regular_status in (SCHEDULE_ACTIVE, SCHEDULE_UNVERIFIED):
         # ACTIVE: the gateway is charging them, a second schedule would take the money twice.
         # UNVERIFIED: we do not know whether it is, and a one-off link is the only answer that is
@@ -351,7 +344,10 @@ async def issue_invoice(
 
     payment.invoice_url = page.page_url
     payment.raw_response = page.raw
-    if schedule:
+    # A bundle leaves the member's existing schedule alone until the money arrives — the
+    # reference of the live monthly schedule is what `_confirm_schedule` needs in order to stop
+    # it, and overwriting it here would lose the only way to reach it.
+    if schedule and not (offer is not None and subscription.regular_status == SCHEDULE_ACTIVE):
         # `requested`, not `active`: the schedule exists only once somebody pays the page. Until
         # then this member is still owed a payment link like anyone else, and the daily sweep must
         # keep chasing them.
@@ -2621,6 +2617,68 @@ async def _confirm_schedule(
     if subscription is None or subscription.regular_order_reference is None:
         return
 
+    # A paid bundle **replaces** whatever schedule the member had: stop the old one, then point
+    # at the one this payment registered. Done here and not at invoice time, because an unpaid
+    # offer must leave the gateway untouched (2026-11-27).
+    paid_reference = payment.gateway_order_reference or payment.order_reference
+    if payment.campaign and subscription.regular_order_reference not in (None, paid_reference):
+        old_reference = subscription.regular_order_reference
+        # **Remove the old one only when there is something to replace it.** The bundle's own
+        # schedule exists only if the member left «Регулярне списання» ticked, and ending their
+        # previous one before checking would take away a renewal they still want.
+        if await _gateway_has_schedule(client, paid_reference):
+            stopped, why = await stop_schedule(session, client, subscription=subscription, now=now)
+            subscription.regular_order_reference = paid_reference
+            subscription.regular_status = SCHEDULE_REQUESTED
+        else:
+            # Nothing registered, so the old schedule is **held, not ended**: SUSPEND keeps the
+            # rule — card, price and all — and a RESUME brings it back. Nothing is charged while
+            # the bundle runs, and the member has not lost their renewal.
+            stopped, why = await pause_schedule(session, client, subscription=subscription, now=now)
+            subscription.regular_next_at = None
+            log.warning(
+                "Bundle paid by %s registered no schedule; their old one %s is suspended",
+                subscription.user_id,
+                old_reference,
+            )
+            await notify_admins(
+                bot,
+                admin_ids,
+                texts.ADMIN_SCHEDULE_PAUSED.format(
+                    user_id=subscription.user_id,
+                    order=old_reference or "—",
+                    until=texts.day(subscription.expires_at),
+                ),
+            )
+            if not stopped:
+                await notify_admins(
+                    bot,
+                    admin_ids,
+                    texts.ADMIN_SCHEDULE_CANCEL_FAILED.format(
+                        user_id=subscription.user_id,
+                        order=old_reference or "—",
+                        reason=why or "—",
+                    ),
+                )
+            return
+        if not stopped:
+            log.error(
+                "Bundle paid by %s but their old schedule %s could not be stopped (%s): they may "
+                "be charged twice",
+                subscription.user_id,
+                old_reference,
+                why,
+            )
+            await notify_admins(
+                bot,
+                admin_ids,
+                texts.ADMIN_SCHEDULE_CANCEL_FAILED.format(
+                    user_id=subscription.user_id,
+                    order=old_reference or "—",
+                    reason=why or "—",
+                ),
+            )
+
     if subscription.regular_status == SCHEDULE_REQUESTED:
         # Point the schedule at the page that was **paid**, not at the last one issued. A member
         # can be handed a second page after abandoning the first, and whichever they eventually
@@ -2793,6 +2851,67 @@ REGULAR_API_OK = "4100"
 #: error had the bot alerting admins that a cancellation had failed when the member simply never
 #: had a schedule — reported 2026-10-31, for a member who had not even asked to cancel.
 REGULAR_API_NOTHING_TO_STOP = frozenset({"4102", "4106", "4107"})
+
+
+async def pause_schedule(
+    session: AsyncSession,
+    client: WayForPayClient | None,
+    *,
+    subscription: Subscription,
+    now: datetime,
+) -> tuple[bool, str | None]:
+    """Hold a schedule instead of ending it. ``(paused, why not)``.
+
+    `regularApi` SUSPEND stops the charges and keeps the rule — card, price and all — so a RESUME
+    brings it back. That is the right instrument when the member is **not** losing their renewal,
+    only pausing it: somebody who bought three months has nothing to be charged for until those
+    months are up.
+
+    Removal is for a cancellation somebody asked for. Pausing is for a gap.
+    """
+    reference = subscription.regular_order_reference
+    if not reference or subscription.regular_status not in LIVE_SCHEDULE_STATUSES:
+        return True, None
+    if client is None or not client.can_manage_schedules:
+        return False, "no-credential"
+
+    try:
+        answer = await client.regular_suspend(order_reference=reference)
+    except Exception as exc:
+        log.exception("SUSPEND failed for schedule %s", reference)
+        return False, type(exc).__name__
+
+    reason_code = str(answer.get("reasonCode") or "")
+    if reason_code in REGULAR_API_NOTHING_TO_STOP:
+        subscription.regular_status = SCHEDULE_REMOVED
+        return True, None
+    if reason_code != REGULAR_API_OK:
+        log.error("SUSPEND refused for %s: %s %s", reference, reason_code, answer.get("reason"))
+        return False, f"{reason_code}: {answer.get('reason')}"
+
+    subscription.regular_status = SCHEDULE_SUSPENDED
+    await record_action(
+        session,
+        actor_id=subscription.user_id,
+        action=Action.SUBSCRIPTION_CANCELLED,
+        target_user_id=subscription.user_id,
+        details={"schedule": reference, "regular_api": "SUSPEND"},
+        now=now,
+    )
+    log.info("Schedule %s suspended for %s", reference, subscription.user_id)
+    return True, None
+
+
+async def _gateway_has_schedule(client: WayForPayClient | None, reference: str) -> bool:
+    """Whether the gateway really registered a schedule under this order."""
+    if client is None or not client.can_manage_schedules:
+        return False
+    try:
+        live = await client.regular_status(order_reference=reference)
+    except Exception:
+        log.exception("Could not ask about schedule %s", reference)
+        return False
+    return live.status in GATEWAY_SCHEDULE_LIVE
 
 
 async def stop_schedule(
