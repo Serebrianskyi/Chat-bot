@@ -1079,6 +1079,18 @@ ADMIN_SCHEDULE_PAUSED = (
     "списань не буде. Щоб відновити його після закінчення акції, напишіть мені."
 )
 
+#: A bundle was paid, but whether it registered its own schedule could not be checked — so the
+#: member's previous one was left exactly as it was rather than ended or paused on a guess.
+ADMIN_BUNDLE_SCHEDULE_UNKNOWN = (
+    "❓ <b>Не вдалося перевірити автопродовження</b>\n\n"
+    "Учасник: <code>{user_id}</code>\n"
+    "Старий регулярний платіж: <code>{order}</code>\n"
+    "Оплата акції: <code>{paid}</code>\n\n"
+    "Акцію оплачено, але WayForPay не відповів, чи створено новий регулярний платіж. "
+    "Старий не змінювали. Перевірте «Регулярні платежі» в кабінеті — якщо активні обидва, "
+    "старий потрібно зупинити, щоб не було подвійного списання."
+)
+
 ADMIN_SCHEDULE_CANCEL_FAILED = (
     "⚠️ <b>Не вдалося скасувати автопродовження</b>\n\n"
     "Учасник: <code>{user_id}</code>\n"

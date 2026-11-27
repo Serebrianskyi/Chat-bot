@@ -3347,6 +3347,7 @@ def test_every_member_facing_message_is_ukrainian_and_formats_cleanly():
         "blocked": 2,
         "purged": 2,
         "order": "sub-1-2",
+        "paid": "sub-1-3",
         "members": "• id 1\n",
         "hours": "24 години",
         "when": "01.10.2026",
@@ -5242,6 +5243,22 @@ async def test_the_campaign_wave_picks_the_right_variant_for_each_member(
             )
         await session.commit()
 
+    # A dry run is dry: no message, and no Purchase either — building a link creates a real
+    # order at the gateway, and once (2026-11-27) creating one cancelled a schedule (rule 15).
+    rehearsal = await campaigns.send_wave(
+        session_factory,
+        bot,
+        wave="launch",
+        settings=settings,
+        wayforpay=fake_wayforpay,
+        billing_config=config,
+        now=campaigns_now,
+        dry_run=True,
+    )
+    assert rehearsal["skipped"] == 2
+    assert fake_wayforpay.purchase_calls == [], "a dry run must not touch the gateway"
+    assert not recording_session.of_type("SendMessage")
+
     counts = await campaigns.send_wave(
         session_factory,
         bot,
@@ -5394,3 +5411,90 @@ async def test_an_unregistered_bundle_schedule_holds_the_old_one_instead_of_endi
 
     to_admin = [c.text for c in bot.session.calls if getattr(c, "chat_id", None) == ADMIN_ID]
     assert any("паузі" in text for text in to_admin), "somebody has to know to resume it"
+
+
+async def test_a_bundle_the_poller_settles_still_replaces_the_old_schedule(
+    session_factory, bot, config
+):
+    """Only the path that settles a payment first sees it as new, and the poller often wins.
+
+    `_confirm_schedule` used to run from the callback alone, so a bundle the poller confirmed
+    never replaced the member's monthly schedule: €20 for three months, and €10 a month on top.
+    """
+    from services import campaigns
+    from services.billing import SCHEDULE_ACTIVE, issue_invoice, poll_open_payments
+
+    await seed_member(session_factory, days_left=20)
+    async with session_factory() as session:
+        sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
+        sub.regular_status = SCHEDULE_ACTIVE
+        sub.regular_order_reference = "sub-222222222-monthly"
+        await session.commit()
+
+    gw = FakeGateway()
+    async with session_factory() as session:
+        sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
+        offer = await campaigns.offer_for(session, subscription=sub, username="member", now=NOW)
+        payment = await issue_invoice(
+            session, gw, subscription=sub, config=config, now=NOW, offer=offer
+        )
+        await session.commit()
+        bundle_order = payment.order_reference
+
+    gw.status_result = approved(bundle_order, amount=REGULAR_PRICE * 2)
+    await poll_open_payments(
+        session_factory, gw, bot, config=config, admin_ids=frozenset({ADMIN_ID}), now=NOW
+    )
+
+    async with session_factory() as session:
+        sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
+        assert gw.remove_calls == ["sub-222222222-monthly"], "the old schedule must go"
+        assert sub.regular_order_reference == bundle_order
+        assert sub.regular_status == SCHEDULE_ACTIVE
+
+
+async def test_a_bundle_never_acts_on_a_schedule_it_could_not_check(session_factory, bot, config):
+    """Two ways a bundle used to guess about a schedule it could not see.
+
+    An `unverified` schedule may well be real, so an unpaid bundle invoice must not overwrite its
+    reference: a later cancellation would stop the bundle order instead («nothing to stop», read
+    as success) and leave the real one charging. And when the gateway cannot say whether the
+    bundle registered its own schedule, the old one is left alone: suspending it on a guess
+    reported «no new schedule» to admins, and resuming it on that report left two.
+    """
+    from db.models import PaymentStatus
+    from services import campaigns
+    from services.billing import SCHEDULE_UNVERIFIED, _confirm_schedule, issue_invoice
+
+    await seed_member(session_factory, days_left=20)
+    async with session_factory() as session:
+        sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
+        sub.regular_status = SCHEDULE_UNVERIFIED
+        sub.regular_order_reference = "sub-222222222-monthly"
+        await session.commit()
+
+    gw = FakeGateway()
+    async with session_factory() as session:
+        sub = await session.scalar(select(Subscription).where(Subscription.user_id == USER_ID))
+        offer = await campaigns.offer_for(session, subscription=sub, username="member", now=NOW)
+        payment = await issue_invoice(
+            session, gw, subscription=sub, config=config, now=NOW, offer=offer
+        )
+        await session.commit()
+        assert sub.regular_order_reference == "sub-222222222-monthly", "an offer changes nothing"
+        assert sub.regular_status == SCHEDULE_UNVERIFIED
+
+        async def unreachable(**_):
+            raise TimeoutError
+
+        gw.regular_status = unreachable
+        payment.status = PaymentStatus.COMPLETE
+        await _confirm_schedule(
+            session, bot, payment=payment, admin_ids=frozenset({ADMIN_ID}), now=NOW, client=gw
+        )
+        await session.commit()
+        assert (gw.remove_calls, gw.suspend_calls) == ([], []), "nothing done on a guess"
+        assert sub.regular_order_reference == "sub-222222222-monthly"
+
+    to_admin = [c.text for c in bot.session.calls if getattr(c, "chat_id", None) == ADMIN_ID]
+    assert any("Не вдалося перевірити" in text for text in to_admin), "a person has to look"

@@ -117,7 +117,12 @@ def is_active_member(subscription: Subscription, *, now: datetime) -> bool:
     The spec's own test: `subscription_ends_at > NOW()`. Deliberately the date and not `status`,
     which is a derived mark and can lag a payment by a sweep.
     """
-    return subscription.expires_at > now
+    return active_by_date(subscription.expires_at, now=now)
+
+
+def active_by_date(expires_at: datetime, *, now: datetime) -> bool:
+    """`is_active_member` from the date alone, for callers that hold no subscription row."""
+    return expires_at > now
 
 
 # --- the scheduled broadcasts ------------------------------------------------------------------
@@ -221,6 +226,16 @@ async def send_wave(
                 counts["claimed"] += 1
                 continue
 
+            if dry_run:
+                # **Before** the link, not after it: building the link creates a real Purchase at
+                # the gateway, so a dry run that got that far would not be dry (rule 15).
+                active = active_by_date(expires_at, now=now)
+                counts["skipped"] += 1
+                log.info(
+                    "Would send %r to %s (%s)", wave, user_id, "active" if active else "lapsed"
+                )
+                continue
+
             user = await session.get(User, user_id)
             link, active = await blackfriday.bundle_link(
                 session,
@@ -242,11 +257,6 @@ async def send_wave(
         # a new or lapsed one also gets «Детальніше» and «Назад» — the same three they would meet
         # inside the bot, so a broadcast is not a worse version of the offer screen.
         markup = blackfriday.offer_keyboard(pay_url=link, active_member=active)
-
-        if dry_run:
-            counts["skipped"] += 1
-            log.info("Would send %r to %s (%s)", wave, user_id, "active" if active else "lapsed")
-            continue
 
         try:
             await bot.send_message(user_id, body, reply_markup=markup)

@@ -347,7 +347,15 @@ async def issue_invoice(
     # A bundle leaves the member's existing schedule alone until the money arrives — the
     # reference of the live monthly schedule is what `_confirm_schedule` needs in order to stop
     # it, and overwriting it here would lose the only way to reach it.
-    if schedule and not (offer is not None and subscription.regular_status == SCHEDULE_ACTIVE):
+    #
+    # `unverified` too: it means a schedule may well exist and could not be checked. Overwriting
+    # its reference with an unpaid bundle order would mean a later cancellation stops the bundle
+    # order («nothing to stop», read as success) while the real schedule keeps charging the card.
+    keeps_old_schedule = offer is not None and subscription.regular_status in (
+        SCHEDULE_ACTIVE,
+        SCHEDULE_UNVERIFIED,
+    )
+    if schedule and not keeps_old_schedule:
         # `requested`, not `active`: the schedule exists only once somebody pays the page. Until
         # then this member is still owed a payment link like anyone else, and the daily sweep must
         # keep chasing them.
@@ -792,6 +800,24 @@ async def poll_open_payments(
 
             if extended:
                 counts["completed"] += 1
+                # **The poller confirms a schedule exactly as the callback does.** Whichever path
+                # settles the payment first is the only one that sees `extended`, and the poller
+                # often wins (2026-11-04). Without this a bundle it settled never replaced the
+                # member's old monthly schedule, so they paid €20 for three months and were still
+                # charged €10 a month on top.
+                try:
+                    await _confirm_schedule(
+                        session,
+                        bot,
+                        payment=payment,
+                        admin_ids=admin_ids,
+                        now=now,
+                        client=client,
+                    )
+                except Exception:
+                    # One member's schedule must not abort the run before `commit`, which would
+                    # roll back every settlement learned so far.
+                    log.exception("Could not confirm the schedule for %s", payment.order_reference)
                 await announce_confirmed_payment(
                     session,
                     bot,
@@ -2626,7 +2652,30 @@ async def _confirm_schedule(
         # **Remove the old one only when there is something to replace it.** The bundle's own
         # schedule exists only if the member left «Регулярне списання» ticked, and ending their
         # previous one before checking would take away a renewal they still want.
-        if await _gateway_has_schedule(client, paid_reference):
+        registered = await _gateway_has_schedule(client, paid_reference)
+        if registered is None:
+            # **Unknown is not "no".** If the gateway could not be asked, the bundle's schedule
+            # may well exist — suspending the old one and telling admins it did not register
+            # would be a false report, and resuming it on that report would leave two live
+            # schedules. Touch nothing and let a person look.
+            log.error(
+                "Bundle paid by %s: could not tell whether %s registered a schedule; old one %s "
+                "left as it was",
+                subscription.user_id,
+                paid_reference,
+                old_reference,
+            )
+            await notify_admins(
+                bot,
+                admin_ids,
+                texts.ADMIN_BUNDLE_SCHEDULE_UNKNOWN.format(
+                    user_id=subscription.user_id,
+                    order=old_reference or "—",
+                    paid=paid_reference,
+                ),
+            )
+            return
+        if registered:
             stopped, why = await stop_schedule(session, client, subscription=subscription, now=now)
             subscription.regular_order_reference = paid_reference
             subscription.regular_status = SCHEDULE_REQUESTED
@@ -2902,15 +2951,19 @@ async def pause_schedule(
     return True, None
 
 
-async def _gateway_has_schedule(client: WayForPayClient | None, reference: str) -> bool:
-    """Whether the gateway really registered a schedule under this order."""
+async def _gateway_has_schedule(client: WayForPayClient | None, reference: str) -> bool | None:
+    """Whether the gateway really registered a schedule under this order; None if unknown.
+
+    None when the question could not be asked (no `merchantPassword`, or the call failed): the
+    caller must not read that as "no schedule" and act on it.
+    """
     if client is None or not client.can_manage_schedules:
-        return False
+        return None
     try:
         live = await client.regular_status(order_reference=reference)
     except Exception:
         log.exception("Could not ask about schedule %s", reference)
-        return False
+        return None
     return live.status in GATEWAY_SCHEDULE_LIVE
 
 
